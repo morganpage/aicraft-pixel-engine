@@ -15,6 +15,16 @@ import { PixelEngine } from '../../src/sand';
 import { MaterialType, Materials } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
 import { paintGridInto, buildPalette } from '../helpers/renderer';
+import {
+  stampVolcano,
+  emitPlume,
+  coolLava,
+  remeltConduit,
+  assimilateTephra,
+  isDormant,
+  makeRng,
+  type VolcanoConfig,
+} from '../helpers/volcano';
 
 /** Square grid so the planet sits centered with even margin all around. */
 const SIZE = 220;
@@ -100,6 +110,7 @@ export function initPlanet(container: HTMLElement): void {
   const brushSize = container.querySelector<HTMLInputElement>('.planet-brush-size')!;
   const brushSizeValue = container.querySelector<HTMLElement>('.planet-brush-size-value')!;
   const scatterBtn = container.querySelector<HTMLButtonElement>('.planet-scatter')!;
+  const volcanoBtn = container.querySelector<HTMLButtonElement>('.planet-volcano')!;
   const clearBtn = container.querySelector<HTMLButtonElement>('.planet-clear')!;
   const spinBtn = container.querySelector<HTMLButtonElement>('.planet-spin')!;
 
@@ -183,10 +194,71 @@ export function initPlanet(container: HTMLElement): void {
     scatterBtn.blur();
   });
 
+  // 🌋 Volcano — carve a magma chamber and conduit, then erupt continuously.
+  //
+  // Built entirely on the engine's public API: the engine has no pressure term
+  // and no lava→rock transition except contact with water, so the section
+  // supplies both (see helpers/volcano.ts). Toggling it off leaves the terrain
+  // it built in place.
+  const volcanoCfg: VolcanoConfig = {
+    centerX: CX,
+    centerY: CY,
+    planetRadius: PLANET_R,
+    ventAngle: -Math.PI / 2, // summit at the top of the screen
+    conduitHalfWidth: 1,
+    chamberRadius: 8,
+    chamberDepth: 26,
+  };
+  let erupting = false;
+  let started = false;
+  // Each eruption is finite: it builds until the cone reaches its cap, then the
+  // volcano goes dormant. Erupting again raises the cap so the cone grows in
+  // stages rather than either stopping forever or growing without bound.
+  let capHeight = 16;
+  const volcanoRng = makeRng(4242);
+
+  const setVolcanoLabel = (label: string, on: boolean): void => {
+    volcanoBtn.setAttribute('aria-pressed', String(on));
+    volcanoBtn.classList.toggle('active', on);
+    volcanoBtn.textContent = label;
+  };
+
+  /**
+   * The eruption ran its course. Say so explicitly — a scene that simply stops
+   * moving is indistinguishable from the page having frozen, which is exactly
+   * how this read before.
+   */
+  const goDormant = (): void => {
+    erupting = false;
+    setVolcanoLabel('🌋 Erupt again', false);
+  };
+
+  volcanoBtn.addEventListener('click', () => {
+    if (erupting) {
+      erupting = false;
+      setVolcanoLabel('🌋 Erupt again', false);
+      volcanoBtn.blur();
+      return;
+    }
+    if (!started) {
+      stampVolcano(engine, volcanoCfg);
+      started = true;
+    } else {
+      capHeight = Math.min(capHeight + 8, 40); // a taller cone each time
+    }
+    erupting = true;
+    setVolcanoLabel('🌋 Erupting', true);
+    volcanoBtn.blur();
+  });
+
   clearBtn.addEventListener('click', () => {
     engine.clear();
     stampPlanet(engine);
     spinAngle = 0;
+    erupting = false;
+    started = false;
+    capHeight = 16;
+    setVolcanoLabel('🌋 Volcano', false);
     clearBtn.blur();
   });
 
@@ -230,7 +302,40 @@ export function initPlanet(container: HTMLElement): void {
   render();
 
   window.setInterval(() => {
+    if (erupting) {
+      emitPlume(engine, volcanoCfg, volcanoRng, {
+        // 8/frame builds a full cone in ~20s at 60Hz; at 2/frame the demo
+        // takes well over a minute to read as anything.
+        perFrame: 8,
+        spread: 0.21, // ~12°
+        loft: 5,
+        // Mostly granular tephra: it piles at its own angle of repose, which is
+        // what gives the cone its shape. Lava alone freezes into static rock
+        // and builds a lumpy mesa instead.
+        lavaFraction: 0.3,
+        maxHeight: capHeight,
+      });
+      // Ask the cone's height directly. A plume placing nothing this frame
+      // only means its sample cells were occupied, not that it has finished.
+      if (isDormant(engine, volcanoCfg, capHeight)) goDormant();
+    }
     engine.update();
+    // Fallout sinks through the magma (tephra is denser than lava), so the
+    // bore has to be reclaimed each frame or the volcano chokes on its own
+    // ejecta within a few seconds.
+    if (erupting) remeltConduit(engine, volcanoCfg);
+    // Cooling runs after the step, so a flow gets a chance to move before it
+    // freezes. Rate is the dial between a steep cone (freeze fast) and a broad
+    // shield (freeze slow); too slow and lava levels into a shell like water.
+    // Slowed from 0.25 so a flow travels further down the flank before setting
+    // — bounded by the assimilation:cooling ratio, since cooling terminates the
+    // advancing front.
+    if (erupting) coolLava(engine, volcanoRng, { rate: 0.15 });
+    // Magma dissolves tephra trapped inside it (tephra is denser than lava so it
+    // sinks in and lodges there). Gated on embedding, not mere contact, so the
+    // cone's flank survives; runs after cooling so a freshly-assimilated cell
+    // survives this tick and flows on the next.
+    if (erupting) assimilateTephra(engine, volcanoRng, { rate: 0.5 });
     if (spinning) spinAngle += SPIN_PER_TICK;
     render();
   }, 1000 / FPS);

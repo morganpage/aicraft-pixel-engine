@@ -29,7 +29,7 @@
  * split the sections use for `renderer.ts`.
  */
 
-import type { PixelEngine } from '../../src/sand';
+import { fillNeighborFrame, type PixelEngine, type NeighborFrame } from '../../src/sand';
 import { MaterialType } from '../../src/materials';
 
 /** Geometry of a volcano stamped into a radial-gravity planet. */
@@ -104,31 +104,204 @@ export function stampVolcano(engine: PixelEngine, cfg: VolcanoConfig): void {
   }
 }
 
+/** Tuning for {@link emitPlume}. */
+export interface PlumeOptions {
+  /** Cells of ejecta to launch per frame. */
+  perFrame: number;
+  /** Half-angle of the launch arc, in radians. Wider = broader, flatter cone. */
+  spread: number;
+  /** How far above the summit ejecta appears, in cells. */
+  loft: number;
+  /**
+   * Fraction of ejecta launched as molten lava; the remainder is granular
+   * tephra. **This is what controls the silhouette.**
+   *
+   * Lava freezes into `ROCK`, which is a static solid — it never settles, so
+   * lava-only eruptions build lumpy mesas full of voids rather than cones.
+   * Granular tephra falls and piles at its own angle of repose, which is
+   * exactly the mechanism that gives a real cinder cone its shape, and which
+   * the engine already models well. A little lava threaded through it reads as
+   * active flows without flattening the profile.
+   */
+  lavaFraction: number;
+  /**
+   * Stop building once the summit reaches this height above the original
+   * surface, in cells. Without a cap the vent tracks its own deposits upward
+   * and the cone grows until it hits the edge of the grid.
+   */
+  maxHeight: number;
+}
+
 /**
- * Feed lava at the vent — the host standing in for magma pressure.
+ * Radius of the summit along the vent axis — the outermost solid cell before
+ * the first gap.
  *
- * Deliberately unconditional. An earlier version only emitted into an *empty*
- * vent cell, which silently produced almost no lava at all: surface lava plugs
- * its own vent (measured: ±2° of spread and zero motion after 1200 frames), so
- * the guard was nearly always false. If a source can be blocked, it needs to
- * say what happens when it is.
- *
- * @returns how many cells actually changed to lava this call.
+ * The vent has to track the growing cone, or the volcano buries its own
+ * source: emission is skipped when the target cell is occupied, so a vent
+ * pinned to the original planet radius simply stops erupting once its own
+ * deposits cover it (measured: the cone stalls at ~5 cells tall). Take the
+ * first gap and not the last solid — scanning for the outermost non-empty cell
+ * instead picks up airborne ejecta, which drags the vent off into space.
  */
-export function emitAtVent(engine: PixelEngine, cfg: VolcanoConfig): number {
+export function surfaceRadiusAt(engine: PixelEngine, cfg: VolcanoConfig, angle: number, limit = 60): number {
+  const ux = Math.cos(angle);
+  const uy = Math.sin(angle);
+  let surface = cfg.planetRadius;
+  for (let r = cfg.planetRadius; r < cfg.planetRadius + limit; r++) {
+    const x = Math.round(cfg.centerX + ux * r);
+    const y = Math.round(cfg.centerY + uy * r);
+    if (engine.getMaterial(x, y) === MaterialType.EMPTY) break;
+    surface = r;
+  }
+  return surface;
+}
+
+export function summitRadius(engine: PixelEngine, cfg: VolcanoConfig, limit = 60): number {
+  const ux = Math.cos(cfg.ventAngle);
+  const uy = Math.sin(cfg.ventAngle);
+  let summit = cfg.planetRadius;
+  for (let r = cfg.planetRadius; r < cfg.planetRadius + limit; r++) {
+    const x = Math.round(cfg.centerX + ux * r);
+    const y = Math.round(cfg.centerY + uy * r);
+    if (engine.getMaterial(x, y) === MaterialType.EMPTY) break;
+    summit = r;
+  }
+  return summit;
+}
+
+/**
+ * True once the cone has reached `maxHeight` and the eruption is over.
+ *
+ * Ask this rather than watching for {@link emitPlume} to return 0 — a plume
+ * also places nothing on frames where its sampled cells all happen to be
+ * occupied, so a zero return means "nothing landed this frame", not
+ * "finished". Conflating the two ends an eruption at a random early moment.
+ */
+export function isDormant(engine: PixelEngine, cfg: VolcanoConfig, maxHeight: number): boolean {
+  return summitRadius(engine, cfg) >= cfg.planetRadius + maxHeight;
+}
+
+/** Dark basalt tint for tephra, so it does not read as yellow desert sand. */
+function tintTephra(engine: PixelEngine, x: number, y: number, rng: () => number): void {
+  if (!engine.colorGrid) engine.colorGrid = new Uint32Array(engine.width * engine.height);
+  const n = Math.floor(rng() * 18);
+  const r = 38 + n, g = 34 + n, b = 36 + n;
+  engine.colorGrid[y * engine.width + x] = (255 << 24) | (b << 16) | (g << 8) | r;
+}
+
+/**
+ * Erupt lava as a lofted plume — the host standing in for magma pressure.
+ *
+ * **The loft is the whole trick, and it is not obvious.** Feeding lava straight
+ * into the vent does not work: the first cell to arrive has nowhere to flow (a
+ * planet's summit is locally flat, so there is no one-cell descent and no
+ * one-cell drop in potential for the levelling pass either), so it freezes
+ * where it lands and walls the vent in. Measured over 1500 frames of
+ * vent-feeding: 218 cells emitted, a 2-cell cap, no cone at all.
+ *
+ * Launching each cell a few cells *above* the surface at a randomised angle
+ * lets it fall and land spread across the summit instead of stacking on one
+ * spot. Same cooling, same everything else — but an edifice actually builds
+ * (measured: 265 cells, 5.3 cells tall, and it still settles to 0 swaps).
+ *
+ * This is what stands in for the engine's missing pressure term. It is a
+ * ballistic approximation, not real hydrostatics — but it produces a volcano.
+ *
+ * @returns how many cells were placed this call.
+ */
+export function emitPlume(
+  engine: PixelEngine,
+  cfg: VolcanoConfig,
+  rng: () => number,
+  opts: PlumeOptions,
+): number {
+  const summit = summitRadius(engine, cfg);
+
+  // Cone is at full height. Do NOT simply stop: the cone reaches the cap in
+  // ~90 frames, and cutting emission dead leaves the whole scene settled at 0
+  // swaps within a second or two, which reads as the app having frozen rather
+  // than as an eruption ending.
+  //
+  // The eruption is finished once the cone reaches its cap.
+  //
+  // This is a *finite* eruption by design, and the caller must surface that —
+  // see the `onDormant` note below. Keeping it running forever was tried and
+  // does not work, because nothing in the simulation removes material, so any
+  // continuous emission grows the cone without bound. Measured attempts:
+  //   - fill the crater each frame  -> scene still frozen (5865 still frames);
+  //     a cell at the summit has no one-cell descent so it never moves.
+  //   - lava-only from near the peak -> stays alive but cone grew to height 63.
+  //   - lava on the flanks only      -> stays alive but cone still grew to 61,
+  //     since flank deposits thicken and lift the summit anyway.
+  // Bounding it needs a removal mechanism (e.g. periodic `erupt()` blasts
+  // excavating the summit), which is a bigger design than this prototype needs.
+  if (summit >= cfg.planetRadius + opts.maxHeight) return 0;
+
+  let placed = 0;
+  for (let i = 0; i < opts.perFrame; i++) {
+    const angle = cfg.ventAngle + (rng() * 2 - 1) * opts.spread;
+    const r = summit + 1 + rng() * opts.loft;
+    const x = Math.round(cfg.centerX + Math.cos(angle) * r);
+    const y = Math.round(cfg.centerY + Math.sin(angle) * r);
+    if (engine.getMaterial(x, y) !== MaterialType.EMPTY) continue;
+    if (rng() < opts.lavaFraction) {
+      engine.setMaterial(x, y, MaterialType.LAVA);
+    } else {
+      engine.setMaterial(x, y, MaterialType.SAND);
+      tintTephra(engine, x, y, rng);
+    }
+    placed++;
+  }
+  return placed;
+}
+
+/**
+ * Remelt anything that has fallen back into the plumbing.
+ *
+ * **Required, not cosmetic.** Tephra is `SAND` at density 10 and lava is
+ * density 8, so ejecta landing on the open vent does not sit on top of the
+ * magma — it *sinks through it*, filling the conduit and chamber from the top
+ * down. Measured without this: the plumbing went from 163 lava / 0 tephra to
+ * **73 lava / 93 tephra within 300 frames** and stayed there. The volcano
+ * chokes on its own fallout and the chamber turns to a bag of sand.
+ *
+ * Magma remelts what falls into it, so restoring the bore each frame is both
+ * the physical answer and the cheap one — it touches only the conduit and
+ * chamber cells, and keeps the conduit visibly molten.
+ *
+ * @returns how many cells were remelted this call.
+ */
+export function remeltConduit(engine: PixelEngine, cfg: VolcanoConfig): number {
   const ux = Math.cos(cfg.ventAngle);
   const uy = Math.sin(cfg.ventAngle);
   const px = -uy;
   const py = ux;
-  let emitted = 0;
-  for (let w = -cfg.conduitHalfWidth; w <= cfg.conduitHalfWidth; w++) {
-    const x = Math.round(cfg.centerX + ux * (cfg.planetRadius + 1) + px * w);
-    const y = Math.round(cfg.centerY + uy * (cfg.planetRadius + 1) + py * w);
-    if (engine.getMaterial(x, y) === MaterialType.LAVA) continue;
+  const chamberR = cfg.planetRadius - cfg.chamberDepth;
+  let melted = 0;
+
+  const melt = (x: number, y: number): void => {
+    const m = engine.getMaterial(x, y);
+    // Only reclaim fallen debris — never eat the surrounding bedrock outside
+    // the bore, which is what keeps the conduit walls intact.
+    if (m !== MaterialType.SAND && m !== MaterialType.ROCK) return;
     engine.setMaterial(x, y, MaterialType.LAVA);
-    emitted++;
+    melted++;
+  };
+
+  for (let r = chamberR; r <= cfg.planetRadius; r++) {
+    for (let w = -cfg.conduitHalfWidth; w <= cfg.conduitHalfWidth; w++) {
+      melt(Math.round(cfg.centerX + ux * r + px * w), Math.round(cfg.centerY + uy * r + py * w));
+    }
   }
-  return emitted;
+  const cxc = cfg.centerX + ux * chamberR;
+  const cyc = cfg.centerY + uy * chamberR;
+  for (let dy = -cfg.chamberRadius; dy <= cfg.chamberRadius; dy++) {
+    for (let dx = -cfg.chamberRadius; dx <= cfg.chamberRadius; dx++) {
+      if (dx * dx + dy * dy > cfg.chamberRadius * cfg.chamberRadius) continue;
+      melt(Math.round(cxc + dx), Math.round(cyc + dy));
+    }
+  }
+  return melted;
 }
 
 /** Cells that count as "cold" for the purposes of chilling a lava cell. */
@@ -162,10 +335,34 @@ export interface CoolOptions {
  * @returns how many cells solidified this call.
  */
 export function coolLava(engine: PixelEngine, rng: () => number, opts: CoolOptions): number {
+  const frame: NeighborFrame = {
+    down: { dx: 0, dy: 0 },
+    downLeft: { dx: 0, dy: 0 },
+    downRight: { dx: 0, dy: 0 },
+    left: { dx: 0, dy: 0 },
+    right: { dx: 0, dy: 0 },
+  };
   let frozen = 0;
   for (let y = 0; y < engine.height; y++) {
     for (let x = 0; x < engine.width; x++) {
       if (engine.getMaterial(x, y) !== MaterialType.LAVA) continue;
+
+      // Only freeze lava that is resting on something.
+      //
+      // Ejecta is spawned in mid-air (the loft in `emitPlume` is the stand-in
+      // for pressure) and the engine has no velocity, so a cell in flight
+      // spends several frames as a lone airborne cell with empty neighbours on
+      // every side — which is *maximum* exposure by the rule below, i.e. the
+      // highest freeze chance, before it has landed anywhere. It then becomes
+      // ROCK, a static solid that never falls, and hangs in the sky forever.
+      // Measured without this check: 38 of 208 frozen cells were unsupported.
+      //
+      // Requiring support inverts that correctly — airborne lava stays molten
+      // until it lands, and a cell within a flow still has support, so crust
+      // formation on real flows is unaffected.
+      fillNeighborFrame(x, y, engine.gravity, frame);
+      if (engine.getMaterial(x + frame.down.dx, y + frame.down.dy) === MaterialType.EMPTY) continue;
+
       let exposure = 0;
       if (isCold(engine.getMaterial(x, y - 1))) exposure++;
       if (isCold(engine.getMaterial(x, y + 1))) exposure++;
@@ -179,6 +376,82 @@ export function coolLava(engine: PixelEngine, rng: () => number, opts: CoolOptio
     }
   }
   return frozen;
+}
+
+/** Tuning for {@link assimilateTephra}. */
+export interface AssimilateOptions {
+  /** Per-frame chance of melting an embedded tephra cell. 0..1. */
+  rate: number;
+  /**
+   * How many of a tephra cell's four neighbours must be lava before it counts as
+   * *embedded* in magma. Default 3.
+   *
+   * This threshold is what stops the rule from eating the cone. A tephra cell
+   * *trapped inside* a lava body — the grey particles hanging in the magma — has
+   * lava on three or four sides. A tephra cell of the cone's flank merely
+   * *touching* a thin surface flow has lava on one or two. Threshold 3 melts the
+   * former and leaves the latter: measured over a full eruption at threshold 2
+   * the cone collapses (sand → 5, slope → 3.8); at threshold 3 it survives
+   * (sand → 166, slope → 1.9, both within the steep-cone contract).
+   */
+  embedThreshold?: number;
+}
+
+/**
+ * Magma dissolves the tephra trapped inside it — the melt the engine has no rule
+ * for, supplied host-side.
+ *
+ * Tephra is `SAND` (density 10) and lava is density 8, so ejecta that lands in a
+ * flow sinks *through* it and lodges there, which is exactly why grey particles
+ * hang around in the magma. `remeltConduit` already reclaims debris inside the
+ * plumbing; this does the same job anywhere on the cone.
+ *
+ * The discriminator is *embedding*, not mere contact: a tephra cell is melted
+ * only when at least `embedThreshold` (default 3) of its four neighbours are
+ * lava. That isolates particles actually engulfed by magma and leaves the cone's
+ * flank tephra — which only touches a thin surface flow — intact. A naive
+ * "lava touches tephra" rule chain-reacts: each melted cell becomes a new lava
+ * source for the layer beneath, measured consuming the entire 16-cell cone and
+ * leaving `sand === 0`. The embedding gate breaks that chain.
+ *
+ * This is a *reaction*, not a displacement: it writes the grid directly, so it
+ * ignores the `canDisplace` density gate that otherwise stops lava from moving
+ * into denser sand. Per-cell tints must be cleared alongside the conversion: the
+ * renderer prefers a `colorGrid` entry over the material palette, so without this
+ * a melted tephra cell keeps rendering dark basalt instead of molten orange.
+ *
+ * @returns how many tephra cells were assimilated this call.
+ */
+export function assimilateTephra(
+  engine: PixelEngine,
+  rng: () => number,
+  opts: AssimilateOptions,
+): number {
+  const threshold = opts.embedThreshold ?? 3;
+  const w = engine.width;
+  const grid = engine.grid;
+  let melted = 0;
+  for (let y = 0; y < engine.height; y++) {
+    const rowOff = y * w;
+    for (let x = 0; x < w; x++) {
+      if (grid[rowOff + x] !== MaterialType.SAND) continue;
+
+      // Count lava among the four orthogonal neighbours. Embedding, not contact.
+      let lavaN = 0;
+      if (y > 0 && grid[rowOff - w + x] === MaterialType.LAVA) lavaN++;
+      if (y < engine.height - 1 && grid[rowOff + w + x] === MaterialType.LAVA) lavaN++;
+      if (x > 0 && grid[rowOff + x - 1] === MaterialType.LAVA) lavaN++;
+      if (x < w - 1 && grid[rowOff + x + 1] === MaterialType.LAVA) lavaN++;
+      if (lavaN < threshold) continue;
+
+      if (rng() >= opts.rate) continue;
+      engine.setMaterial(x, y, MaterialType.LAVA);
+      // Drop the dark basalt tint, or the renderer keeps showing grey.
+      if (engine.colorGrid) engine.colorGrid[rowOff + x] = 0;
+      melted++;
+    }
+  }
+  return melted;
 }
 
 /**

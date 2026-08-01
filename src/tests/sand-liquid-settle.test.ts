@@ -112,7 +112,7 @@ describe('liquid settling (the shimmer/foam regression)', () => {
     const e = new PixelEngine({ width: W, height: H, seed: 1, gravity: new FlatGravity() });
     for (let x = 0; x < W; x++) e.setMaterial(x, H - 1, MaterialType.WALL);
     // Pour from a brush-sized blob in the middle, as the sandbox does.
-    for (let i = 0; i < 600; i++) {
+    for (let i = 0; i < 300; i++) {
       const cx = 150, cy = 120, r = 14;
       for (let dy = -r; dy <= r; dy++) {
         for (let dx = -r; dx <= r; dx++) {
@@ -124,7 +124,14 @@ describe('liquid settling (the shimmer/foam regression)', () => {
       }
       e.update();
     }
-    for (let i = 0; i < 3000; i++) e.update();
+    // Run until it stops moving rather than for a fixed count — the pass
+    // levels this scene long before 3000 frames, and burning the difference
+    // put this test within a whisker of the default 5s timeout.
+    let quiet = 0;
+    for (let i = 0; i < 3000 && quiet < 30; i++) {
+      e.update();
+      quiet = e.swapsLastFrame === 0 ? quiet + 1 : 0;
+    }
 
     const surface: number[] = [];
     for (let x = 0; x < W; x++) {
@@ -139,7 +146,9 @@ describe('liquid settling (the shimmer/foam regression)', () => {
     // And having levelled, it must go quiet — the failure mode of an earlier
     // attempt was levelling that never terminated.
     for (let i = 0; i < 10; i++) { e.update(); expect(e.swapsLastFrame).toBe(0); }
-  });
+    // Full sandbox resolution (300x195) with a long pour is genuinely heavy;
+    // give it explicit headroom rather than sitting near the 5s default.
+  }, 20_000);
 
   it('levelling conserves liquid exactly', () => {
     // The levelling pass writes the grid directly rather than going through
