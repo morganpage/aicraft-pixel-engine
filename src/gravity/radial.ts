@@ -45,6 +45,21 @@ export class RadialGravity implements GravityModel {
     this.centerY = options.centerY;
   }
 
+  /**
+   * Height above the planet center — simply the distance from it. Moving one
+   * cell toward the center reduces this by exactly 1, satisfying the
+   * {@link GravityModel.potentialAt} contract.
+   *
+   * At the center the potential is 0 and flat, which is correct: there is no
+   * "downhill" left, matching {@link gravityAt}'s arbitrary-but-stable
+   * fallback direction there.
+   */
+  potentialAt(x: number, y: number): number {
+    const dx = x - this.centerX;
+    const dy = y - this.centerY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
   gravityAt(x: number, y: number): Vec2 {
     // Direction from cell toward center = "down" (fall toward planet).
     let dx = this.centerX - x;

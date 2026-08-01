@@ -40,12 +40,35 @@ const DEFAULT_CHUNK_SIZE = 32;
  * (reaching a descent) — which is what lets a settled pool go quiet instead of
  * shimmering forever. See {@link PixelEngineOptions.liquidDispersion}.
  *
- * 32 (not 16) is the default: it flattens a deep pour's residual staircase to
- * ~1 row at no measured steady-state cost (the scan exits at the first
- * non-passable cell in a packed pool, so a higher value only costs while the
- * liquid is genuinely in motion with open space ahead).
+ * 16 is the default. Under flat gravity a pool is perfectly still at any
+ * value, and higher values only buy surface flatness (32 → flatness 1 vs 16 →
+ * 2 on a deep pour). Under *radial* gravity the trade-off runs the other way:
+ * a long probe wraps far enough around the curve to keep finding descents in
+ * geometry that no longer matches the source cell, leaving a residual jitter
+ * (planet ocean 0 swaps at 16, 1 at 32; scatter-ring 4 at 16, 8 at 32). 16
+ * buys a quiet planet for one row of flat-surface unevenness.
+ *
+ * Steady-state cost is zero regardless: in a packed pool the scan exits at the
+ * first non-passable cell, so a higher value only costs while the liquid is
+ * genuinely in motion with open space ahead.
  */
-const DEFAULT_LIQUID_DISPERSION = 32;
+const DEFAULT_LIQUID_DISPERSION = 16;
+
+/**
+ * How far the levelling pass looks along the surface for a lower resting
+ * place. Separate from {@link PixelEngineOptions.liquidDispersion}: that gates
+ * one-cell steps in the displacement core, while this bounds a non-local
+ * transfer, and the two want different reaches. The residual slope of a
+ * levelled pool is roughly one cell per this many cells of span.
+ */
+const LIQUID_LEVEL_REACH = 32;
+
+/**
+ * How far the levelling walk may climb or descend to re-seat itself on the
+ * surface after a tangential step. Keeps the re-seat O(1) and stops the walk
+ * from chasing a surface down a cliff.
+ */
+const LIQUID_LEVEL_CLIMB = 4;
 
 /** How many stable frames the grid must be quiet before settle completes. */
 export const SETTLE_STABLE_THRESHOLD = 10;
@@ -141,6 +164,13 @@ export class PixelEngine {
   /** The gravity model driving movement direction. */
   readonly gravity: GravityModel;
 
+  /**
+   * The gravity model's potential field, pre-bound, or `null` when the model
+   * does not provide one. Cached at construction so the hot loop neither
+   * re-checks for the optional method nor allocates a bound function.
+   */
+  private readonly _potentialAt: ((x: number, y: number) => number) | null;
+
   private _rngState: number;
   private _swapsThisFrame = 0;
   private _settleFrameCount = 0;
@@ -160,6 +190,19 @@ export class PixelEngine {
     right: { dx: 0, dy: 0 },
   };
 
+  /**
+   * Scratch frame for {@link flowRun}'s probe walk. Separate from
+   * {@link _frame}, which holds the *source* cell's frame for the duration of
+   * the cell's turn in the update loop and must not be clobbered mid-probe.
+   */
+  private readonly _probeFrame: NeighborFrame = {
+    down: { dx: 0, dy: 0 },
+    downLeft: { dx: 0, dy: 0 },
+    downRight: { dx: 0, dy: 0 },
+    left: { dx: 0, dy: 0 },
+    right: { dx: 0, dy: 0 },
+  };
+
   constructor(options: PixelEngineOptions) {
     const { width, height } = options;
     this.width = width;
@@ -169,6 +212,9 @@ export class PixelEngine {
     this.liquidVel = new Int8Array(width * height);
     this._rngState = (options.seed ?? DEFAULT_SEED) | 0;
     this.gravity = options.gravity ?? new FlatGravity();
+    this._potentialAt = this.gravity.potentialAt
+      ? this.gravity.potentialAt.bind(this.gravity)
+      : null;
     this.CHUNK_SIZE = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
     this.liquidDispersion = options.liquidDispersion ?? DEFAULT_LIQUID_DISPERSION;
     this._onExplode = options.onExplode ?? (() => {});
@@ -362,14 +408,26 @@ export class PixelEngine {
   }
 
   /**
-   * How far along the level axis `(ldx, ldy)` this liquid must travel to reach
-   * a cell it could descend from, or 0 if no descent is reachable within
+   * How far along the level axis this liquid must travel to reach a cell it
+   * could descend from, or 0 if no descent is reachable within
    * {@link liquidDispersion} steps.
    *
    * This is the gate that stops a liquid from flowing for the sake of flowing.
    * A liquid that returns 0 in both directions is at rest and does not move —
    * which is what lets a pool actually go quiet, and what leaves the `updated`
    * flags clear so the cell above can settle downward into it.
+   *
+   * The walk re-derives the movement frame at each probe cell rather than
+   * stepping along the source cell's axis, so under a curved gravity field it
+   * follows the surface instead of shooting off along the tangent it started
+   * on. Under {@link FlatGravity} the frame is constant and this is a no-op;
+   * under {@link RadialGravity} it is the difference between a planet's water
+   * jittering forever and settling to a dead stop — a straight walk of 16
+   * cells along the tangent of an r≈70 planet rises ~1.8 cells clear of the
+   * surface and then tests descent against a stale "down".
+   *
+   * `goLeft` keeps the walk turning in one consistent rotational sense as the
+   * frame rotates beneath it.
    *
    * The path must stay passable the whole way (empty, or a material this one
    * outweighs), so oil floating on water still layers correctly rather than
@@ -379,24 +437,210 @@ export class PixelEngine {
     x: number, y: number, mover: number,
     ldx: number, ldy: number,
     ddx: number, ddy: number,
+    goLeft: boolean,
   ): number {
     const moverDensity = materialDefs[mover].density;
     // The first lateral step must be a legal move right now (updated flags).
     if (!this.canDisplace(x, y, x + ldx, y + ldy)) return 0;
+    const pf = this._probeFrame;
+    let tx = x, ty = y;
+    let sx = ldx, sy = ldy; // step direction, re-derived each cell
+    let dx = ddx, dy = ddy; // down direction, re-derived each cell
     for (let d = 1; d <= this.liquidDispersion; d++) {
-      const tx = x + ldx * d, ty = y + ldy * d;
+      tx += sx; ty += sy;
       if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) return 0;
       const tMat = this.grid[this.getIndex(tx, ty)];
       // Path must stay passable: empty, or something we outweigh.
       if (tMat !== MaterialType.EMPTY && materialDefs[tMat].density >= moverDensity) return 0;
+      // Follow the field: re-derive the frame at the probe cell.
+      fillNeighborFrame(tx, ty, this.gravity, pf);
+      dx = pf.down.dx; dy = pf.down.dy;
+      sx = goLeft ? pf.left.dx : pf.right.dx;
+      sy = goLeft ? pf.left.dy : pf.right.dy;
       // Can we descend from here?
-      const bx = tx + ddx, by = ty + ddy;
+      const bx = tx + dx, by = ty + dy;
       if (bx >= 0 && bx < this.width && by >= 0 && by < this.height) {
         const bMat = this.grid[this.getIndex(bx, by)];
         if (bMat === MaterialType.EMPTY || materialDefs[bMat].density < moverDensity) return d;
       }
     }
     return 0;
+  }
+
+  /**
+   * True if stepping from `(x, y)` by `(dx, dy)` would raise the cell's
+   * gravitational potential — i.e. carry it uphill.
+   *
+   * Returns `false` (no gating, today's behaviour) when the gravity model does
+   * not implement {@link GravityModel.potentialAt}, which keeps custom models
+   * working unchanged.
+   *
+   * The comparison is strict: any rise at all is rejected. That is safe
+   * because the only rises a *level* step can produce are sub-cell
+   * quantization noise (≤ ~0.54 measured on a planet), while genuine downhill
+   * movement is a full cell or more. Under {@link FlatGravity} a level step
+   * never changes `y`, so the difference is exactly 0 and nothing is rejected.
+   */
+  private stepRaisesPotential(x: number, y: number, dx: number, dy: number): boolean {
+    const pot = this._potentialAt;
+    if (pot === null) return false;
+    return pot(x + dx, y + dy) > pot(x, y);
+  }
+
+  /**
+   * Height-field levelling — let a free liquid surface flow to level.
+   *
+   * ## Why this pass has to exist
+   *
+   * A liquid cannot displace its own kind, so a contiguous body is rigid
+   * everywhere except its free surface, and the displacement core can only
+   * advance that surface where there is a full one-cell drop. Measured on a
+   * settled lens, 203 of 206 cells could not take a single step and 93% of
+   * attempted steps were blocked by the liquid itself. The result is that
+   * water piles with a sand-like angle of repose. Walls hide it; open floors
+   * and planet surfaces expose it as lumps.
+   *
+   * The core cannot fix this locally, because the move that resolves it is
+   * non-local: a cell at the top of a mound has to reach a lower part of the
+   * surface, and every cell in between is liquid it cannot pass through. So
+   * this pass transfers it directly.
+   *
+   * ## The rule
+   *
+   * For each free-surface liquid cell, walk the surface outward along both
+   * level directions and transfer the cell to the *first* resting place whose
+   * gravitational potential is at least one full cell lower.
+   *
+   * "First, not lowest" keeps transfers short, which both looks better and
+   * costs less; repetition across frames still drives the surface flat.
+   *
+   * ## Why it terminates
+   *
+   * Let Φ be the total potential of all liquid cells. Every transfer here
+   * lowers Φ by at least 1 by construction; falling lowers it; and since the
+   * lateral-flow potential gate (see {@link stepRaisesPotential}) nothing
+   * raises it. Φ is bounded below, so the system reaches a fixed point and
+   * stops — which is what lets a levelled pool reach zero swaps and idle its
+   * chunks.
+   *
+   * An earlier attempt at this pass accepted destinations at the *same* level
+   * and hung forever at 28 swaps/frame: cells shuffled between equally-good
+   * spots because nothing decreased. The strict one-cell drop is the fix, and
+   * it is load-bearing — do not relax it to "not higher".
+   */
+  private runLiquidLevelling(): void {
+    const pot = this._potentialAt;
+    if (pot === null) return; // model without a potential keeps prior behaviour
+    const f = this._frame;
+    const pf = this._probeFrame;
+    const dir = this.frameCount % 2 === 0 ? 1 : -1;
+
+    // Chunk-major, skipping inactive chunks wholesale — the same shape as
+    // `runCheckerboardUpdate`. Iterating cells first and testing the chunk per
+    // cell still costs a full-grid scan every frame, which showed up as 1.5ms
+    // per frame on a 220x220 planet that had been completely still since frame
+    // one. A settled world must cost nothing.
+    const cs = this.CHUNK_SIZE;
+    for (let cy = this.chunkHeight - 1; cy >= 0; cy--) {
+      const startCX = dir === 1 ? 0 : this.chunkWidth - 1;
+      const endCX = dir === 1 ? this.chunkWidth : -1;
+      for (let cx = startCX; cx !== endCX; cx += dir) {
+        if (!this.activeChunks[cy * this.chunkWidth + cx]) continue;
+
+        const yStart = Math.min(this.height - 1, (cy + 1) * cs - 1);
+        const yEnd = cy * cs;
+        for (let y = yStart; y >= yEnd; y--) {
+          const startX = dir === 1 ? cx * cs : Math.min(this.width - 1, (cx + 1) * cs - 1);
+          const endX = dir === 1 ? Math.min(this.width, (cx + 1) * cs) : cx * cs - 1;
+          for (let x = startX; x !== endX; x += dir) {
+        const idx = this.getIndex(x, y);
+        if (this.updated[idx]) continue;
+        const mat = this.grid[idx];
+        if (mat === MaterialType.EMPTY) continue;
+        if (!materialDefs[mat].isLiquid) continue;
+
+        fillNeighborFrame(x, y, this.gravity, f);
+        // Free surface only: a cell with liquid resting on it is load-bearing.
+        if (this.getMaterial(x - f.down.dx, y - f.down.dy) !== MaterialType.EMPTY) continue;
+
+        const p0 = pot(x, y);
+        let destX = -1;
+        let destY = -1;
+
+        for (let side = 0; side < 2 && destX < 0; side++) {
+          const goLeft = dir === 1 ? side === 0 : side === 1;
+          let sx = goLeft ? f.left.dx : f.right.dx;
+          let sy = goLeft ? f.left.dy : f.right.dy;
+          let dx = f.down.dx, dy = f.down.dy;
+          let tx = x, ty = y;
+
+          for (let d = 1; d <= LIQUID_LEVEL_REACH; d++) {
+            tx += sx; ty += sy;
+            if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) break;
+            const m = this.grid[this.getIndex(tx, ty)];
+
+            // Re-seat onto the local surface: a tangential step lands at an
+            // arbitrary height relative to it.
+            if (m === mat) {
+              let c = 0;
+              while (c < LIQUID_LEVEL_CLIMB && this.getMaterial(tx - dx, ty - dy) === mat) {
+                tx -= dx; ty -= dy; c++;
+              }
+              // Covered by something else (or too deep): stop following.
+              if (this.getMaterial(tx - dx, ty - dy) !== MaterialType.EMPTY) break;
+              tx -= dx; ty -= dy; // the free cell atop this column
+            } else if (m === MaterialType.EMPTY) {
+              let c = 0;
+              while (c < LIQUID_LEVEL_CLIMB && this.getMaterial(tx + dx, ty + dy) === MaterialType.EMPTY) {
+                tx += dx; ty += dy; c++;
+              }
+              // Still nothing underneath: a cliff, not a surface. The ordinary
+              // falling rules handle pouring over an edge.
+              if (this.getMaterial(tx + dx, ty + dy) === MaterialType.EMPTY) break;
+            } else {
+              break; // solid, or a different material
+            }
+
+            // Destination must be free. Deliberately NOT gated on `updated`:
+            // that flag is only cleared inside active chunks, so it goes stale
+            // in settled regions — which is exactly where this walk wants to
+            // deposit liquid. Emptiness is the correct and sufficient test,
+            // since a transfer fills its destination and any later walk this
+            // frame then sees it occupied.
+            const tIdx = this.getIndex(tx, ty);
+            if (this.grid[tIdx] !== MaterialType.EMPTY) break;
+            if (pot(tx, ty) <= p0 - 1) { destX = tx; destY = ty; break; }
+
+            fillNeighborFrame(tx, ty, this.gravity, pf);
+            dx = pf.down.dx; dy = pf.down.dy;
+            sx = goLeft ? pf.left.dx : pf.right.dx;
+            sy = goLeft ? pf.left.dy : pf.right.dy;
+          }
+        }
+
+        if (destX < 0) continue;
+
+        // Transfer (not a swap — the path between is solid liquid).
+        const dIdx = this.getIndex(destX, destY);
+        this.grid[dIdx] = mat;
+        this.grid[idx] = MaterialType.EMPTY;
+        this.updated[dIdx] = 1;
+        this.updated[idx] = 1;
+        if (this.colorGrid) {
+          this.colorGrid[dIdx] = this.colorGrid[idx];
+          this.colorGrid[idx] = 0;
+        }
+        this.liquidVel[dIdx] = 0;
+        this.liquidVel[idx] = 0;
+        this.wakeChunk(x, y);
+        this.wakeChunk(destX, destY);
+        this.markRenderDirty(x, y);
+        this.markRenderDirty(destX, destY);
+        this._swapsThisFrame++;
+          }
+        }
+      }
+    }
   }
 
   private clearUpdatedInActiveChunks(): void {
@@ -448,6 +692,9 @@ export class PixelEngine {
     this.nextActiveChunks.fill(0);
 
     this.runCheckerboardUpdate(deferredExplosions);
+    // Falling and reactions resolve first; levelling then acts on where they
+    // left the liquid, which is the correct physical order.
+    this.runLiquidLevelling();
 
     for (const pt of deferredExplosions) {
       this.explode(pt.x, pt.y, 8, 3);
@@ -644,19 +891,32 @@ export class PixelEngine {
                   // dithering. No RNG: the rule is fully deterministic. Offsets
                   // are gravity-relative, so this works unchanged under any
                   // GravityModel. Gases keep their own rising logic.
-                  const leftRun = this.flowRun(x, y, mat, lDX, lDY, dDX, dDY);
-                  const rightRun = this.flowRun(x, y, mat, rDX, rDY, dDX, dDY);
+                  const leftRun = this.flowRun(x, y, mat, lDX, lDY, dDX, dDY, true);
+                  const rightRun = this.flowRun(x, y, mat, rDX, rDY, dDX, dDY, false);
                   let chosen: 'L' | 'R' | null = null;
-                  if (leftRun > 0 && rightRun > 0) {
+                  // Potential gate: a "level" step must not carry the liquid
+                  // uphill. The level axis is quantized to 8 compass
+                  // directions, so under curved gravity it is only
+                  // approximately level — measured on a planet, 38% of level
+                  // steps drift outward by up to 0.54 cells of head. Ungated,
+                  // that becomes a ratchet: 379 of 483 liquid moves in a
+                  // settled planet lens climb, pumping the body uphill
+                  // indefinitely. Real descents are a full cell or more, so
+                  // rejecting *any* rise separates noise from genuine flow
+                  // without touching the latter. Exactly neutral under flat
+                  // gravity, where a level step never changes y.
+                  const leftOk = leftRun > 0 && !this.stepRaisesPotential(x, y, lDX, lDY);
+                  const rightOk = rightRun > 0 && !this.stepRaisesPotential(x, y, rDX, rDY);
+                  if (leftOk && rightOk) {
                     const vel = this.liquidVel[sourceIdx];
                     if (vel < 0) chosen = 'L';
                     else if (vel > 0) chosen = 'R';
                     else if (leftRun < rightRun) chosen = 'L';
                     else if (rightRun < leftRun) chosen = 'R';
                     else chosen = dir === 1 ? 'R' : 'L';
-                  } else if (leftRun > 0) {
+                  } else if (leftOk) {
                     chosen = 'L';
-                  } else if (rightRun > 0) {
+                  } else if (rightOk) {
                     chosen = 'R';
                   } else {
                     // At rest: no descent reachable either way. Drop the flow

@@ -59,4 +59,32 @@ export interface GravityModel {
    * If omitted, the engine treats magnitude as uniform (1.0).
    */
   magnitudeAt?(x: number, y: number): number;
+
+  /**
+   * Optional gravitational potential ("height") at `(x, y)` — higher means
+   * further uphill. Only the *ordering* and *differences* between cells are
+   * meaningful; the absolute value is arbitrary.
+   *
+   * ## Why the core needs this
+   *
+   * {@link gravityAt} is purely local: it answers "which way is down from
+   * here", but it cannot answer "is that cell over there lower than this
+   * one". Levelling a liquid is inherently a comparison between *distant*
+   * cells — a tall column has to know it is taller than somewhere else before
+   * it can flow there — so it needs a scalar field, not a direction field.
+   *
+   * ## Contract
+   *
+   * The unit is **cells**: a difference of 1.0 means one cell of head. The
+   * field must be consistent with {@link gravityAt} — stepping one cell along
+   * the gravity direction must decrease the potential by approximately 1 — so
+   * that "downhill" means the same thing to both.
+   *
+   * Implementations must be pure, exactly as {@link gravityAt} is.
+   *
+   * **Optional.** A model that omits it simply does not participate in
+   * potential-based levelling, and the simulation behaves exactly as it does
+   * without this method. Existing custom models keep working unchanged.
+   */
+  potentialAt?(x: number, y: number): number;
 }

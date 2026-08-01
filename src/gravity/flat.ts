@@ -21,4 +21,13 @@ export class FlatGravity implements GravityModel {
   gravityAt(_x: number, _y: number): Vec2 {
     return { x: DOWN.x, y: DOWN.y };
   }
+
+  /**
+   * Height above the floor. "Down" is `+Y`, so potential decreases as `y`
+   * grows — one cell down is exactly one unit of head, satisfying the
+   * {@link GravityModel.potentialAt} contract exactly.
+   */
+  potentialAt(_x: number, y: number): number {
+    return -y;
+  }
 }

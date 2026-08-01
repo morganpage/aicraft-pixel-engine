@@ -60,16 +60,24 @@ The library is publishable, but doing so adds a `dependencies` entry to the cons
 
 **Determinism is guaranteed by construction.** Same seed + same sequence of public calls + same gravity model → identical grid evolution over any number of frames. Validated by golden tests. Never call `Math.random()` inside game-affecting logic; use `engine.random()`.
 
-**Tuning liquid leveling (`liquidDispersion`).** A liquid only steps sideways when that direction leads to a cell it could descend from within `liquidDispersion` cells along its level axis — this gate is what lets a settled pool go quiet instead of shimmering, and it leaves the `updated` flags clear so the pool can compact. Higher values level a pool flatter at the cost of a longer per-cell scan *while the liquid is in motion*; once a pool is packed the scan exits at the first cell, so steady-state cost is zero regardless of the value. Default 32. Trade-off summary:
+**Tuning liquid leveling (`liquidDispersion`).** A liquid only steps sideways when that direction leads to a cell it could descend from within `liquidDispersion` cells along its level axis — this gate is what lets a settled pool go quiet instead of shimmering, and it leaves the `updated` flags clear so the pool can compact. The probe re-derives the movement frame at each step, so under `RadialGravity` it follows the planet surface instead of running off along the tangent it started on. Steady-state cost is zero at any value: once a pool is packed the scan exits at the first cell. Default 16. Trade-off summary:
 
-| `liquidDispersion` | leveling (flatness) | cost while flowing | cost when settled |
-|---|---|---|---|
-| 2–4 | rougher surface | lowest | 0 |
-| 16 | good (~2-row residual staircase) | moderate | 0 |
-| **32 (default)** | near-flat (~1 row) | higher (flowing only) | 0 |
-| 64+ | flat | higher (flowing only) | 0 |
+| `liquidDispersion` | flat leveling | radial (planet) | cost while flowing | cost when settled |
+|---|---|---|---|---|
+| 2–8 | rough surface (~4 rows) | quietest | lowest | 0 |
+| **16 (default)** | good (~2-row residual staircase) | quiet (ocean shell settles dead still) | moderate | 0 |
+| 32+ | near-flat (~1 row) | small residual jitter | higher (flowing only) | 0 |
 
-A residual staircase (step width ≈ `liquidDispersion`) remains on a deep pour's surface; it is fully static. Removing it entirely requires a pressure field (a future, larger change).
+The two gravity models pull in opposite directions here, which is why the default is 16 rather than higher: a flat pool is perfectly still at *any* value, so raising it only buys surface flatness — but on a planet a long probe wraps far enough around the curve to keep finding descents in geometry that no longer matches the source cell, leaving a residual shimmer. If your game is flat-only, 32 is a good choice.
+
+**Liquid levelling.** A liquid cannot displace its own kind, so a contiguous body is rigid except at its free surface — which on its own gives water a sand-like angle of repose (visible as lumpy piles on open floors and planet surfaces). The engine corrects this with a levelling pass that walks each free surface and transfers a cell to the nearest resting place at least one cell lower in gravitational *potential*, a scalar "height" supplied by `GravityModel.potentialAt`. Both shipped gravity models provide it; a custom model that omits it simply opts out and behaves as the engine did before.
+
+Levelling is automatic — there is nothing to configure. It settles to a dead stop (every transfer strictly lowers total potential, so the system provably reaches a fixed point) and costs nothing once settled, because it skips inactive chunks.
+
+Remaining limits, all static rather than shimmering:
+- A gentle residual slope of roughly **one cell per 32 cells of span** — about 5 rows across a 300-wide pool. Set by how far the pass looks along the surface.
+- **No pressurised flow.** This acts on free surfaces only: water in a sealed pipe will not rise, and a U-tube will not equalise. That needs a full pressure solve.
+- **Sub-cell volumes.** A blob too small to cover its span at one cell deep pools into a lens rather than a film — a 9-cell brush blob on a 220-wide planet is 0.4 cells thick spread out, which no rule can render evenly. Use more water for a full shell.
 
 ---
 
