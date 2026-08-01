@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>aicraft-pixel-engine — Falling-Sand Physics for Games</title>
+    <meta
+      name="description"
+      content="A pixel-based falling-sand cellular-automaton physics engine. Zero runtime dependencies. Deterministic. Pluggable gravity: flat worlds and circular planets."
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <h1 class="site-title">aicraft-pixel-engine</h1>
+      <p class="site-tagline">
+        Pixel-based falling-sand physics. Deterministic. Pluggable gravity — flat worlds and circular planets.
+      </p>
+    </header>
+
+    <main>
+      <!--
+        Section 1 — Flat falling-sand sandbox.
+        Paint materials in and watch them simulate: sand piles, water levels,
+        lava+water→rock+steam, fire spreads, acid dissolves, oil floats.
+      -->
+      <section id="sandbox" class="section sandbox-section">
+        <div class="copy">
+          <h2 class="section-title">Falling sand. Destructible terrain. Density.</h2>
+          <p class="blurb">
+            A flat-world falling-sand cellular automaton. Pick a material and
+            drag on the grid: sand piles, water levels out, lava cools to rock
+            on water contact and throws off steam, fire spreads through
+            flammables, acid dissolves solids, oil floats on water. Everything
+            is density-driven and deterministic from the seed.
+          </p>
+
+          <div class="toolbar" role="toolbar" aria-label="Material brushes">
+            <button class="btn brush sandbox-brush" data-mat="2" type="button">Sand</button>
+            <button class="btn brush sandbox-brush" data-mat="3" type="button">Water</button>
+            <button class="btn brush sandbox-brush" data-mat="4" type="button">Lava</button>
+            <button class="btn brush sandbox-brush" data-mat="9" type="button">Oil</button>
+            <button class="btn brush sandbox-brush" data-mat="10" type="button">Acid</button>
+            <button class="btn brush sandbox-brush" data-mat="11" type="button">Wood</button>
+            <button class="btn brush sandbox-brush" data-mat="1" type="button">Wall</button>
+            <button class="btn brush sandbox-brush" data-mat="5" type="button">Rock</button>
+            <button class="btn brush sandbox-brush" data-mat="7" type="button">Fire</button>
+            <button class="btn brush sandbox-brush" data-mat="13" type="button">Ice</button>
+            <button class="btn brush sandbox-brush brush-erase" data-mat="0" type="button">⌫ Erase</button>
+          </div>
+
+          <div class="controls">
+            <label class="slider-label" for="sandbox-brush-size">
+              Brush: <span class="sandbox-brush-size-value">3</span>
+              <input id="sandbox-brush-size" class="slider sandbox-brush-size" type="range" min="1" max="8" step="1" value="3" />
+            </label>
+            <button class="btn action sandbox-explode" type="button">💣 Explode</button>
+            <button class="btn action sandbox-clear" type="button">🧹 Clear</button>
+          </div>
+
+          <p class="hint">
+            <span class="kbd">drag</span> to paint ·
+            <span class="kbd">💣</span> detonates at center ·
+            try <strong>Lava</strong> into <strong>Water</strong>, or <strong>Acid</strong> onto <strong>Wood</strong>
+          </p>
+        </div>
+
+        <div class="stage">
+          <canvas class="sandbox-canvas" aria-label="Flat falling-sand sandbox"></canvas>
+        </div>
+      </section>
+
+      <!--
+        Section 2 — Radial-gravity planet.
+        Gravity points toward the planet center; material dropped anywhere
+        curves inward and settles as a ring on the surface.
+      -->
+      <section id="planet" class="section planet-section">
+        <div class="copy">
+          <h2 class="section-title">Gravity points to the center.</h2>
+          <p class="blurb">
+            The same engine, but gravity is <code>RadialGravity</code>: every
+            cell falls toward the planet center, not toward <code>+Y</code>.
+            Paint sand or water anywhere in the void and watch it curve inward
+            and settle as a layer on the surface — the defining behavior for
+            Reus / Godfinger-style circular-planet god games. The white
+            crosshair marks the gravity source.
+          </p>
+
+          <div class="toolbar" role="toolbar" aria-label="Material brushes">
+            <button class="btn brush planet-brush" data-mat="2" type="button">Sand</button>
+            <button class="btn brush planet-brush" data-mat="3" type="button">Water</button>
+            <button class="btn brush planet-brush" data-mat="4" type="button">Lava</button>
+            <button class="btn brush planet-brush" data-mat="9" type="button">Oil</button>
+            <button class="btn brush planet-brush" data-mat="7" type="button">Fire</button>
+            <button class="btn brush planet-brush" data-mat="5" type="button">Rock</button>
+            <button class="btn brush planet-brush" data-mat="11" type="button">Wood</button>
+            <button class="btn brush planet-brush brush-erase" data-mat="0" type="button">⌫ Erase</button>
+          </div>
+
+          <div class="controls">
+            <label class="slider-label" for="planet-brush-size">
+              Brush: <span class="planet-brush-size-value">3</span>
+              <input id="planet-brush-size" class="slider planet-brush-size" type="range" min="1" max="8" step="1" value="3" />
+            </label>
+            <button class="btn action planet-scatter" type="button">🌍 Scatter</button>
+            <button class="btn action planet-spin" type="button" aria-pressed="false">🌀 Spin</button>
+            <button class="btn action planet-clear" type="button">🧹 Clear</button>
+          </div>
+
+          <p class="hint">
+            <span class="kbd">drag</span> to paint ·
+            <span class="kbd">🌍</span> drops a shell of sand &amp; water in orbit — watch it settle into a ring ·
+            <span class="kbd">🌀</span> slowly spins the planet
+          </p>
+        </div>
+
+        <div class="stage">
+          <canvas class="planet-canvas" aria-label="Radial-gravity planet"></canvas>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>Live validation scenes for the falling-sand simulation and gravity models.</p>
+    </footer>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
