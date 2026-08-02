@@ -105,19 +105,72 @@
             </label>
             <button class="btn action planet-scatter" type="button">🌍 Scatter</button>
             <button class="btn action planet-volcano" type="button" aria-pressed="false">🌋 Volcano</button>
+            <button class="btn action planet-cloud" type="button" aria-pressed="false">☁ Cloud</button>
             <button class="btn action planet-spin" type="button" aria-pressed="false">🌀 Spin</button>
             <button class="btn action planet-clear" type="button">🧹 Clear</button>
+          </div>
+
+          <div class="controls" data-world-controls>
+            <label class="slider-label" for="planet-resolution">
+              Resolution: <span class="planet-resolution-value">220×220</span>
+              <input id="planet-resolution" class="slider planet-resolution" type="range" min="120" max="400" step="20" value="220" />
+            </label>
+            <label class="slider-label" for="planet-diameter">
+              Diameter: <span class="planet-diameter-value">60% (r=66)</span>
+              <input id="planet-diameter" class="slider planet-diameter" type="range" min="30" max="80" step="2" value="60" />
+            </label>
+          </div>
+
+          <div class="controls" data-volcano-controls>
+            <label class="slider-label" for="planet-volcano-cooling">
+              Cooling: <span class="planet-volcano-cooling-value">0.12</span>
+              <input id="planet-volcano-cooling" class="slider planet-volcano-cooling" type="range" min="0.04" max="0.24" step="0.01" value="0.12" />
+            </label>
+            <label class="slider-label" for="planet-volcano-effusion">
+              Effusion: <span class="planet-volcano-effusion-value">1</span>
+              <input id="planet-volcano-effusion" class="slider planet-volcano-effusion" type="range" min="1" max="5" step="1" value="1" />
+            </label>
+            <label class="slider-label" for="planet-volcano-ash">
+              Ash: <span class="planet-volcano-ash-value">8</span>
+              <input id="planet-volcano-ash" class="slider planet-volcano-ash" type="range" min="1" max="16" step="1" value="8" />
+            </label>
+            <label class="slider-label" for="planet-volcano-spread">
+              Spread: <span class="planet-volcano-spread-value">0.36</span>
+              <input id="planet-volcano-spread" class="slider planet-volcano-spread" type="range" min="0.12" max="0.60" step="0.02" value="0.36" />
+            </label>
+          </div>
+
+          <div class="controls" data-cloud-controls>
+            <label class="slider-label" for="planet-rain">
+              Rain: <span class="planet-rain-value">2</span>
+              <input id="planet-rain" class="slider planet-rain" type="range" min="1" max="6" step="1" value="2" />
+            </label>
           </div>
 
           <p class="hint">
             <span class="kbd">drag</span> to paint ·
             <span class="kbd">🌍</span> drops a shell of sand &amp; water in orbit — watch it settle into a ring ·
-            <span class="kbd">🌀</span> slowly spins the planet
+            <span class="kbd">🌀</span> slowly spins the planet ·
+            <span class="kbd">🌋</span> erupts in episodes:
+            <span class="planet-volcano-phase">—</span>
+          </p>
+          <p class="hint">
+            <span class="kbd">☁ Cloud</span> enters cloud mode — drag above the surface to paint clouds that rain water and shrink as they empty.
+          </p>
+          <p class="hint">
+            <span class="kbd">Resolution</span> and <span class="kbd">Diameter</span>
+            rebuild the world, so both clear whatever you have painted.
           </p>
         </div>
 
         <div class="stage">
           <canvas class="planet-canvas" aria-label="Radial-gravity planet"></canvas>
+          <!--
+            Engine workload, not frame rate: cells scanned per tick is
+            deterministic and machine-independent, so it is the figure to size
+            the resolution slider's ceiling against. Averaged over 30 ticks.
+          -->
+          <p class="perf planet-perf" aria-live="off">—</p>
         </div>
       </section>
     </main>

@@ -192,7 +192,21 @@ main {
 
 .stage {
   display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
+  gap: 0.5rem;
+}
+
+/* Engine workload readout under a canvas. Tabular figures so the numbers
+   don't jitter sideways as they update. */
+.perf {
+  margin: 0;
+  font-size: 0.78rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-dim);
+  text-align: center;
 }
 
 canvas {
