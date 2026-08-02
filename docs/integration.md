@@ -79,6 +79,16 @@ Remaining limits, all static rather than shimmering:
 - **No pressurised flow.** This acts on free surfaces only: water in a sealed pipe will not rise, and a U-tube will not equalise. That needs a full pressure solve.
 - **Sub-cell volumes.** A blob too small to cover its span at one cell deep pools into a lens rather than a film — a 9-cell brush blob on a 220-wide planet is 0.4 cells thick spread out, which no rule can render evenly. Use more water for a full shell.
 
+**Yield strength (`yieldThickness`) — liquids that are not water.** Levelling above describes a *Newtonian* liquid: it flows until level however thin the film gets. Lava does not behave that way. It is a Bingham plastic with a real yield strength, so a flow only advances while the driving stress — which scales with its thickness — beats that strength, and it simply stops where it thins out.
+
+A material opts in by setting `yieldThickness` in its `MaterialDef` (lava does; water, oil, and acid do not and are completely unaffected). The engine then refuses sideways and levelling moves for any parcel of that material thinner than the threshold, measured as the contiguous run through the cell along the gravity axis. Falling straight down is never gated, so airborne material still falls normally and only stiffens once it lands.
+
+This is what produces every shape lava is known for: a blunt flow front instead of a feather edge, chilled margins that stall into levees and channel the still-mobile core, and an edifice that can stack up at all. Without it a liquid on a planet has only two states — spreading toward an equipotential shell, or frozen solid — with nothing in between. Measured on a lava-fed planet before the term existed, a cooling rate of 0.02 let the flow wrap 180° around the planet as an orange ocean, while 0.5 froze it within 32° of the vent; a flow that travels a bounded distance downslope and *stops* was not reachable at any cooling rate.
+
+**Per-cell rheology (`stiffnessGrid`).** Yield strength is not really a constant of the material — for lava it climbs by orders of magnitude as the melt cools and crystallizes. `engine.stiffnessGrid` is an optional `Uint8Array` overriding `yieldThickness` per cell (`0` means "use the material's value"). Like `colorGrid` it rides with the material through swaps and levelling transfers, so a stiffened parcel stays stiff as it moves.
+
+A host that tracks temperature writes it each frame — fresh lava mobile, chilled lava locked — which is what makes a flow run while hot and set where it has cooled. A host that does not can ignore the field entirely. Keep the mobile end at **2 or more, never 1**: at 1 the criterion can never be met (a single cell is already one cell thick), so the liquid thins without limit into a half-occupied monolayer that freezes as a checkerboard of specks. See `showcase/helpers/volcano.ts` for a worked example.
+
 ---
 
 ## 3. Minimum viable sandbox

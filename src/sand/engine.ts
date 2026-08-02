@@ -134,6 +134,24 @@ export class PixelEngine {
    * custom colors (e.g. explosion debris). Lazily allocated on first write.
    */
   colorGrid: Uint32Array | null = null;
+  /**
+   * Optional per-cell override of {@link MaterialDef.yieldThickness}, in cells.
+   * `0` (the default everywhere) means "use the material's own value".
+   *
+   * Like {@link colorGrid} this rides with the material: the engine keeps it in
+   * sync on swaps and levelling transfers, so a stiffened parcel of fluid stays
+   * stiff as it moves. Lazily allocated on first write.
+   *
+   * It exists because yield strength is not really a constant of the material —
+   * for lava it is a strong function of temperature, rising by orders of
+   * magnitude as the melt cools and crystallizes. That single dependence is what
+   * shapes a real flow: the hot core stays mobile while the chilled margins and
+   * the flow front stiffen first, which is what builds levees, gives the front
+   * its blunt snout, and stops the flow at a finite length. A host that tracks
+   * temperature writes it here; a host that does not can ignore the field
+   * entirely and get the material's constant.
+   */
+  stiffnessGrid: Uint8Array | null = null;
   /** Per-cell "already processed this frame" flag. */
   readonly updated: Uint8Array;
   /**
@@ -240,6 +258,7 @@ export class PixelEngine {
   clear(): void {
     this.grid.fill(MaterialType.EMPTY);
     if (this.colorGrid) this.colorGrid.fill(0);
+    if (this.stiffnessGrid) this.stiffnessGrid.fill(0);
     this.updated.fill(0);
     this.liquidVel.fill(0);
     this.activeChunks.fill(1);
@@ -338,8 +357,11 @@ export class PixelEngine {
       // v1 has no rigid-body terrain to rebuild, but we keep the semantic
       // flag available for a future layer / for consumer inspection.
     }
-    if (oldMat !== mat && this.colorGrid) {
-      this.colorGrid[idx] = 0;
+    if (oldMat !== mat) {
+      if (this.colorGrid) this.colorGrid[idx] = 0;
+      // A cell that has become a different material carries none of the old
+      // one's rheology.
+      if (this.stiffnessGrid) this.stiffnessGrid[idx] = 0;
     }
     // A freshly-placed cell carries no flow direction.
     this.liquidVel[idx] = 0;
@@ -369,6 +391,11 @@ export class PixelEngine {
       const c1 = this.colorGrid[idx1];
       this.colorGrid[idx1] = this.colorGrid[idx2];
       this.colorGrid[idx2] = c1;
+    }
+    if (this.stiffnessGrid) {
+      const s1 = this.stiffnessGrid[idx1];
+      this.stiffnessGrid[idx1] = this.stiffnessGrid[idx2];
+      this.stiffnessGrid[idx2] = s1;
     }
     this.wakeChunk(x1, y1);
     this.wakeChunk(x2, y2);
@@ -468,6 +495,63 @@ export class PixelEngine {
   }
 
   /**
+   * How many cells thick this liquid's flow is at `(x, y)`, measured along the
+   * gravity axis — the contiguous run of the same material through this cell,
+   * counting both up and down from it.
+   *
+   * This is the discrete stand-in for the flow depth `h` in a yield-stress
+   * criterion: a Bingham fluid advances only while `ρ·g·h·sinθ` exceeds its
+   * yield strength, and on a fixed grid with fixed gravity, `h` is the only
+   * term that varies from cell to cell. So thickness *is* the flow/no-flow
+   * discriminator, and {@link MaterialDef.yieldThickness} is the threshold.
+   *
+   * Counting both directions makes the measure agree between the engine's two
+   * movement paths, which see a column from different places: the levelling
+   * pass only ever handles the free-surface cell at the top of a column (where
+   * everything is below), while the checkerboard's lateral-flow branch can
+   * handle any cell in it. Counting only one way would report a thickness of 1
+   * for a surface cell and stall a genuinely thick flow.
+   *
+   * Capped at `cap` so the walk stays O(1) on a deep body — the answer only
+   * has to be comparable against a small threshold, never exact.
+   */
+  flowThickness(x: number, y: number, mat: number, dDX: number, dDY: number, cap: number): number {
+    let n = 1;
+    // Up (against gravity), then down. Both bounded by `cap`.
+    for (let i = 1; i < cap; i++) {
+      const tx = x - dDX * i, ty = y - dDY * i;
+      if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) break;
+      if (this.grid[this.getIndex(tx, ty)] !== mat) break;
+      n++;
+    }
+    for (let i = 1; n < cap; i++) {
+      const tx = x + dDX * i, ty = y + dDY * i;
+      if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) break;
+      if (this.grid[this.getIndex(tx, ty)] !== mat) break;
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * True if this liquid is too thin at `(x, y)` to overcome its own yield
+   * strength, and so must not spread sideways or level this frame.
+   *
+   * Always false for a material without a {@link MaterialDef.yieldThickness},
+   * which is every material except lava — so Newtonian liquids keep their
+   * previous behavior exactly.
+   */
+  private belowYield(x: number, y: number, mat: number, dDX: number, dDY: number): boolean {
+    // Per-cell stiffness wins over the material constant when the host supplies
+    // it; 0 means "not set".
+    const yt =
+      (this.stiffnessGrid ? this.stiffnessGrid[this.getIndex(x, y)] : 0) ||
+      materialDefs[mat].yieldThickness;
+    if (!yt) return false;
+    return this.flowThickness(x, y, mat, dDX, dDY, yt) < yt;
+  }
+
+  /**
    * True if stepping from `(x, y)` by `(dx, dy)` would raise the cell's
    * gravitational potential — i.e. carry it uphill.
    *
@@ -563,6 +647,13 @@ export class PixelEngine {
         // Free surface only: a cell with liquid resting on it is load-bearing.
         if (this.getMaterial(x - f.down.dx, y - f.down.dy) !== MaterialType.EMPTY) continue;
 
+        // Yield strength: levelling is the *water* behaviour — chase the
+        // lowest reachable spot however thin the film. A liquid with a yield
+        // strength does not do that, and letting it would undo the flow front
+        // entirely, since this pass is non-local and would teleport a
+        // one-cell-thick flow margin far downslope.
+        if (this.belowYield(x, y, mat, f.down.dx, f.down.dy)) continue;
+
         const p0 = pot(x, y);
         let destX = -1;
         let destY = -1;
@@ -629,6 +720,10 @@ export class PixelEngine {
         if (this.colorGrid) {
           this.colorGrid[dIdx] = this.colorGrid[idx];
           this.colorGrid[idx] = 0;
+        }
+        if (this.stiffnessGrid) {
+          this.stiffnessGrid[dIdx] = this.stiffnessGrid[idx];
+          this.stiffnessGrid[idx] = 0;
         }
         this.liquidVel[dIdx] = 0;
         this.liquidVel[idx] = 0;
@@ -864,6 +959,26 @@ export class PixelEngine {
               // --- Falling + liquid flow (gravity-relative) ---
               if (this.canDisplace(x, y, x + dDX, y + dDY)) {
                 this.swap(x, y, x + dDX, y + dDY);
+              } else if (this.belowYield(x, y, mat, dDX, dDY)) {
+                // Yield strength: this parcel is too thin to overcome its own
+                // strength, so it stops. Both the diagonals and the level step
+                // are blocked; only falling straight down (handled above) stays
+                // open, so a cell still in the air keeps falling normally and
+                // stiffens only once it has landed.
+                //
+                // The diagonals have to be included. On a curved planet the
+                // quantized movement frame turns every surface into a staircase
+                // of one-cell steps, so a diagonal is nearly always available
+                // and becomes the creep path: with the diagonals left open, a
+                // one-cell-thick sheet crept the whole 180° around the planet at
+                // every cooling rate tried, no matter what the level-axis gate
+                // said.
+                //
+                // What keeps that from freezing flows solid is that the
+                // threshold is not a constant — see `stiffnessGrid`. Fresh lava
+                // is set nearly fluid and moves freely; it stiffens as it cools,
+                // so a flow runs while hot and locks where it has chilled.
+                this.liquidVel[sourceIdx] = 0;
               } else {
                 const canGoLeft = this.canDisplace(x, y, x + dlDX, y + dlDY);
                 const canGoRight = this.canDisplace(x, y, x + drDX, y + drDY);

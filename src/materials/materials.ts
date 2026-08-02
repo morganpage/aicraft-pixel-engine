@@ -53,6 +53,34 @@ export interface MaterialDef {
   flammability: number;
   /** Surface friction (0–1). Exposed for consumers; unused by the v1 core. */
   friction: number;
+  /**
+   * Yield strength, expressed as the minimum flow thickness (in cells) at
+   * which this liquid will spread sideways or level. `0`/absent = Newtonian:
+   * spreads at any depth, which is the behavior every liquid had before this
+   * field existed.
+   *
+   * Water is Newtonian — it flows until level however thin the film. Lava is
+   * not: it is a Bingham plastic with a real yield strength, so a flow only
+   * advances while the driving stress (which scales with thickness × slope)
+   * exceeds it. Thin out, and the flow simply stops where it is.
+   *
+   * That single difference is what gives lava every shape it is known for. A
+   * flow stops at a blunt front one yield-thickness tall instead of feathering
+   * away to nothing; its cooling margins stall first and become levees that
+   * channel the still-molten core; and successive flows stack instead of
+   * draining away, which is the only reason an edifice can exist at all.
+   *
+   * Without it, a liquid on a planet has exactly two states — spreading toward
+   * an equipotential shell, or frozen solid — and there is no setting in
+   * between. Measured on a lava-fed planet before this field existed: at a
+   * cooling rate of 0.02 the flow wrapped 180° around the planet (an orange
+   * ocean), and at 0.5 it froze within 32° of the vent. A flow that travels a
+   * bounded distance downslope and then *stops* — which is what a lava flow
+   * is — was not reachable at any cooling rate.
+   *
+   * @see PixelEngine.flowThickness for how thickness is measured.
+   */
+  yieldThickness?: number;
 }
 
 /**
@@ -63,7 +91,12 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.WALL]: { id: MaterialType.WALL, name: 'Wall', color: [100, 100, 100, 255], density: 1000, isLiquid: false, isGas: false, flammability: 0, friction: 1 },
   [MaterialType.SAND]: { id: MaterialType.SAND, name: 'Sand', color: [230, 200, 100, 255], density: 10, isLiquid: false, isGas: false, flammability: 0, friction: 0.8 },
   [MaterialType.WATER]: { id: MaterialType.WATER, name: 'Water', color: [50, 100, 255, 200], density: 5, isLiquid: true, isGas: false, flammability: 0, friction: 0.1 },
-  [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5 },
+  // yieldThickness 3: lava spreads only where the flow is at least 3 cells
+  // thick, so a tongue advances while it is being fed and halts at a blunt
+  // front once it thins. This is the value for lava with no temperature behind
+  // it — a host tracking heat overrides it per cell via `stiffnessGrid`, since
+  // the real quantity climbs steeply as the melt cools.
+  [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5, yieldThickness: 3 },
   [MaterialType.ROCK]: { id: MaterialType.ROCK, name: 'Rock', color: [80, 80, 80, 255], density: 100, isLiquid: false, isGas: false, flammability: 0, friction: 0.9 },
   [MaterialType.STEAM]: { id: MaterialType.STEAM, name: 'Steam', color: [200, 200, 200, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1 },
   [MaterialType.FIRE]: { id: MaterialType.FIRE, name: 'Fire', color: [255, 150, 0, 255], density: -2, isLiquid: false, isGas: true, flammability: 0, friction: 0.1 },
