@@ -20,7 +20,7 @@
  * diagonal flips, producing mild chunkiness — but the result is stable and
  * deterministic. This is the standard approach for square-grid planet sims.
  */
-import type { GravityModel, Vec2 } from './types';
+import type { GravityModel, Vec2 } from './types.js';
 
 /** Options for constructing a {@link RadialGravity}. */
 export interface RadialGravityOptions {

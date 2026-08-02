@@ -7,7 +7,7 @@
  * frame equals the original hardcoded offsets `{down:(0,1), downLeft:(-1,1),
  * downRight:(1,1), left:(-1,0), right:(1,0)}`.
  */
-import type { GravityModel, Vec2 } from './types';
+import type { GravityModel, Vec2 } from './types.js';
 
 /** Shared constant — `gravityAt` is allocation-free. */
 const DOWN: Readonly<Vec2> = { x: 0, y: 1 };

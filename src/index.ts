@@ -7,6 +7,6 @@
  * Import from individual modules for optimal tree-shaking, or from the
  * package root for convenience.
  */
-export * from './materials';
-export * from './gravity';
-export * from './sand';
+export * from './materials/index.js';
+export * from './gravity/index.js';
+export * from './sand/index.js';

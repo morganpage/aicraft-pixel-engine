@@ -5,4 +5,4 @@ export {
   TERRAIN_SOLIDS,
   isTerrainSolid,
   type MaterialDef,
-} from './materials';
+} from './materials.js';

@@ -23,8 +23,8 @@
  * For **g** = (0, 1) (flat) this yields exactly the original hardcoded
  * offsets — verified by `gravity-flat.test.ts`.
  */
-import type { GravityModel, Vec2 } from '../gravity/types';
-import type { NeighborFrame } from './types';
+import type { GravityModel, Vec2 } from '../gravity/types.js';
+import type { NeighborFrame } from './types.js';
 
 /** Inline a small sign helper to avoid allocating closures. */
 function sign(v: number): number {

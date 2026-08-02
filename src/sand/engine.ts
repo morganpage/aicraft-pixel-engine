@@ -23,10 +23,10 @@
  * frame-alternating scan, the material interaction rules, the chunk system,
  * and the settle detection are all preserved from the original.
  */
-import { MaterialType, Materials, materialDefs, isTerrainSolid } from '../materials';
-import { FlatGravity, type GravityModel } from '../gravity';
-import type { NeighborFrame } from './types';
-import { fillNeighborFrame } from './neighbors';
+import { MaterialType, Materials, materialDefs, isTerrainSolid } from '../materials/index.js';
+import { FlatGravity, type GravityModel } from '../gravity/index.js';
+import type { NeighborFrame } from './types.js';
+import { fillNeighborFrame } from './neighbors.js';
 
 /** Default simulation seed. */
 const DEFAULT_SEED = 12345;

@@ -4,6 +4,17 @@ All notable changes to **aicraft-pixel-engine** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-08-03
+
+### Fixed
+- **Package root entry now loads in plain Node ESM.** 0.1.0 emitted extension-less
+  directory re-exports (`export * from './materials'`), which bundlers and `tsx`
+  resolve but stock Node rejects with `ERR_UNSUPPORTED_DIR_IMPORT`. The build
+  (`tsconfig.build.json`) now uses `module: NodeNext` / `moduleResolution: NodeNext`,
+  and every relative import in `src/` carries an explicit `.js` extension, so the
+  emitted `dist/` is Node-ESM-correct. No runtime behavior change; bundler and
+  `tsx` consumers are unaffected.
+
 ## [0.1.0] — 2026-08-02
 
 Initial public release. A pixel-based falling-sand cellular-automaton physics
@@ -74,4 +85,5 @@ library to `aicraft-engine`.
 - No rendering — the library owns the simulation; you own the canvas.
 - No level generation, loading, or serialization. Only the simulation core.
 
-[0.1.0]: https://www.npmjs.com/package/aicraft-pixel-engine
+[0.1.0]: https://www.npmjs.com/package/aicraft-pixel-engine/v/0.1.0
+[0.1.1]: https://www.npmjs.com/package/aicraft-pixel-engine/v/0.1.1

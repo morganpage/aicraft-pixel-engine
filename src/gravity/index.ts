@@ -1,3 +1,3 @@
-export { FlatGravity } from './flat';
-export { RadialGravity, type RadialGravityOptions } from './radial';
-export type { GravityModel, Vec2 } from './types';
+export { FlatGravity } from './flat.js';
+export { RadialGravity, type RadialGravityOptions } from './radial.js';
+export type { GravityModel, Vec2 } from './types.js';

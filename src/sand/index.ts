@@ -4,6 +4,6 @@ export {
   SETTLE_TIMEOUT_FRAMES,
   type PixelEngineOptions,
   type ExplosionHook,
-} from './engine';
-export { neighborFrame, fillNeighborFrame } from './neighbors';
-export type { NeighborFrame, CellOffset } from './types';
+} from './engine.js';
+export { neighborFrame, fillNeighborFrame } from './neighbors.js';
+export type { NeighborFrame, CellOffset } from './types.js';
