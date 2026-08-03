@@ -590,3 +590,181 @@ describe('heat step — settling', () => {
     expect(Array.from(e.consumeRenderDirtyChunks()).some((v) => v)).toBe(false);
   });
 });
+
+describe('heat step — phase change', () => {
+  it('freezes lava into rock once it drops below its threshold', () => {
+    const e = floored(40, 24, { heat: true });
+    for (let x = 10; x < 20; x++) { e.setMaterial(x, 22, MaterialType.LAVA); e.setHeat(x, 22, 1); }
+    let frozenAt = -1;
+    for (let i = 0; i < 2000; i++) {
+      e.update();
+      if (e.getMaterial(15, 22) === MaterialType.ROCK) { frozenAt = i; break; }
+    }
+    expect(frozenAt).toBeGreaterThan(0);
+  });
+
+  it('carries temperature across the change instead of resetting it', () => {
+    // Rock created by freezing lava must arrive at the freezing point and fade
+    // from there, not snap to ambient. FREEZE-point rock that is instantly grey
+    // loses the glow-and-fade that is most of what makes a cooling flow read as
+    // a single connected body rather than pepper stirred through gravel.
+    const e = floored(40, 24, { heat: true });
+    for (let x = 10; x < 20; x++) { e.setMaterial(x, 22, MaterialType.LAVA); e.setHeat(x, 22, 1); }
+    const freeze = Materials[MaterialType.LAVA].freezesAt!;
+    for (let i = 0; i < 2000; i++) {
+      e.update();
+      if (e.getMaterial(15, 22) === MaterialType.ROCK) break;
+    }
+    const t = e.getHeat(15, 22);
+    expect(t).toBeCloseTo(freeze, 1);                      // arrived at the threshold
+    expect(t).toBeGreaterThan(DEFAULT_AMBIENT_TEMPERATURE); // not reset to ambient
+    expect(t).not.toBe(Materials[MaterialType.ROCK].spawnTemp ?? DEFAULT_AMBIENT_TEMPERATURE);
+  });
+
+  it('never freezes a cell that is still in the air', () => {
+    // The engine has no velocity, so a parcel in flight is a lone cell with air
+    // on every side -- maximum exposure, and so the likeliest thing to cross a
+    // freezing threshold before it has landed. Rock never falls, so without the
+    // support guard a lava bomb sets mid-air and hangs there forever.
+    const e = floored(40, 24, { heat: true });
+    e.setMaterial(20, 3, MaterialType.LAVA);
+    e.setHeat(20, 3, 0.01); // already far below freezing
+    for (let i = 0; i < 8; i++) {
+      e.update();
+      for (let y = 0; y < 22; y++) {
+        // Nothing may be rock anywhere above the floor while it is falling.
+        expect(e.getMaterial(20, y)).not.toBe(MaterialType.ROCK);
+      }
+    }
+    for (let i = 0; i < 200; i++) e.update();
+    expect(e.getMaterial(20, 22)).toBe(MaterialType.ROCK); // sets once landed
+  });
+
+  it('melts ice and boils water, and lets steam live long enough to rise', () => {
+    // Steam is the case that exposes the missing latent heat. Because phase
+    // change carries temperature across, water boiling at meltsAt becomes steam
+    // at meltsAt -- so a condensation threshold just below it gave steam a
+    // measured lifetime of ONE frame, flickering back to water instead of
+    // forming a plume. The wide gap is the stateless stand-in.
+    const e = floored(40, 40, { heat: true });
+    e.setMaterial(20, 38, MaterialType.STEAM);
+    e.setHeat(20, 38, Materials[MaterialType.WATER].meltsAt!);
+    let lived = 0;
+    for (let i = 0; i < 3000; i++) {
+      e.update();
+      let seen = false;
+      for (let y = 0; y < 40 && !seen; y++) {
+        for (let x = 0; x < 40; x++) if (e.getMaterial(x, y) === MaterialType.STEAM) { seen = true; break; }
+      }
+      if (!seen) break;
+      lived++;
+    }
+    expect(lived).toBeGreaterThan(15);
+  });
+
+  it('does not oscillate for a cell held inside the hysteresis band', () => {
+    // Between the condensation and boiling thresholds neither transform fires,
+    // so a cell sitting mid-band must stay put. Without the band it would flip
+    // between a density-5 liquid that falls and a density--1 gas that rises,
+    // every frame, thrashing the grid.
+    const boil = Materials[MaterialType.WATER].meltsAt!;
+    const condense = Materials[MaterialType.STEAM].freezesAt!;
+    const mid = (boil + condense) / 2;
+    const e = new PixelEngine({
+      width: 16, height: 16, seed: 1, gravity: new FlatGravity(),
+      enableHeat: true, ambientTemperature: mid,
+    });
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) e.setMaterial(x, y, MaterialType.ROCK);
+    e.setMaterial(8, 8, MaterialType.WATER);
+    e.setHeat(8, 8, mid);
+    for (let i = 0; i < 100; i++) {
+      e.update();
+      expect(e.getMaterial(8, 8)).toBe(MaterialType.WATER);
+    }
+  });
+});
+
+describe('heat step — contact reactions', () => {
+  it('keeps the instant reactions byte-for-byte when heat is disabled', () => {
+    // The opt-in guarantee for the gating specifically: with no heat grid,
+    // lava/water, fire/water and ice contact must behave exactly as before.
+    const e = floored(20, 12, { heat: false });
+    e.setMaterial(5, 10, MaterialType.LAVA);
+    e.setMaterial(6, 10, MaterialType.WATER);
+    e.update();
+    expect(e.getMaterial(5, 10)).toBe(MaterialType.ROCK);
+    expect(e.getMaterial(6, 10)).toBe(MaterialType.STEAM);
+
+    const ice = floored(20, 12, { heat: false });
+    ice.setMaterial(5, 10, MaterialType.LAVA);
+    ice.setMaterial(6, 10, MaterialType.ICE);
+    ice.update();
+    expect(ice.getMaterial(6, 10)).toBe(MaterialType.WATER); // instant
+  });
+
+  it('mediates those same reactions through temperature when heat is on', () => {
+    // Left instant, they pre-empt the whole field: ICE.meltsAt would be
+    // decorative in any world containing lava. Mediated, the ice still melts --
+    // it just has to be warmed first.
+    const e = floored(20, 12, { heat: true });
+    e.setMaterial(5, 10, MaterialType.LAVA);
+    e.setHeat(5, 10, 1);
+    e.setMaterial(6, 10, MaterialType.ICE);
+    e.update();
+    expect(e.getMaterial(6, 10)).toBe(MaterialType.ICE); // not instant any more
+
+    let meltedAt = -1;
+    for (let i = 0; i < 3000; i++) {
+      e.update();
+      if (e.getMaterial(6, 10) === MaterialType.WATER) { meltedAt = i; break; }
+    }
+    expect(meltedAt).toBeGreaterThan(0); // but it does melt
+  });
+
+  it('lets fire boil water it is in sustained contact with', () => {
+    // The motivating example, and the one an earlier draft of the design made
+    // unreachable twice over: fire held below water's boiling point (a source
+    // cannot drive a neighbour past itself), and fire beside water deleted on
+    // frame one so it never got the time.
+    const e = floored(20, 24, { heat: true });
+    for (let y = 19; y <= 22; y++) for (let x = 8; x <= 12; x++) e.setMaterial(x, y, MaterialType.WALL);
+    e.setMaterial(10, 21, MaterialType.WATER);
+    e.setMaterial(10, 20, MaterialType.FIRE);
+
+    let boiledAt = -1;
+    for (let i = 0; i < 3000; i++) {
+      e.update();
+      if (e.getMaterial(10, 21) === MaterialType.STEAM) { boiledAt = i; break; }
+    }
+    expect(boiledAt).toBeGreaterThan(0);
+  });
+
+  it('leaves combustion untouched by the heat field', () => {
+    // Phase changes of a substance become thermal; combustion does not.
+    // Ignition is a probabilistic chemical event rolled against flammability,
+    // not a temperature threshold, and it keeps its tuned behaviour.
+    //
+    // Asserted as byte-equality rather than "something caught fire", which is
+    // both stronger and not flaky: neither WOOD nor FIRE defines a phase
+    // threshold, and the heat step consumes no RNG, so a burning world must
+    // evolve identically whether or not heat is being tracked. Any divergence
+    // means the heat field leaked into combustion.
+    const build = (heat: boolean): PixelEngine => {
+      const e = floored(30, 20, { heat });
+      for (let y = 12; y < 19; y++) {
+        for (let x = 8; x < 22; x++) e.setMaterial(x, y, MaterialType.WOOD);
+      }
+      e.setMaterial(15, 15, MaterialType.FIRE); // embedded, cannot rise away
+      return e;
+    };
+    const cold = build(false);
+    const hot = build(true);
+    for (let i = 0; i < 300; i++) { cold.update(); hot.update(); }
+
+    expect(Array.from(hot.grid)).toEqual(Array.from(cold.grid));
+
+    // ...and the scenario actually burned, so the equality is not vacuous.
+    const wood = Array.from(cold.grid).filter((m) => m === MaterialType.WOOD).length;
+    expect(wood).toBeLessThan(14 * 7);
+  });
+});

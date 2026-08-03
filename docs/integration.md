@@ -110,7 +110,11 @@ Heat evolves through two mechanisms each frame. **Conduction** moves heat cell-t
 
 Heat settles: changes below `HEAT_EPSILON` are discarded so chunks can sleep, and a thermally equilibrated world costs the same as one with heat disabled (measured at 0.0006 ms/frame either way on a 220×220 world). Use `engine.activeThermalChunkCount` to observe it. One consequence worth knowing: a heat source at temperature `T` can never drive a neighbour past `T`, so a phase threshold above the hottest source is unreachable by construction.
 
-> **Status:** phase change (`freezesAt`/`meltsAt`) is defined on materials but not yet acted on, so ice does not melt and lava does not turn to rock on its own yet. The existing contact reactions in `stepLavaOrFire` still handle those instantly. See `docs/plan-temperature.md`.
+**Phase change.** A cell crossing `freezesAt` or `meltsAt` transforms into `freezesInto`/`meltsInto`, carrying its temperature across — rock created by freezing lava arrives at the freezing point and fades from there rather than snapping to ambient. A mobile material freezing into an immobile one (lava→rock, water→ice) additionally requires support underneath, or a parcel still in flight would set in mid-air and hang there, since rock never falls.
+
+Enabling heat also changes three existing contact reactions in `stepLavaOrFire`: lava+water, fire+water, and ice touching either. They stop being instant and become temperature-mediated, so lava chills into rock and water heats until it boils. Left instant they would pre-empt the whole field — `ICE.meltsAt` would be decorative in any world containing lava. **Combustion is deliberately not mediated:** ignition stays a probabilistic roll against `flammability`, identical with heat on or off. With heat disabled all three reactions are byte-for-byte unchanged.
+
+One tuning note: steam condenses well below where water boils (0.20 vs 0.70) rather than just under it. Because temperature carries across a change, water boiling at 0.70 becomes steam at 0.70, and a threshold just below gave steam a measured lifetime of **one frame**. The wide gap stands in for latent heat — the energy real steam must shed before condensing — without needing per-cell energy state. It lowers only the condensation leg, so boiling does not lag.
 
 ---
 

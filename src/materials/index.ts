@@ -3,6 +3,7 @@ export {
   Materials,
   materialDefs,
   isThermal,
+  isImmobile,
   TERRAIN_SOLIDS,
   isTerrainSolid,
   type MaterialDef,

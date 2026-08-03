@@ -23,7 +23,7 @@
  * frame-alternating scan, the material interaction rules, the chunk system,
  * and the settle detection are all preserved from the original.
  */
-import { MaterialType, Materials, materialDefs, isTerrainSolid, isThermal } from '../materials/index.js';
+import { MaterialType, Materials, materialDefs, isTerrainSolid, isThermal, isImmobile } from '../materials/index.js';
 import { FlatGravity, type GravityModel } from '../gravity/index.js';
 import type { NeighborFrame } from './types.js';
 import { fillNeighborFrame } from './neighbors.js';
@@ -1183,6 +1183,54 @@ export class PixelEngine {
         }
       }
     }
+
+    // --- Pass 4: phase change ---------------------------------------------
+    const frame = this._frame;
+    for (let cy = 0; cy < this.chunkHeight; cy++) {
+      for (let cx = 0; cx < cw; cx++) {
+        if (!active[cy * cw + cx]) continue;
+        const yEnd = Math.min((cy + 1) * cs, h);
+        const xStart = cx * cs;
+        const xEnd = Math.min(xStart + cs, w);
+        for (let y = cy * cs; y < yEnd; y++) {
+          const rowOff = y * w;
+          for (let x = xStart; x < xEnd; x++) {
+            const idx = rowOff + x;
+            const def = materialDefs[grid[idx]];
+            const t = heat[idx];
+
+            let into: MaterialType | undefined;
+            if (def.freezesAt !== undefined && t <= def.freezesAt) into = def.freezesInto;
+            else if (def.meltsAt !== undefined && t >= def.meltsAt) into = def.meltsInto;
+            if (into === undefined) continue;
+
+            // A mobile material freezing into an immobile one must be resting
+            // on something. The engine has no velocity, so a cell in flight is
+            // a lone parcel with cold air on every side — maximum exposure, and
+            // therefore the likeliest thing in the world to cross a freezing
+            // threshold, before it has landed anywhere. Rock never falls, so
+            // without this a lava bomb sets in mid-air and hangs there forever.
+            // Skipping the transform (rather than clamping the temperature)
+            // leaves it molten and cooling, so it sets the instant it lands.
+            if (isImmobile[into] && !isImmobile[def.id]) {
+              fillNeighborFrame(x, y, this.gravity, frame);
+              if (this.getMaterial(x + frame.down.dx, y + frame.down.dy) === MaterialType.EMPTY) {
+                continue;
+              }
+            }
+
+            // Temperature carries across the change; it is the same parcel of
+            // matter. Resetting to the new material's spawnTemp would snap
+            // freshly-set rock straight to ambient grey, losing the fade from
+            // red-hot that is most of what makes a cooling flow read as one.
+            // `setMaterial` does reset it, so this must be written after.
+            this.setMaterial(x, y, into);
+            heat[idx] = t;
+            this.wakeThermalChunk(x, y);
+          }
+        }
+      }
+    }
   }
 
   private clearUpdatedInActiveChunks(): void {
@@ -1527,6 +1575,26 @@ export class PixelEngine {
     mat: MaterialType,
     deferredExplosions: { x: number; y: number }[],
   ): boolean {
+    // When the heat field is live, the three *phase* reactions below stop being
+    // instant contact rules and become temperature-mediated: conduction warms
+    // the neighbour and `applyPhaseChanges` transforms it once it crosses a
+    // threshold. Left instant, they would pre-empt the entire heat field --
+    // ICE.meltsAt would be decorative in any world containing fire, lava would
+    // turn to rock on touching water however white-hot it was, and fire beside
+    // water would be deleted on frame one, so it could never dry out a moat
+    // "given time" because it never gets the time.
+    //
+    // Combustion is deliberately NOT mediated: the flammability branch below
+    // and the FGAS ignition above stay instant whether or not heat is enabled.
+    // Ignition here is a probabilistic chemical event rolled against
+    // `MaterialDef.flammability`, not a thermal threshold, and thermalising it
+    // would mean adding an ignition temperature and re-deriving every
+    // flammability value against a heat curve. The line is: phase changes of a
+    // substance become thermal, combustion does not.
+    //
+    // With heat off this is byte-for-byte the original behaviour.
+    const heatMediated = this.heatGrid !== null;
+
     const neighbors = [
       { nx: x, ny: y - 1 },
       { nx: x, ny: y + 1 },
@@ -1548,10 +1616,13 @@ export class PixelEngine {
       }
 
       if (nMat === MaterialType.ICE) {
-        this.grid[nIdx] = MaterialType.WATER;
-        this.updated[nIdx] = 1;
-        this.wakeChunk(n.nx, n.ny);
-        this.markRenderDirty(n.nx, n.ny);
+        if (!heatMediated) {
+          this.grid[nIdx] = MaterialType.WATER;
+          this.updated[nIdx] = 1;
+          this.wakeChunk(n.nx, n.ny);
+          this.markRenderDirty(n.nx, n.ny);
+        }
+        // Under heat, conduction warms the ice and ICE.meltsAt melts it.
         continue;
       }
 
@@ -1559,7 +1630,7 @@ export class PixelEngine {
 
       const nDef = materialDefs[nMat];
 
-      if (mat === MaterialType.LAVA && nMat === MaterialType.WATER) {
+      if (mat === MaterialType.LAVA && nMat === MaterialType.WATER && !heatMediated) {
         this.grid[sourceIdx] = MaterialType.ROCK;
         this.updated[sourceIdx] = 1;
         this.grid[nIdx] = MaterialType.STEAM;
@@ -1576,7 +1647,7 @@ export class PixelEngine {
           this.wakeChunk(n.nx, n.ny);
           this.markRenderDirty(n.nx, n.ny);
         }
-      } else if (mat === MaterialType.FIRE && nMat === MaterialType.WATER) {
+      } else if (mat === MaterialType.FIRE && nMat === MaterialType.WATER && !heatMediated) {
         this.grid[sourceIdx] = MaterialType.EMPTY;
         this.updated[sourceIdx] = 1;
         this.wakeChunk(x, y);

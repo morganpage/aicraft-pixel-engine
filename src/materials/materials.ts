@@ -162,7 +162,7 @@ export interface MaterialDef {
  * {@link PixelEngine.swap} as hot air parcels and be destroyed silently by
  * `setMaterial`, so conservation would be fiction.
  *
- * Four of these numbers are derived rather than chosen, and move together:
+ * Five of these numbers are derived rather than chosen, and move together:
  *
  *  - `LAVA.emissivity = 0.13` reproduces the showcase's default cooling. That
  *    slider is an *absolute* loss per frame for a fully exposed cell (0.12);
@@ -180,6 +180,22 @@ export interface MaterialDef {
  * The equilibrium a cell actually reaches, for `n` faces touching a source at
  * `Ts` with exposure factor `k`, is where `n·f·(Ts − T) = emissivity·k·(T −
  * ambient)`. Use that, not intuition, before moving any threshold.
+ *
+ * `STEAM.freezesAt` is the fifth derived number, and it is deliberately far
+ * below `WATER.meltsAt` rather than just under it. Because phase change carries
+ * temperature across, water boiling at 0.70 becomes steam at 0.70 — so a
+ * condensation threshold of 0.65 gave steam a measured lifetime of **one
+ * frame**, flickering straight back to water instead of forming a plume.
+ *
+ * What is missing physically is latent heat: converting water to steam absorbs
+ * a large amount of energy that must be shed again before it condenses. Modelling
+ * that properly needs a per-cell energy budget — new state, and purely additive
+ * whenever it is wanted. The wide gap is the stateless stand-in: the energy is
+ * represented by the temperature span the steam has to fall through. At 0.20 a
+ * plume lives ~36 frames, from `T(t) = ambient + (0.70 − ambient)·e^(−e·k·t)`.
+ *
+ * Note this lowers only the *condensation* leg. Boiling still happens at
+ * `WATER.meltsAt`, so nothing about it visibly lags.
  */
 export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.EMPTY]: { id: MaterialType.EMPTY, name: 'Empty', color: [0, 0, 0, 0], density: 0, isLiquid: false, isGas: false, flammability: 0, friction: 0 },
@@ -193,7 +209,7 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   // the real quantity climbs steeply as the melt cools.
   [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5, yieldThickness: 3, spawnTemp: 1.0, conductivity: 0.6, emissivity: 0.13, freezesAt: 0.30, freezesInto: MaterialType.ROCK },
   [MaterialType.ROCK]: { id: MaterialType.ROCK, name: 'Rock', color: [80, 80, 80, 255], density: 100, isLiquid: false, isGas: false, flammability: 0, friction: 0.9, conductivity: 0.2, emissivity: 0.15 },
-  [MaterialType.STEAM]: { id: MaterialType.STEAM, name: 'Steam', color: [200, 200, 200, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 0.75, conductivity: 0.4, emissivity: 0.05, freezesAt: 0.65, freezesInto: MaterialType.WATER },
+  [MaterialType.STEAM]: { id: MaterialType.STEAM, name: 'Steam', color: [200, 200, 200, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 0.75, conductivity: 0.4, emissivity: 0.05, freezesAt: 0.20, freezesInto: MaterialType.WATER },
   [MaterialType.FIRE]: { id: MaterialType.FIRE, name: 'Fire', color: [255, 150, 0, 255], density: -2, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 1.0, heatSource: true, conductivity: 0.8, emissivity: 0.10 },
   [MaterialType.SMOKE]: { id: MaterialType.SMOKE, name: 'Smoke', color: [100, 100, 100, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1 },
   [MaterialType.OIL]: { id: MaterialType.OIL, name: 'Oil', color: [50, 50, 50, 255], density: 4, isLiquid: true, isGas: false, flammability: 100, friction: 0.05 },
@@ -235,6 +251,28 @@ export const isThermal: readonly boolean[] = materialDefs.map(
     d.emissivity !== undefined ||
     d.freezesAt !== undefined ||
     d.meltsAt !== undefined
+);
+
+/**
+ * Whether each material is skipped outright by the movement core — it never
+ * falls, flows, or rises under any circumstance. Indexed by id.
+ *
+ * Mirrors the early-out at the top of `runCheckerboardUpdate` (minus EMPTY,
+ * which is skipped for a different reason). Kept as data because the phase
+ * change step needs the same question answered: freezing a *mobile* material
+ * into an immobile one mid-air produces a cell that can never fall, so a lava
+ * bomb still in flight would freeze into rock and hang in the sky forever.
+ * That guard is only correct if "immobile" means exactly what the movement
+ * core thinks it means, so the two must not drift apart.
+ *
+ * WOOD is deliberately absent: it is in {@link TERRAIN_SOLIDS} but the core
+ * does process it, falling when it loses structural support.
+ */
+export const isImmobile: readonly boolean[] = materialDefs.map(
+  (d) =>
+    d.id === MaterialType.WALL ||
+    d.id === MaterialType.ROCK ||
+    d.id === MaterialType.ICE
 );
 
 /**
