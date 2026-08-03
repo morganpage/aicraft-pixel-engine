@@ -70,6 +70,37 @@ const LIQUID_LEVEL_REACH = 32;
  */
 const LIQUID_LEVEL_CLIMB = 4;
 
+/**
+ * Default world environment temperature.
+ *
+ * Chosen so nothing spontaneously transforms on a default world: it sits above
+ * `WATER.freezesAt` (0.05) and below `ICE.meltsAt` (0.15), so water stays
+ * liquid and ice stays solid at the same ambient. A host that wants a snowball
+ * planet sets `ambientTemperature: 0.02` and the oceans freeze on their own —
+ * that is the climate dial, and it is why this is a world constant rather than
+ * a per-material one.
+ */
+export const DEFAULT_AMBIENT_TEMPERATURE = 0.1;
+
+/**
+ * Temperature change below which the heat field treats a cell as settled.
+ *
+ * Load-bearing for termination, not an optimization. Diffusion approaches
+ * equilibrium asymptotically and never reaches it in floating point, so without
+ * an explicit floor a hot cell and a cold neighbour exchange ever-smaller
+ * amounts forever, no chunk ever sleeps, and a host tinting by heat re-renders
+ * every chunk every frame. With it, a thermally equilibrated region goes quiet
+ * and costs nothing, exactly like a settled pool.
+ *
+ * The cost is a small permanent bias: truncated increments are heat that is
+ * never transferred, so a settled system holds a residual gradient of up to
+ * roughly this much per edge rather than being exactly flat. That is far below
+ * both render resolution and any phase threshold — but it does mean a
+ * conservation test must assert to a tolerance derived from this and the cell
+ * count, not to float epsilon.
+ */
+export const HEAT_EPSILON = 1e-4;
+
 /** How many stable frames the grid must be quiet before settle completes. */
 export const SETTLE_STABLE_THRESHOLD = 10;
 
@@ -114,6 +145,22 @@ export interface PixelEngineOptions {
    * the explosion's center, radius, and force. Default: no-op.
    */
   onExplode?: ExplosionHook;
+  /**
+   * Allocate {@link PixelEngine.heatGrid} at construction. Default false.
+   *
+   * Not a performance flag. Allocation has to *seed* every cell from its
+   * material's `spawnTemp` rather than zero-fill (see
+   * {@link PixelEngine.setHeat}), which is an O(cells) sweep; this makes that
+   * sweep happen at a predictable moment instead of partway through a
+   * simulation.
+   */
+  enableHeat?: boolean;
+  /**
+   * The environment temperature every exposed cell exchanges toward, 0–1.
+   * Default {@link DEFAULT_AMBIENT_TEMPERATURE}. This is the climate dial:
+   * turn it down and oceans freeze on their own.
+   */
+  ambientTemperature?: number;
 }
 
 /**
@@ -152,6 +199,23 @@ export class PixelEngine {
    * entirely and get the material's constant.
    */
   stiffnessGrid: Uint8Array | null = null;
+  /**
+   * Optional per-cell temperature in `[0, 1]`. `null` until
+   * {@link PixelEngineOptions.enableHeat} or the first {@link setHeat}.
+   *
+   * Like {@link stiffnessGrid} this rides with the material through swaps and
+   * levelling transfers, so a hot parcel of lava stays hot as it flows. A host
+   * that never allocates it pays nothing.
+   *
+   * Unlike the other optional grids, this one is **never zero-filled**. `0` is a
+   * legitimate temperature — it is, in fact, frozen — so it cannot double as the
+   * "unset, use the material's value" sentinel that `colorGrid` and
+   * `stiffnessGrid` rely on. A zero-filled heat grid would assert that every
+   * cell in the world is at absolute cold, and the first phase-change pass would
+   * flash every lava cell to rock. Allocation therefore seeds; see
+   * {@link setHeat}.
+   */
+  heatGrid: Float32Array | null = null;
   /** Per-cell "already processed this frame" flag. */
   readonly updated: Uint8Array;
   /**
@@ -178,9 +242,32 @@ export class PixelEngine {
   nextActiveChunks: Uint8Array;
   /** Chunks whose contents changed and need re-rendering. */
   renderDirtyChunks: Uint8Array;
+  /**
+   * Chunks with heat still in motion, to be stepped next frame.
+   *
+   * Deliberately **separate from {@link activeChunks}**, and the distinction is
+   * load-bearing rather than tidiness. A crusted lava flow is motionless: zero
+   * swaps, movement chunk asleep — and it must still be cooling. Reusing the
+   * movement activity set would stop it cooling the moment it stopped moving,
+   * which is precisely the case the heat field exists to serve.
+   *
+   * The inverse matters too: a settled world must cost nothing (see
+   * {@link runLiquidLevelling}, which was made chunk-major for exactly this
+   * reason), so the heat step cannot simply scan the grid. Null when heat is
+   * disabled.
+   */
+  thermalChunks: Uint8Array | null = null;
+  /** Thermal chunks to step next frame. Swapped with {@link thermalChunks}. */
+  nextThermalChunks: Uint8Array | null = null;
 
   /** The gravity model driving movement direction. */
   readonly gravity: GravityModel;
+
+  /**
+   * The environment temperature exposed cells exchange toward. See
+   * {@link PixelEngineOptions.ambientTemperature}.
+   */
+  readonly ambientTemperature: number;
 
   /**
    * The gravity model's potential field, pre-bound, or `null` when the model
@@ -236,6 +323,7 @@ export class PixelEngine {
     this.CHUNK_SIZE = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
     this.liquidDispersion = options.liquidDispersion ?? DEFAULT_LIQUID_DISPERSION;
     this._onExplode = options.onExplode ?? (() => {});
+    this.ambientTemperature = options.ambientTemperature ?? DEFAULT_AMBIENT_TEMPERATURE;
 
     this.chunkWidth = Math.ceil(width / this.CHUNK_SIZE);
     this.chunkHeight = Math.ceil(height / this.CHUNK_SIZE);
@@ -244,6 +332,100 @@ export class PixelEngine {
     this.renderDirtyChunks = new Uint8Array(this.chunkWidth * this.chunkHeight);
 
     this.clear();
+
+    // After clear(), so the seeding sweep reads an EMPTY grid and lands every
+    // cell on ambient rather than on stale material temperatures.
+    if (options.enableHeat) this.allocHeat();
+  }
+
+  /**
+   * Allocate and **seed** the heat field, plus its scratch buffer and thermal
+   * chunk sets. Idempotent.
+   *
+   * The seeding is the whole point, and it is why this cannot be the one-line
+   * lazy `new Float32Array(n)` that {@link colorGrid} and {@link stiffnessGrid}
+   * get away with. Those can zero-fill because `0` means "no override" for them.
+   * Heat has no spare value: a zero-filled grid says the entire world is at
+   * absolute cold, so a single {@link setHeat} call would allocate it and the
+   * next phase-change pass would turn every lava cell on the map to rock.
+   *
+   * One O(cells) sweep, once. {@link PixelEngineOptions.enableHeat} exists so a
+   * host can choose when to pay it.
+   */
+  private allocHeat(): Float32Array {
+    if (this.heatGrid) return this.heatGrid;
+    const n = this.width * this.height;
+    const h = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const st = materialDefs[this.grid[i]].spawnTemp;
+      h[i] = st === undefined ? this.ambientTemperature : st;
+    }
+    // The conduction scratch buffer is allocated here too once the heat step
+    // lands; it has no reader yet, so it is not carried as dead state.
+    const chunks = this.chunkWidth * this.chunkHeight;
+    this.thermalChunks = new Uint8Array(chunks);
+    this.nextThermalChunks = new Uint8Array(chunks);
+    // Everything that exists is potentially off-equilibrium; let the first heat
+    // step decide what is actually quiet.
+    this.thermalChunks.fill(1);
+    this.nextThermalChunks.fill(1);
+    return (this.heatGrid = h);
+  }
+
+  /**
+   * Mark the chunk containing `(x, y)` as thermally active next frame, plus its
+   * border neighbors if the cell sits on a chunk edge — so heat crossing a
+   * boundary keeps the destination alive. The thermal mirror of
+   * {@link wakeChunk}.
+   */
+  wakeThermalChunk(x: number, y: number): void {
+    const next = this.nextThermalChunks;
+    if (next === null) return;
+    const cx = Math.floor(x / this.CHUNK_SIZE);
+    const cy = Math.floor(y / this.CHUNK_SIZE);
+    if (cx < 0 || cx >= this.chunkWidth || cy < 0 || cy >= this.chunkHeight) return;
+    next[cy * this.chunkWidth + cx] = 1;
+
+    const localX = x % this.CHUNK_SIZE;
+    const localY = y % this.CHUNK_SIZE;
+
+    if (localX === 0 && cx > 0) next[cy * this.chunkWidth + cx - 1] = 1;
+    if (localX === this.CHUNK_SIZE - 1 && cx < this.chunkWidth - 1) next[cy * this.chunkWidth + cx + 1] = 1;
+    if (localY === 0 && cy > 0) next[(cy - 1) * this.chunkWidth + cx] = 1;
+    if (localY === this.CHUNK_SIZE - 1 && cy < this.chunkHeight - 1) next[(cy + 1) * this.chunkWidth + cx] = 1;
+  }
+
+  /**
+   * Write a cell's temperature, clamped to `[0, 1]`.
+   *
+   * Allocates and seeds {@link heatGrid} on first call — see {@link allocHeat}
+   * for why that is a sweep rather than a zero-fill.
+   *
+   * Call this *after* {@link setMaterial}, never before: a material change
+   * resets the cell's heat to the new material's `spawnTemp`, so a temperature
+   * written first is discarded.
+   */
+  setHeat(x: number, y: number, t: number): void {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
+    const h = this.heatGrid ?? this.allocHeat();
+    h[this.getIndex(x, y)] = t < 0 ? 0 : t > 1 ? 1 : t;
+    this.wakeThermalChunk(x, y);
+    this.markRenderDirty(x, y);
+  }
+
+  /**
+   * Temperature at `(x, y)` in `[0, 1]`.
+   *
+   * When {@link heatGrid} is unallocated this reports what the cell *would* be
+   * born at — its material's `spawnTemp`, or the world ambient — so a host can
+   * ask "how hot is this?" without deciding to track heat. Once allocated there
+   * is no fallback path: every cell holds a real value.
+   */
+  getHeat(x: number, y: number): number {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return this.ambientTemperature;
+    const idx = this.getIndex(x, y);
+    if (this.heatGrid) return this.heatGrid[idx];
+    return materialDefs[this.grid[idx]].spawnTemp ?? this.ambientTemperature;
   }
 
   /** Seeded mulberry32-style PRNG. Use this — never `Math.random()`. */
@@ -259,6 +441,11 @@ export class PixelEngine {
     this.grid.fill(MaterialType.EMPTY);
     if (this.colorGrid) this.colorGrid.fill(0);
     if (this.stiffnessGrid) this.stiffnessGrid.fill(0);
+    // Ambient, not zero: the grid is now all EMPTY, and EMPTY has no spawnTemp.
+    // Zero-filling would leave a cleared world at absolute cold.
+    if (this.heatGrid) this.heatGrid.fill(this.ambientTemperature);
+    if (this.thermalChunks) this.thermalChunks.fill(1);
+    if (this.nextThermalChunks) this.nextThermalChunks.fill(1);
     this.updated.fill(0);
     this.liquidVel.fill(0);
     this.activeChunks.fill(1);
@@ -362,6 +549,14 @@ export class PixelEngine {
       // A cell that has become a different material carries none of the old
       // one's rheology.
       if (this.stiffnessGrid) this.stiffnessGrid[idx] = 0;
+      // ...but it is born at its own temperature rather than reset to nothing,
+      // which is the one place heat differs from the grids above: a freshly
+      // spawned LAVA cell is born hot, and that is the point. A caller that
+      // wants a specific temperature calls setHeat *after* this.
+      if (this.heatGrid) {
+        this.heatGrid[idx] = materialDefs[mat].spawnTemp ?? this.ambientTemperature;
+        this.wakeThermalChunk(x, y);
+      }
     }
     // A freshly-placed cell carries no flow direction.
     this.liquidVel[idx] = 0;
@@ -396,6 +591,15 @@ export class PixelEngine {
       const s1 = this.stiffnessGrid[idx1];
       this.stiffnessGrid[idx1] = this.stiffnessGrid[idx2];
       this.stiffnessGrid[idx2] = s1;
+    }
+    if (this.heatGrid) {
+      const h1 = this.heatGrid[idx1];
+      this.heatGrid[idx1] = this.heatGrid[idx2];
+      this.heatGrid[idx2] = h1;
+      // Heat that moved is heat out of equilibrium with its new surroundings,
+      // even if neither cell's temperature changed.
+      this.wakeThermalChunk(x1, y1);
+      this.wakeThermalChunk(x2, y2);
     }
     this.wakeChunk(x1, y1);
     this.wakeChunk(x2, y2);
@@ -725,6 +929,14 @@ export class PixelEngine {
           this.stiffnessGrid[dIdx] = this.stiffnessGrid[idx];
           this.stiffnessGrid[idx] = 0;
         }
+        if (this.heatGrid) {
+          // The source cell becomes EMPTY, which has no spawnTemp — so it
+          // returns to ambient rather than to 0, matching what `clear` does.
+          this.heatGrid[dIdx] = this.heatGrid[idx];
+          this.heatGrid[idx] = this.ambientTemperature;
+          this.wakeThermalChunk(x, y);
+          this.wakeThermalChunk(destX, destY);
+        }
         this.liquidVel[dIdx] = 0;
         this.liquidVel[idx] = 0;
         this.wakeChunk(x, y);
@@ -785,6 +997,15 @@ export class PixelEngine {
     this.activeChunks = this.nextActiveChunks;
     this.nextActiveChunks = temp;
     this.nextActiveChunks.fill(0);
+
+    // Same swap for the thermal set, kept independent of the movement set: a
+    // motionless flow still cools, and a thermally settled region still moves.
+    if (this.thermalChunks && this.nextThermalChunks) {
+      const tt = this.thermalChunks;
+      this.thermalChunks = this.nextThermalChunks;
+      this.nextThermalChunks = tt;
+      this.nextThermalChunks.fill(0);
+    }
 
     this.runCheckerboardUpdate(deferredExplosions);
     // Falling and reactions resolve first; levelling then acts on where they
@@ -1372,5 +1593,23 @@ export class PixelEngine {
     this.activeChunks.fill(1);
     this.nextActiveChunks.fill(1);
     this.renderDirtyChunks.fill(1);
+    if (this.thermalChunks) this.thermalChunks.fill(1);
+    if (this.nextThermalChunks) this.nextThermalChunks.fill(1);
+  }
+
+  /**
+   * How many chunks still have heat in motion. `0` once the thermal field has
+   * settled (or when heat is disabled).
+   *
+   * This — not {@link swapsLastFrame} — is the settle signal for the heat
+   * field. Diffusion performs no swaps, so a swap count says nothing about
+   * whether heat is still moving.
+   */
+  get activeThermalChunkCount(): number {
+    const t = this.thermalChunks;
+    if (t === null) return 0;
+    let n = 0;
+    for (let i = 0; i < t.length; i++) if (t[i]) n++;
+    return n;
   }
 }

@@ -89,6 +89,25 @@ This is what produces every shape lava is known for: a blunt flow front instead 
 
 A host that tracks temperature writes it each frame — fresh lava mobile, chilled lava locked — which is what makes a flow run while hot and set where it has cooled. A host that does not can ignore the field entirely. Keep the mobile end at **2 or more, never 1**: at 1 the criterion can never be met (a single cell is already one cell thick), so the liquid thins without limit into a half-occupied monolayer that freezes as a checkerboard of specks. See `showcase/helpers/volcano.ts` for a worked example.
 
+**Temperature (`heatGrid`).** An optional `Float32Array` holding a per-cell temperature in `[0, 1]`, off by default. Enable it with `enableHeat: true` at construction, or just call `setHeat` and it allocates itself. Like `stiffnessGrid` it rides with the material through swaps and levelling transfers, so a hot parcel of lava stays hot as it flows.
+
+```ts
+const engine = new PixelEngine({ width, height, enableHeat: true, ambientTemperature: 0.1 });
+engine.setMaterial(x, y, MaterialType.LAVA); // born at LAVA's spawnTemp of 1.0
+engine.setHeat(x, y, 0.6);                   // ...or override it
+engine.getHeat(x, y);                        // 0.6
+```
+
+Three things differ from the other optional grids, and all three bite if you assume otherwise:
+
+- **Call `setHeat` *after* `setMaterial`, never before.** A material change resets the cell to the new material's `spawnTemp`, so a temperature written first is discarded. Same ordering hazard `colorGrid` has.
+- **`0` is a temperature, not "unset".** It means *frozen*. There is no sentinel value, so allocation seeds every cell from its material's `spawnTemp` rather than zero-filling — an O(cells) sweep that `enableHeat` lets you schedule rather than pay partway through a simulation.
+- **`ambientTemperature` is the climate dial.** It is the temperature exposed cells exchange toward, and the default (0.1) deliberately sits above water's freezing point and below ice's melting point so nothing transforms on its own. Lower it and oceans freeze.
+
+Materials opt in by setting any thermal field (`spawnTemp`, `conductivity`, `emissivity`, `freezesAt`/`meltsAt`, `heatSource`); `isThermal[mat]` reports the result. EMPTY, OIL, ACID, SMOKE and FGAS set none. `engine.activeThermalChunkCount` is the settle signal for heat — *not* `swapsLastFrame`, since heat moves without swapping anything.
+
+> **Status:** the field and its bookkeeping are in place; the heat *step* — conduction, environment exchange, and phase change — is not yet wired up, so stored temperatures currently only move with their cells. Until it lands, a host that wants lava to cool still drives that itself. See `docs/plan-temperature.md`.
+
 ---
 
 ## 3. Minimum viable sandbox
