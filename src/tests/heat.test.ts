@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PixelEngine, DEFAULT_AMBIENT_TEMPERATURE } from '../sand';
+import { PixelEngine, DEFAULT_AMBIENT_TEMPERATURE, HEAT_EPSILON } from '../sand';
 import { MaterialType, Materials, isThermal } from '../materials';
 import { FlatGravity } from '../gravity';
 
@@ -146,44 +146,59 @@ describe('heat field — birth temperature', () => {
 });
 
 describe('heat field — heat rides with the material', () => {
-  it('carries heat with a falling cell rather than leaving it behind', () => {
-    // The property that made colorGrid an attractive heat store in the first
-    // place, and the reason heat must be a grid the engine owns rather than
-    // host-side bookkeeping.
-    const e = floored(20, 24, { heat: true });
-    e.setMaterial(10, 2, MaterialType.SAND);
-    e.setHeat(10, 2, 0.87);
-    for (let i = 0; i < 60; i++) e.update();
+  // Heat now evolves, so these cannot assert a carried value survives
+  // unchanged. They assert the *difference* travels: two worlds identical
+  // except for one cell's starting temperature must still differ wherever that
+  // cell ended up, and agree where it never was.
 
-    let found = -1;
-    for (let y = 0; y < 24; y++) if (e.getMaterial(10, y) === MaterialType.SAND) found = y;
-    expect(found).toBe(22); // landed on the floor
-    expect(e.getHeat(10, found)).toBeCloseTo(0.87, 5);
-    expect(e.getHeat(10, 2)).toBe(f32(DEFAULT_AMBIENT_TEMPERATURE)); // nothing left behind
+  it('carries heat with a falling cell rather than leaving it behind', () => {
+    const drop = (t: number): PixelEngine => {
+      const e = floored(20, 24, { heat: true });
+      e.setMaterial(10, 2, MaterialType.SAND);
+      e.setHeat(10, 2, t);
+      for (let i = 0; i < 8; i++) e.update();
+      return e;
+    };
+    const hot = drop(0.95);
+    const cool = drop(f32(DEFAULT_AMBIENT_TEMPERATURE));
+
+    let y = -1;
+    for (let j = 0; j < 24; j++) if (hot.getMaterial(10, j) === MaterialType.SAND) y = j;
+    expect(y).toBeGreaterThan(2); // it moved
+    expect(cool.getMaterial(10, y)).toBe(MaterialType.SAND); // identically in both
+
+    // The heat went with it, and did not stay at the origin.
+    expect(hot.getHeat(10, y)).toBeGreaterThan(cool.getHeat(10, y) + 0.3);
+    expect(hot.getHeat(10, 2)).toBeCloseTo(cool.getHeat(10, 2), 4);
   });
 
   it('carries heat through a levelling transfer, not just a swap', () => {
     // Levelling moves a cell non-locally by writing grid directly instead of
-    // calling swap(), so it needs its own heat carry. A mound of water that
-    // levels sideways must take its temperature along.
-    const e = floored(40, 24, { heat: true });
-    for (let y = 12; y < 23; y++) e.setMaterial(20, y, MaterialType.WATER);
-    for (let y = 12; y < 23; y++) e.setHeat(20, y, 0.6);
+    // calling swap(), so it needs its own heat carry. A column of water that
+    // levels sideways must take its temperature along the transfer.
+    const run = (t: number): PixelEngine => {
+      const e = floored(40, 24, { heat: true });
+      for (let y = 12; y < 23; y++) e.setMaterial(20, y, MaterialType.WATER);
+      for (let y = 12; y < 23; y++) e.setHeat(20, y, t);
+      for (let i = 0; i < 40; i++) e.update();
+      return e;
+    };
+    const hot = run(0.65);
+    const cool = run(f32(DEFAULT_AMBIENT_TEMPERATURE));
 
-    for (let i = 0; i < 300; i++) e.update();
-
-    // The column has spread into a flat sheet; every water cell in it must
-    // still be at the temperature it started with.
-    let cells = 0;
+    // Sample water that can only have arrived where it is by levelling --
+    // several cells lateral of the original column.
+    let compared = 0;
     for (let x = 0; x < 40; x++) {
+      if (Math.abs(x - 20) < 3) continue;
       for (let y = 0; y < 23; y++) {
-        if (e.getMaterial(x, y) === MaterialType.WATER) {
-          cells++;
-          expect(e.getHeat(x, y)).toBeCloseTo(0.6, 5);
-        }
+        if (hot.getMaterial(x, y) !== MaterialType.WATER) continue;
+        expect(cool.getMaterial(x, y)).toBe(MaterialType.WATER);
+        expect(hot.getHeat(x, y)).toBeGreaterThan(cool.getHeat(x, y) + 0.05);
+        compared++;
       }
     }
-    expect(cells).toBe(11); // nothing lost or duplicated
+    expect(compared).toBeGreaterThan(3); // the sample is not vacuous
   });
 });
 
@@ -274,5 +289,304 @@ describe('heat field — material metadata', () => {
     expect(DEFAULT_AMBIENT_TEMPERATURE).toBeGreaterThan(water.freezesAt!);
     expect(DEFAULT_AMBIENT_TEMPERATURE).toBeLessThan(ice.meltsAt!);
     expect(DEFAULT_AMBIENT_TEMPERATURE).toBeLessThan(water.meltsAt!);
+  });
+});
+
+describe('heat step — conduction', () => {
+  /**
+   * A sealed block of one material, with ambient set to the block's own mean.
+   *
+   * Environment exchange is not conservative in general — the environment is an
+   * infinite reservoir — so a conservation test has to neutralise it. With every
+   * cell the same material and equally unexposed, each exchanges toward ambient
+   * with the same coefficient, so setting ambient to the mean makes the sum
+   * exactly neutral and leaves conduction as the only term moving heat.
+   */
+  function sealed(size: number, hot: number, cold: number): PixelEngine {
+    const mean = (hot + cold) / 2;
+    const e = new PixelEngine({
+      width: size, height: size, seed: 1, gravity: new FlatGravity(),
+      enableHeat: true, ambientTemperature: mean,
+    });
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        e.setMaterial(x, y, MaterialType.ROCK); // static, and never exposed
+        e.setHeat(x, y, x < size / 2 ? hot : cold);
+      }
+    }
+    return e;
+  }
+
+  const total = (e: PixelEngine): number => {
+    let s = 0;
+    for (let i = 0; i < e.heatGrid!.length; i++) s += e.heatGrid![i];
+    return s;
+  };
+
+  it('conserves heat exactly, up to the settling epsilon', () => {
+    // Conservation comes from *edge symmetry*: each edge is visited exactly
+    // once and both endpoints are updated by the same amount with opposite
+    // signs. Any coefficient both endpoints agree on conserves equally well --
+    // min, max, the harmonic mean, or a constant. What would break it is
+    // computing flux per-cell over all four neighbours, where the two ends of
+    // an edge disagree about how much crossed it.
+    const e = sealed(16, 0.8, 0.2);
+    const before = total(e);
+    for (let i = 0; i < 100; i++) e.update();
+    // Tolerance is the documented epsilon bias, not float epsilon: sub-epsilon
+    // increments are deliberately discarded so chunks can sleep.
+    expect(Math.abs(total(e) - before)).toBeLessThan(HEAT_EPSILON * e.heatGrid!.length);
+  });
+
+  it('conducts at a rate independent of which cell owns the edge', () => {
+    // What min() actually buys -- and it is not conservation, which edge
+    // symmetry already guarantees however the coefficient is chosen. It is
+    // that the edge's conductance cannot depend on which endpoint the loop
+    // happens to visit first. Reading conductivity from the owning cell alone
+    // makes a ROCK|WATER seam conduct at 0.2 or at 0.9 depending purely on
+    // which side is to the left, so the physics would follow grid orientation.
+    //
+    // min() also models the bottleneck: a good insulator throttles the pair.
+    // The physically exact choice is the harmonic mean, which is likewise
+    // symmetric and drops in unchanged.
+    const rise = (waterFirst: boolean): number => {
+      const e = sealed(16, 0.5, 0.5);
+      const wx = waterFirst ? 7 : 8;
+      const rx = waterFirst ? 8 : 7;
+      e.setMaterial(wx, 8, MaterialType.WATER); // cannot move: denser rock all round
+      e.setHeat(wx, 8, 0.1);
+      e.setHeat(rx, 8, 0.9);
+      e.update();
+      return e.getHeat(wx, 8) - 0.1;
+    };
+    const ownedByRock = rise(false);
+    const ownedByWater = rise(true);
+    expect(ownedByRock).toBeGreaterThan(0.01);          // it did exchange
+    expect(ownedByWater).toBeCloseTo(ownedByRock, 6);   // ...at the same rate
+  });
+
+  it('actually moves heat while conserving it', () => {
+    // Guards the test above from passing on an implementation that does nothing.
+    const e = sealed(16, 0.8, 0.2);
+    for (let i = 0; i < 100; i++) e.update();
+    expect(e.getHeat(0, 8)).toBeLessThan(0.8 - 0.05);
+    expect(e.getHeat(15, 8)).toBeGreaterThan(0.2 + 0.05);
+  });
+
+  it('obeys the max principle on a worst-case stencil', () => {
+    // The bound that CONDUCTION_MAX exists to hold. Using conductivity applied
+    // directly as the per-neighbour fraction, a cell at 1.0 with four
+    // neighbours at 0.0 would move 4x its own difference out in one step and
+    // land far below zero, flipping sign every step after.
+    const e = new PixelEngine({
+      width: 9, height: 9, seed: 1, gravity: new FlatGravity(),
+      enableHeat: true, ambientTemperature: 0.5,
+    });
+    for (let y = 0; y < 9; y++) {
+      for (let x = 0; x < 9; x++) {
+        e.setMaterial(x, y, MaterialType.WATER); // the highest conductivity
+        e.setHeat(x, y, 0);
+      }
+    }
+    e.setHeat(4, 4, 1);
+    for (let i = 0; i < 50; i++) {
+      e.update();
+      for (let j = 0; j < e.heatGrid!.length; j++) {
+        expect(e.heatGrid![j]).toBeGreaterThanOrEqual(0);
+        expect(e.heatGrid![j]).toBeLessThanOrEqual(1);
+      }
+    }
+    // And it converged rather than oscillating: the centre never rebounds above
+    // where it started.
+    expect(e.getHeat(4, 4)).toBeLessThan(1);
+  });
+
+  it('is bounded in space — heat does not teleport across the grid', () => {
+    // The cap is what stops a single hot cell flash-heating the world.
+    const e = sealed(16, 0.5, 0.5);
+    e.setHeat(8, 8, 1);
+    const far = e.getHeat(8, 11);
+    e.update();
+    expect(e.getHeat(8, 9)).toBeGreaterThan(0.5); // immediate neighbour warmed
+    expect(e.getHeat(8, 11)).toBeCloseTo(far, 6); // three away did not
+  });
+
+  it('does not conduct into non-thermal materials', () => {
+    // OIL sets no thermal field, so it must neither gain nor lose heat.
+    const e = sealed(16, 0.5, 0.5);
+    e.setMaterial(8, 8, MaterialType.OIL);
+    e.setHeat(8, 8, 0.9);
+    e.setHeat(7, 8, 0.1);
+    for (let i = 0; i < 30; i++) e.update();
+    expect(e.getHeat(8, 8)).toBeCloseTo(0.9, 5); // untouched by the step
+  });
+});
+
+describe('heat step — environment exchange', () => {
+  it('cools an exposed cell faster than a buried one', () => {
+    // The term conduction cannot express, and the one that carries the
+    // behaviour: a flow's skin chills ahead of its core and its front stalls
+    // first. Under conduction alone an exposed cell has nobody to conduct into
+    // and would cool *slower* than a buried one -- exactly backwards.
+    const build = (bury: boolean): PixelEngine => {
+      const e = floored(24, 24, { heat: true });
+      if (bury) {
+        for (let y = 18; y <= 22; y++) {
+          for (let x = 8; x <= 12; x++) e.setMaterial(x, y, MaterialType.ROCK);
+        }
+      }
+      e.setMaterial(10, 20, MaterialType.LAVA);
+      e.setHeat(10, 20, 1);
+      return e;
+    };
+    const exposed = build(false);
+    const buried = build(true);
+    for (let i = 0; i < 20; i++) { exposed.update(); buried.update(); }
+
+    let ex = -1;
+    for (let y = 0; y < 24; y++) if (exposed.getMaterial(10, y) === MaterialType.LAVA) ex = y;
+    expect(exposed.getHeat(10, ex)).toBeLessThan(buried.getHeat(10, 20));
+  });
+
+  it('cools toward ambient rather than toward zero', () => {
+    const e = new PixelEngine({
+      width: 12, height: 12, seed: 1, gravity: new FlatGravity(),
+      enableHeat: true, ambientTemperature: 0.4,
+    });
+    e.setMaterial(6, 6, MaterialType.SAND);
+    e.setHeat(6, 6, 1);
+    for (let i = 0; i < 400; i++) e.update();
+    expect(e.getHeat(6, 6)).toBeCloseTo(0.4, 2);
+  });
+
+  it('makes ambient a climate dial that freezes an ocean', () => {
+    // Turning the world's temperature down has to be enough on its own; this
+    // is the whole point of ambient being a world constant rather than a
+    // per-material one. Phase change is not wired up yet, so this asserts the
+    // water actually reaches ICE's melting point.
+    const cold = new PixelEngine({
+      width: 24, height: 24, seed: 1, gravity: new FlatGravity(),
+      enableHeat: true, ambientTemperature: 0.02,
+    });
+    const temperate = new PixelEngine({
+      width: 24, height: 24, seed: 1, gravity: new FlatGravity(),
+      enableHeat: true, // default ambient
+    });
+    for (const e of [cold, temperate]) {
+      for (let x = 0; x < 24; x++) e.setMaterial(x, 23, MaterialType.WALL);
+      for (let x = 4; x < 20; x++) e.setMaterial(x, 22, MaterialType.WATER);
+      for (let i = 0; i < 400; i++) e.update();
+    }
+    // The threshold that governs water turning to ice is water's own freezing
+    // point, not ice's melting point. The default ambient sits deliberately
+    // between the two -- above WATER.freezesAt and below ICE.meltsAt -- which
+    // is what makes both phases stable on an untouched world.
+    const freezing = Materials[MaterialType.WATER].freezesAt!;
+    expect(cold.getHeat(12, 22)).toBeLessThan(freezing);
+    expect(temperate.getHeat(12, 22)).toBeGreaterThan(freezing);
+    expect(temperate.getHeat(12, 22)).toBeLessThan(Materials[MaterialType.ICE].meltsAt!);
+  });
+});
+
+describe('heat step — heat sources', () => {
+  it('conducts as a source and is held, rather than sitting inert', () => {
+    // "Held" is not "skipped". A source is read at full strength by the
+    // conduction pass -- so neighbours draw from it -- and only then pinned
+    // back to its own temperature. An implementation that excluded sources
+    // from conduction would give a fire nothing can warm itself against.
+    const e = floored(16, 16, { heat: true });
+    // Wall it in so the gas cannot rise away from its neighbour.
+    for (let y = 9; y <= 13; y++) {
+      for (let x = 6; x <= 10; x++) e.setMaterial(x, y, MaterialType.WALL);
+    }
+    e.setMaterial(8, 11, MaterialType.FIRE);
+    e.setHeat(7, 11, 0);
+    const before = e.getHeat(7, 11);
+    e.update();
+    expect(e.getMaterial(8, 11)).toBe(MaterialType.FIRE); // survived the frame
+    expect(e.getHeat(7, 11)).toBeGreaterThan(before);     // it conducted
+    expect(e.getHeat(8, 11)).toBe(Materials[MaterialType.FIRE].spawnTemp); // and was held
+  });
+
+  it('cannot drive a neighbour above its own temperature', () => {
+    // Conduction moves a fraction of the *difference*, so a neighbour
+    // approaches a source asymptotically and never crosses it. Any threshold
+    // set above a source's temperature is unreachable by that source -- the
+    // constraint that decides whether a phase threshold is reachable at all.
+    const e = floored(16, 16, { heat: true });
+    for (let y = 9; y <= 13; y++) {
+      for (let x = 6; x <= 10; x++) e.setMaterial(x, y, MaterialType.WALL);
+    }
+    e.setMaterial(8, 11, MaterialType.FIRE);
+    const src = Materials[MaterialType.FIRE].spawnTemp!;
+    for (let i = 0; i < 200; i++) {
+      e.update();
+      for (let j = 0; j < e.heatGrid!.length; j++) {
+        expect(e.heatGrid![j]).toBeLessThanOrEqual(src);
+      }
+    }
+  });
+});
+
+describe('heat step — settling', () => {
+  it('settles a body that spans several chunks, and stops waking them', () => {
+    // Regression: an active chunk used to wake its sleeping neighbours
+    // unconditionally whenever an edge crossed the seam, with no regard for
+    // whether there was any gradient to move. Neighbours then re-woke each
+    // other indefinitely, so a world where *not one cell was still changing*
+    // never went quiet -- measured at ~0.09ms/frame forever against ~0.0006ms
+    // once fixed, on a world that was otherwise completely dead.
+    //
+    // The geometry matters: this needs a body straddling enough chunk seams
+    // that some chunks quiesce while their neighbours are still working. At
+    // 96 wide it settles either way and catches nothing; 128 reproduces it.
+    const N = 128;
+    const top = N - 41;
+    const e = new PixelEngine({
+      width: N, height: N, seed: 1, gravity: new FlatGravity(), enableHeat: true,
+    });
+    for (let x = 0; x < N; x++) e.setMaterial(x, N - 1, MaterialType.WALL);
+    for (let y = top + 1; y < N - 1; y++) {
+      for (let x = 40; x < N - 40; x++) e.setMaterial(x, y, MaterialType.ROCK);
+    }
+    for (let x = N / 2 - 20; x < N / 2 + 20; x++) {
+      e.setMaterial(x, top, MaterialType.LAVA);
+      e.setHeat(x, top, 1);
+    }
+
+    let settledAt = -1;
+    for (let i = 0; i < 2000; i++) {
+      e.update();
+      if (e.activeThermalChunkCount === 0) { settledAt = i; break; }
+    }
+    expect(settledAt).toBeGreaterThan(0);
+
+    for (let i = 0; i < 100; i++) e.update();
+    expect(e.activeThermalChunkCount).toBe(0);
+  });
+
+  it('reaches a thermal dead stop and stays there', () => {
+    // The settle guarantee, and the reason HEAT_EPSILON exists. Diffusion
+    // asymptotes but never arrives in floating point, so without the epsilon
+    // every chunk stays awake and render-dirty forever. Note this is asserted
+    // on thermal chunks, not swapsLastFrame -- heat moves without swapping
+    // anything, so a swap count says nothing about whether it has settled.
+    const e = floored(64, 64, { heat: true });
+    for (let x = 20; x < 30; x++) e.setMaterial(x, 62, MaterialType.SAND);
+    for (let x = 20; x < 30; x++) e.setHeat(x, 62, 1);
+
+    let settledAt = -1;
+    for (let i = 0; i < 1500; i++) {
+      e.update();
+      if (e.activeThermalChunkCount === 0) { settledAt = i; break; }
+    }
+    expect(settledAt).toBeGreaterThan(0);
+
+    // And it stays settled: no chunk re-wakes, and nothing is re-rendered.
+    e.consumeRenderDirtyChunks();
+    for (let i = 0; i < 50; i++) e.update();
+    expect(e.activeThermalChunkCount).toBe(0);
+    expect(e.swapsLastFrame).toBe(0);
+    expect(Array.from(e.consumeRenderDirtyChunks()).some((v) => v)).toBe(false);
   });
 });

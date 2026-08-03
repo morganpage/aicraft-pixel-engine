@@ -4,6 +4,8 @@ export {
   SETTLE_TIMEOUT_FRAMES,
   DEFAULT_AMBIENT_TEMPERATURE,
   HEAT_EPSILON,
+  CONDUCTION_MAX,
+  INSULATED_EXPOSURE,
   type PixelEngineOptions,
   type ExplosionHook,
 } from './engine.js';

@@ -106,7 +106,11 @@ Three things differ from the other optional grids, and all three bite if you ass
 
 Materials opt in by setting any thermal field (`spawnTemp`, `conductivity`, `emissivity`, `freezesAt`/`meltsAt`, `heatSource`); `isThermal[mat]` reports the result. EMPTY, OIL, ACID, SMOKE and FGAS set none. `engine.activeThermalChunkCount` is the settle signal for heat — *not* `swapsLastFrame`, since heat moves without swapping anything.
 
-> **Status:** the field and its bookkeeping are in place; the heat *step* — conduction, environment exchange, and phase change — is not yet wired up, so stored temperatures currently only move with their cells. Until it lands, a host that wants lava to cool still drives that itself. See `docs/plan-temperature.md`.
+Heat evolves through two mechanisms each frame. **Conduction** moves heat cell-to-cell and is exactly conservative — the coefficient is a property of the edge (`min` of both endpoints' `conductivity`, scaled by a stability cap), so a seam conducts at the same rate whichever side you look from. **Environment exchange** pulls each cell toward `ambientTemperature` in proportion to how many of its faces are open to `EMPTY`, which is what actually cools a surface: conduction alone cannot, since the thing an exposed cell loses heat to has no temperature. A material flagged `heatSource` (FIRE) is held at its temperature rather than skipped — neighbours draw from it at full strength, then it is pinned back.
+
+Heat settles: changes below `HEAT_EPSILON` are discarded so chunks can sleep, and a thermally equilibrated world costs the same as one with heat disabled (measured at 0.0006 ms/frame either way on a 220×220 world). Use `engine.activeThermalChunkCount` to observe it. One consequence worth knowing: a heat source at temperature `T` can never drive a neighbour past `T`, so a phase threshold above the hottest source is unreachable by construction.
+
+> **Status:** phase change (`freezesAt`/`meltsAt`) is defined on materials but not yet acted on, so ice does not melt and lava does not turn to rock on its own yet. The existing contact reactions in `stepLavaOrFire` still handle those instantly. See `docs/plan-temperature.md`.
 
 ---
 

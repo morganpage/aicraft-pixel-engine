@@ -23,7 +23,7 @@
  * frame-alternating scan, the material interaction rules, the chunk system,
  * and the settle detection are all preserved from the original.
  */
-import { MaterialType, Materials, materialDefs, isTerrainSolid } from '../materials/index.js';
+import { MaterialType, Materials, materialDefs, isTerrainSolid, isThermal } from '../materials/index.js';
 import { FlatGravity, type GravityModel } from '../gravity/index.js';
 import type { NeighborFrame } from './types.js';
 import { fillNeighborFrame } from './neighbors.js';
@@ -100,6 +100,37 @@ export const DEFAULT_AMBIENT_TEMPERATURE = 0.1;
  * count, not to float epsilon.
  */
 export const HEAT_EPSILON = 1e-4;
+
+/**
+ * Maximum per-edge conduction coefficient, before a material's relative
+ * {@link MaterialDef.conductivity} scales it down.
+ *
+ * This is a stability bound, not a taste knob. The update for a cell is
+ * `T' = T(1 − Σf) + Σ(f·T_n)`, so the max principle needs the self-weight
+ * `1 − Σf` to stay non-negative — i.e. `f ≤ 1/4` on a 4-neighbour stencil.
+ * Exceed it and the scheme diverges: a cell at 1.0 with `f = 0.8` and four
+ * neighbours at 0.0 moves 3.2 out in one step, landing at −2.2 while each
+ * neighbour jumps to 0.8, and the sign flips every step after. Clamping to
+ * [0,1] would stop the divergence at the cost of conservation, leaving a
+ * flickering checkerboard.
+ *
+ * 0.25 is the true limit and is not itself wrong — but it is *attained* when
+ * all four neighbours have conductivity 1.0, and at exactly zero self-weight
+ * the update degenerates into a pure neighbour average, which a two-colour
+ * grid oscillates on forever. 0.2 holds the self-weight at ≥ 0.2 for every
+ * value the material table can produce, and costs only a slightly slower
+ * approach to equilibrium.
+ */
+export const CONDUCTION_MAX = 0.2;
+
+/**
+ * Environment-exchange factor for a cell with no exposed face.
+ *
+ * Small but deliberately nonzero, so a fully buried flow eventually sets
+ * instead of staying molten forever, while a conduit that is recharged every
+ * frame stays live.
+ */
+export const INSULATED_EXPOSURE = 0.02;
 
 /** How many stable frames the grid must be quiet before settle completes. */
 export const SETTLE_STABLE_THRESHOLD = 10;
@@ -270,6 +301,19 @@ export class PixelEngine {
   readonly ambientTemperature: number;
 
   /**
+   * Per-cell heat flux accumulator for the conduction pass, in temperature
+   * units. Allocated alongside {@link heatGrid}.
+   *
+   * Conduction is accumulated as edge fluxes here and applied in a second pass,
+   * rather than computed cell-by-cell into a scratch temperature buffer. That
+   * is what makes conservation exact: each edge is visited once and both of its
+   * endpoints are updated by the same amount with opposite signs, so heat
+   * cannot be created at a boundary between materials of differing
+   * conductivity.
+   */
+  private _heatDelta: Float32Array | null = null;
+
+  /**
    * The gravity model's potential field, pre-bound, or `null` when the model
    * does not provide one. Cached at construction so the hot loop neither
    * re-checks for the optional method nor allocates a bound function.
@@ -360,8 +404,7 @@ export class PixelEngine {
       const st = materialDefs[this.grid[i]].spawnTemp;
       h[i] = st === undefined ? this.ambientTemperature : st;
     }
-    // The conduction scratch buffer is allocated here too once the heat step
-    // lands; it has no reader yet, so it is not carried as dead state.
+    this._heatDelta = new Float32Array(n);
     const chunks = this.chunkWidth * this.chunkHeight;
     this.thermalChunks = new Uint8Array(chunks);
     this.nextThermalChunks = new Uint8Array(chunks);
@@ -950,6 +993,198 @@ export class PixelEngine {
     }
   }
 
+  /**
+   * Advance the heat field one frame: conduction, then environment exchange,
+   * then heat-source re-assertion.
+   *
+   * ## Why three sequential sub-steps rather than one fused pass
+   *
+   * Each is individually contractive — neither can push a cell outside the
+   * range it started in — and composing contractive operators stays
+   * contractive. Fusing them would mean reasoning about a combined stability
+   * bound, and the combined bound is where an earlier design put coefficients
+   * that diverge.
+   *
+   * ## Why conduction is not enough on its own
+   *
+   * The thing an exposed cell loses heat *to* is EMPTY, which has no
+   * temperature and cannot be a conduction partner (heat stored in vacuum cells
+   * would advect through {@link swap} as hot air parcels and be destroyed by
+   * `setMaterial`). Under conduction alone an exposed cell therefore has nobody
+   * to conduct into and cools *slower* than a buried one — backwards from the
+   * behaviour this field exists to provide. Environment exchange is the term
+   * that actually cools a flow: a skin chills ahead of its core, a buried
+   * conduit stays live, and a flow front stalls first.
+   *
+   * ## Cost
+   *
+   * Scoped to {@link thermalChunks}, and returns immediately when none is
+   * active — a thermally settled world costs one scan of the chunk flags.
+   */
+  private runHeatStep(): void {
+    const heat = this.heatGrid;
+    const delta = this._heatDelta;
+    const active = this.thermalChunks;
+    if (heat === null || delta === null || active === null) return;
+
+    let anyActive = false;
+    for (let i = 0; i < active.length; i++) {
+      if (active[i]) { anyActive = true; break; }
+    }
+    if (!anyActive) return;
+
+    const cw = this.chunkWidth;
+    const cs = this.CHUNK_SIZE;
+    const w = this.width;
+    const h = this.height;
+    const grid = this.grid;
+
+    // --- Pass 1: clear the flux accumulator over active chunks -------------
+    // Only cells in active chunks can receive flux (see pass 2), so this is
+    // sufficient and leaves settled regions untouched.
+    for (let cy = 0; cy < this.chunkHeight; cy++) {
+      for (let cx = 0; cx < cw; cx++) {
+        if (!active[cy * cw + cx]) continue;
+        const yEnd = Math.min((cy + 1) * cs, h);
+        const xStart = cx * cs;
+        const xEnd = Math.min(xStart + cs, w);
+        for (let y = cy * cs; y < yEnd; y++) {
+          const rowOff = y * w;
+          for (let x = xStart; x < xEnd; x++) delta[rowOff + x] = 0;
+        }
+      }
+    }
+
+    // --- Pass 2: accumulate conduction flux, one visit per edge ------------
+    // Each cell owns its +x and +y edges, so every edge is visited exactly
+    // once and both endpoints are updated with equal and opposite flux.
+    for (let cy = 0; cy < this.chunkHeight; cy++) {
+      for (let cx = 0; cx < cw; cx++) {
+        if (!active[cy * cw + cx]) continue;
+        const yEnd = Math.min((cy + 1) * cs, h);
+        const xStart = cx * cs;
+        const xEnd = Math.min(xStart + cs, w);
+        for (let y = cy * cs; y < yEnd; y++) {
+          const rowOff = y * w;
+          for (let x = xStart; x < xEnd; x++) {
+            const idx = rowOff + x;
+            const ca = materialDefs[grid[idx]].conductivity;
+            if (ca === undefined) continue; // non-thermal: does not conduct
+            const ta = heat[idx];
+
+            // All four neighbours are *inspected*, but only the +x and +y
+            // edges are conducted across — each edge has exactly one owner, so
+            // it is visited once and its two endpoints updated with equal and
+            // opposite flux. The -x/-y neighbours are inspected purely to
+            // decide whether a sleeping chunk on that side needs waking; their
+            // edges belong to the cell on the other end.
+            for (let d = 0; d < 4; d++) {
+              const nx = x + (d === 0 ? 1 : d === 2 ? -1 : 0);
+              const ny = y + (d === 1 ? 1 : d === 3 ? -1 : 0);
+              if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+
+              const nIdx = ny * w + nx;
+              const cb = materialDefs[grid[nIdx]].conductivity;
+              if (cb === undefined) continue; // non-thermal: does not conduct
+
+              // The coefficient is a property of the *edge*. Both endpoints
+              // must agree on it, or the seam's conductance would depend on
+              // which side the loop visits first and the physics would follow
+              // grid orientation. `min` models the bottleneck — a good
+              // insulator throttles the pair. (The physically exact form is
+              // the harmonic mean, likewise symmetric, and drops in here
+              // unchanged.)
+              const f = CONDUCTION_MAX * (ca < cb ? ca : cb);
+              const q = f * (ta - heat[nIdx]);
+
+              // An edge is only conducted across when *both* chunks are awake:
+              // flux written into a sleeping chunk would never be applied, and
+              // the heat would simply vanish. Skipping transfers nothing, which
+              // conserves exactly.
+              const ncx = (nx / cs) | 0;
+              const ncy = (ny / cs) | 0;
+              if (!active[ncy * cw + ncx]) {
+                // Wake the sleeping side only if there is genuinely heat to
+                // move, so the pair conducts next frame — a one-frame lag at a
+                // seam rather than a stall. Waking unconditionally would let
+                // any active chunk re-wake its neighbours forever, and they it,
+                // so a fully equilibrated world would never go quiet.
+                if (q > HEAT_EPSILON || q < -HEAT_EPSILON) this.wakeThermalChunk(nx, ny);
+                continue;
+              }
+
+              if (d >= 2) continue; // -x/-y: inspected for waking only
+              delta[idx] -= q;
+              delta[nIdx] += q;
+            }
+          }
+        }
+      }
+    }
+
+    // --- Pass 3: apply flux, exchange with the environment, hold sources ---
+    for (let cy = 0; cy < this.chunkHeight; cy++) {
+      for (let cx = 0; cx < cw; cx++) {
+        if (!active[cy * cw + cx]) continue;
+        const yEnd = Math.min((cy + 1) * cs, h);
+        const xStart = cx * cs;
+        const xEnd = Math.min(xStart + cs, w);
+        for (let y = cy * cs; y < yEnd; y++) {
+          const rowOff = y * w;
+          for (let x = xStart; x < xEnd; x++) {
+            const idx = rowOff + x;
+            const mat = grid[idx];
+            if (!isThermal[mat]) continue;
+            const def = materialDefs[mat];
+            const before = heat[idx];
+            let t = before + delta[idx];
+
+            const emissivity = def.emissivity;
+            if (emissivity !== undefined) {
+              // Exposure = orthogonal faces open to the environment. The curve
+              // is deliberately steep at the first face and shallow after:
+              // touching air at all is most of the heat loss, and a cell open
+              // on four sides is not four times as cold as one open on one. A
+              // linear exposure/4 lets a flow's top surface — open on exactly
+              // one face, which is nearly every cell of a flow — cool at a
+              // quarter rate, and tongues then stay molten long enough to run
+              // right around a planet as a sheet.
+              let exposed = 0;
+              if (this.getMaterial(x, y - 1) === MaterialType.EMPTY) exposed++;
+              if (this.getMaterial(x, y + 1) === MaterialType.EMPTY) exposed++;
+              if (this.getMaterial(x - 1, y) === MaterialType.EMPTY) exposed++;
+              if (this.getMaterial(x + 1, y) === MaterialType.EMPTY) exposed++;
+              const k = exposed > 0 ? 0.4 + (0.6 * exposed) / 4 : INSULATED_EXPOSURE;
+              // `emissivity * k <= 1`, so this lands on ambient at worst and
+              // never overshoots past it.
+              t += emissivity * k * (this.ambientTemperature - t);
+            }
+
+            // A heat source is held, not skipped: it was read at full strength
+            // by pass 2, so its neighbours have already drawn from it, and it
+            // is only now pinned back to its own temperature. This is the one
+            // place heat is created rather than moved.
+            if (def.heatSource) t = def.spawnTemp ?? t;
+
+            if (t > 1) t = 1;
+            else if (t < 0) t = 0;
+
+            // Below the epsilon the cell is treated as settled: the write is
+            // skipped so the chunk can sleep. Without this, diffusion's
+            // asymptotic tail keeps every chunk awake and every chunk
+            // render-dirty forever.
+            const change = t - before;
+            if (change > HEAT_EPSILON || change < -HEAT_EPSILON) {
+              heat[idx] = t;
+              this.wakeThermalChunk(x, y);
+              this.markRenderDirty(x, y);
+            }
+          }
+        }
+      }
+    }
+  }
+
   private clearUpdatedInActiveChunks(): void {
     const cw = this.chunkWidth;
     const cs = this.CHUNK_SIZE;
@@ -1011,6 +1246,9 @@ export class PixelEngine {
     // Falling and reactions resolve first; levelling then acts on where they
     // left the liquid, which is the correct physical order.
     this.runLiquidLevelling();
+    // Heat last, so it acts on where the material actually ended up this
+    // frame rather than on where it started. No-op when heat is disabled.
+    this.runHeatStep();
 
     for (const pt of deferredExplosions) {
       this.explode(pt.x, pt.y, 8, 3);
