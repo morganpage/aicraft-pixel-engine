@@ -26,29 +26,33 @@
  *     blunt flow front, cooling margins that stall into levees, and an edifice
  *     that can stack at all.
  *
- *  3. **Lava cools through incandescence to dark rock.** The engine reaches
- *     `ROCK` only through the lava+water reaction, so on a dry planet a flow
- *     stays molten forever. {@link coolLava} supplies the transition, and does
- *     it as a *gradual* temperature decay rather than a per-cell coin flip —
- *     the coin flip is what made the old cone look like orange pepper stirred
- *     through grey gravel. Exposed cells lose heat fastest, so a flow crusts
- *     over from the outside in while its core stays molten, which is what makes
- *     a flow read as a flow.
+ *  3. **Lava cools through incandescence to dark rock.** This used to be the
+ *     helper's largest job. It is now the engine's: `LAVA` sets `spawnTemp`,
+ *     `emissivity` and `freezesAt`, and the engine's heat step cools it,
+ *     freezes it to `ROCK`, and refuses to freeze a parcel still in flight.
  *
  * ## The temperature field
  *
- * Heat lives in the engine's `colorGrid` as one of {@link TEMP_STEPS} quantized
- * ramp colours, and {@link tempAt} decodes a cell's temperature by looking its
- * packed colour back up. That is deliberate rather than a parallel array: the
- * engine already swaps `colorGrid` alongside `grid` on every swap and levelling
- * transfer, so heat follows its material for free. A side array would need the
- * engine to know about it.
+ * Heat is `engine.heatGrid`, written with `setHeat` and read with `getHeat`.
+ *
+ * It used to live in the engine's `colorGrid`, quantized into {@link TEMP_STEPS}
+ * ramp colours and decoded by looking a cell's exact packed colour back up. That
+ * was not perverse — the engine already swaps `colorGrid` alongside `grid` on
+ * every swap and levelling transfer, so heat followed its material for free,
+ * which a host-side side-array could never do. But it cost a whole colour
+ * channel, capped temperature at 48 levels, and forced the ramp to stay
+ * disjoint from every tephra tint forever so the decode could tell them apart.
+ *
+ * The engine now carries temperature as a first-class per-cell field with the
+ * same ride-along guarantee, so all of that is gone. What is left here is the
+ * part that really is the host's: {@link syncFromHeat} maps temperature onto
+ * rheology and colour, and the ramp survives as a palette only.
  *
  * DOM-free and deterministic, so it runs and is tested under Node — the same
  * split the sections use for `renderer.ts`.
  */
 
-import { fillNeighborFrame, type PixelEngine, type NeighborFrame } from '../../src/sand';
+import { type PixelEngine } from '../../src/sand';
 import { MaterialType } from '../../src/materials';
 
 /** Geometry of a volcano stamped into a radial-gravity planet. */
@@ -188,15 +192,6 @@ export function makeRng(seed: number): () => number {
 export const TEMP_STEPS = 48;
 
 /**
- * Temperature at or below which molten lava sets to rock.
- *
- * Rock keeps cooling below this, from dark red down to cold basalt, so a flow
- * that has just crusted over still glows and fades over the next few seconds
- * instead of snapping to grey the instant it stops moving.
- */
-export const FREEZE_TEMP = 0.30;
-
-/**
  * Incandescence ramp control points, `[t, [r, g, b]]`.
  *
  * The cold end is deliberately *darker* than the `ROCK` palette grey the planet
@@ -206,12 +201,11 @@ export const FREEZE_TEMP = 0.30;
  * whole eruption's worth of new rock simply vanished into the planet.
  *
  * The ramp and the dark basalt tints {@link tintTephra} writes share one
- * `colorGrid`, and {@link tempAt} identifies a cell as hot by looking its exact
- * packed colour back up — so the two sets must stay disjoint, or tephra would
- * read as warm rock and be cooled as if it were lava. They do not overlap:
- * tephra is always `(38+n, 34+n, 36+n)`, whose channels are locked to a fixed
- * `r-g = 4`, `r-b = 2` spacing that no ramp entry reproduces. There is a test
- * pinning this.
+ * `colorGrid`, and they used to be required to stay disjoint forever: the old
+ * decode identified a hot cell by looking its exact packed colour back up, so
+ * an overlap would have made tephra read as warm rock and be cooled as if it
+ * were lava. Nothing reads colour back now, so that constraint is retired
+ * along with the test that pinned it.
  */
 const RAMP_STOPS: ReadonlyArray<readonly [number, readonly [number, number, number]]> = [
   [0.00, [ 40,  38,  44]], // cold basalt — darker than bedrock grey
@@ -248,43 +242,9 @@ export const TEMP_RAMP: Uint32Array = (() => {
   return ramp;
 })();
 
-/** Reverse lookup: packed ramp colour → step index. */
-const RAMP_INDEX: ReadonlyMap<number, number> = (() => {
-  const m = new Map<number, number>();
-  for (let i = 0; i < TEMP_STEPS; i++) m.set(TEMP_RAMP[i], i);
-  return m;
-})();
-
 function ensureColorGrid(engine: PixelEngine): Uint32Array {
   if (!engine.colorGrid) engine.colorGrid = new Uint32Array(engine.width * engine.height);
   return engine.colorGrid;
-}
-
-/**
- * Temperature of a cell in 0..1, or `-1` if it carries no ramp colour (cold
- * bedrock, tephra, anything untracked).
- */
-export function tempAt(engine: PixelEngine, x: number, y: number): number {
-  if (x < 0 || x >= engine.width || y < 0 || y >= engine.height) return -1;
-  const cg = engine.colorGrid;
-  if (!cg) return -1;
-  const i = RAMP_INDEX.get(cg[y * engine.width + x]);
-  return i === undefined ? -1 : i / (TEMP_STEPS - 1);
-}
-
-/**
- * Write a cell's temperature, quantized onto the ramp.
- *
- * Call this *after* `setMaterial`, never before: `setMaterial` clears the
- * cell's `colorGrid` entry whenever the material actually changes, so a colour
- * written first is discarded.
- */
-export function setTemp(engine: PixelEngine, x: number, y: number, t: number): void {
-  if (x < 0 || x >= engine.width || y < 0 || y >= engine.height) return;
-  const cg = ensureColorGrid(engine);
-  const i = Math.max(0, Math.min(TEMP_STEPS - 1, Math.round(t * (TEMP_STEPS - 1))));
-  cg[y * engine.width + x] = TEMP_RAMP[i];
-  engine.markRenderDirty(x, y);
 }
 
 /**
@@ -343,7 +303,9 @@ function setStiffness(engine: PixelEngine, x: number, y: number, v: number): voi
 /** Place a cell of molten magma, with the rheology its temperature implies. */
 function setMagma(engine: PixelEngine, x: number, y: number, t = MAGMA_TEMP): void {
   engine.setMaterial(x, y, MaterialType.LAVA);
-  setTemp(engine, x, y, t);
+  // After setMaterial, never before: a material change resets the cell's heat
+  // to the new material's spawnTemp, so a temperature written first is lost.
+  engine.setHeat(x, y, t);
   if (x >= 0 && x < engine.width && y >= 0 && y < engine.height) {
     setStiffness(engine, x, y, stiffnessForTemp(t));
   }
@@ -614,9 +576,17 @@ export function pressurizeConduit(
       const p = borePos(cfg, r, w);
       const b = borePos(cfg, r - 1, w);
       // A lane that has no source below it (the bore swells here) starts from
-      // reservoir heat rather than inheriting nothing.
-      const belowT = tempAt(engine, b.x, b.y);
-      setMagma(engine, p.x, p.y, belowT < 0 ? reservoirTemp(p.x, p.y) : belowT);
+      // reservoir heat rather than inheriting nothing. Asking the material
+      // directly replaces what used to be a sentinel from the colour decode:
+      // `tempAt` returned -1 for any cell carrying no ramp colour, which was
+      // only ever a proxy for "not magma".
+      const belowIsMagma = engine.getMaterial(b.x, b.y) === MaterialType.LAVA;
+      setMagma(
+        engine,
+        p.x,
+        p.y,
+        belowIsMagma ? engine.getHeat(b.x, b.y) : reservoirTemp(p.x, p.y),
+      );
     }
   }
   // Recharge the base of the bore from the chamber.
@@ -850,126 +820,187 @@ export function emitPlume(
 // ---------------------------------------------------------------------------
 
 /** Cells that count as "cold" for the purposes of chilling a lava cell. */
-function isCold(mat: MaterialType): boolean {
-  return (
-    mat === MaterialType.EMPTY ||
-    mat === MaterialType.WATER ||
-    mat === MaterialType.STEAM ||
-    mat === MaterialType.SMOKE ||
-    mat === MaterialType.FIRE
-  );
-}
-
-/** Tuning for {@link coolLava}. */
-export interface CoolOptions {
-  /** Temperature lost per frame by a fully-exposed cell. */
-  rate: number;
-  /**
-   * Fraction of {@link rate} lost by a fully insulated cell. Small but nonzero,
-   * so a buried flow eventually sets instead of staying molten forever, while
-   * the conduit — which is recharged every frame — stays live.
-   */
-  insulatedFactor?: number;
-}
+/**
+ * How far above ambient a solid must be before it is painted as incandescent.
+ *
+ * Bedrock sits at ambient and must keep its palette grey, or the whole planet
+ * turns basalt-dark. Anything genuinely warmer — lava, rock freshly set from
+ * it, country rock a flow has heated — glows.
+ */
+const GLOW_FLOOR = 0.005;
 
 /**
- * Cool every hot cell one step, set molten lava that has passed
- * {@link FREEZE_TEMP} to rock, and let cooled rock fade to cold basalt.
+ * Derive the two host-side consequences of a cell's temperature: how stiff it
+ * is, and what colour it renders.
  *
- * Heat loss scales with *exposure* — how many of the four orthogonal neighbours
- * are air or water. That single rule does all the work a flow needs: a flow's
- * skin, exposed on two or three sides, chills far ahead of its core, so a
- * crusted flow with a molten interior falls out for free; a buried conduit is
- * insulated and stays live; and a flow front, being the most exposed part of the
- * flow, stalls first, which is what makes a tongue stop at a blunt end and its
- * margins stiffen into levees.
+ * This is all that remains of `coolLava`. The cooling itself — exposure-scaled
+ * heat loss, the freeze to rock, the airborne guard that stopped ejecta setting
+ * in mid-air — now belongs to the engine, which does it for every host rather
+ * than only this one. What is left is genuinely the host's business:
  *
- * The decay is gradual and deterministic rather than a per-cell freeze roll. The
- * roll is what made the old cone look like orange pepper stirred through grey
- * gravel: neighbouring cells of one flow would land on opposite sides of a coin
- * flip and end up at opposite ends of the palette. Cooling by degrees instead
- * keeps a flow's cells within a step or two of their neighbours, which is what
- * reads as one connected body of lava.
+ *  - **Rheology.** `stiffnessGrid` is a host input, so something has to keep it
+ *    in step with temperature as a flow chills. That is the mapping that turns
+ *    a cooling curve into flow morphology — margins and fronts lock while the
+ *    core keeps moving.
+ *  - **Colour.** Rendering is the host's job per the engine's contract. The
+ *    engine stores a temperature; turning it into incandescence is up to us.
  *
- * @returns how many cells set to rock this call.
+ * The ramp survives, but only as a *palette*. It is no longer a storage format,
+ * so the constraint that used to make it fragile is gone: `tempAt` decoded a
+ * cell's temperature by looking its exact packed colour back up, which forced
+ * every ramp entry to stay distinct from every tephra tint forever. Nothing
+ * reads colour back now, so the two sets are free to collide.
+ *
+ * **Call this once per frame, unconditionally** — not only while the volcano is
+ * erupting. The engine cools and freezes cells regardless of what the host is
+ * doing, and a freeze clears the cell's colour, so anything that sets while the
+ * volcano is quiet would otherwise be left rendering as bedrock.
+ *
+ * @returns how many cells were painted as glowing.
  */
-export function coolLava(engine: PixelEngine, rng: () => number, opts: CoolOptions): number {
-  const insulated = opts.insulatedFactor ?? 0.02;
-  const frame: NeighborFrame = {
-    down: { dx: 0, dy: 0 },
-    downLeft: { dx: 0, dy: 0 },
-    downRight: { dx: 0, dy: 0 },
-    left: { dx: 0, dy: 0 },
-    right: { dx: 0, dy: 0 },
-  };
-  const cg = engine.colorGrid;
-  if (!cg) return 0;
+export function syncFromHeat(engine: PixelEngine): number {
+  const cg = ensureColorGrid(engine);
+  const grid = engine.grid;
   const w = engine.width;
-  let frozen = 0;
+  const floor = engine.ambientTemperature + GLOW_FLOOR;
+  let glowing = 0;
 
   for (let y = 0; y < engine.height; y++) {
     const rowOff = y * w;
     for (let x = 0; x < w; x++) {
       const idx = rowOff + x;
-      const step = RAMP_INDEX.get(cg[idx]);
-      if (step === undefined || step === 0) continue; // not hot (or already cold)
-      const mat = engine.grid[idx] as MaterialType;
+      const mat = grid[idx];
       if (mat !== MaterialType.LAVA && mat !== MaterialType.ROCK) continue;
 
-      let exposure = 0;
-      if (isCold(engine.getMaterial(x, y - 1))) exposure++;
-      if (isCold(engine.getMaterial(x, y + 1))) exposure++;
-      if (isCold(engine.getMaterial(x - 1, y))) exposure++;
-      if (isCold(engine.getMaterial(x + 1, y))) exposure++;
-
-      // Exposure → heat loss. The curve is deliberately steep at the first
-      // exposed face and shallow after: touching air at all is most of the heat
-      // loss, and a cell exposed on four sides is not four times as cold as one
-      // exposed on one. A linear exposure/4 instead let a flow's top surface —
-      // exposed on exactly one side, which is nearly every cell of a flow — cool
-      // at a quarter rate, so tongues stayed molten long enough to run right
-      // around the planet as a sheet.
-      //
-      // A little jitter keeps the crust edge ragged rather than a clean
-      // iso-contour. Small enough not to reintroduce salt-and-pepper.
-      const loss = opts.rate * (exposure > 0 ? 0.4 + (0.6 * exposure) / 4 : insulated) * (0.75 + rng() * 0.5);
-      const next = Math.max(0, step - loss * (TEMP_STEPS - 1));
-      const nextStep = Math.max(0, Math.min(TEMP_STEPS - 1, Math.round(next)));
-      const t = nextStep / (TEMP_STEPS - 1);
-
-      if (mat === MaterialType.LAVA && t <= FREEZE_TEMP) {
-        // Only set lava that is resting on something. Ejecta is spawned in
-        // mid-air and the engine has no velocity, so a cell in flight is a lone
-        // airborne cell with cold neighbours on every side — maximum exposure,
-        // and therefore the likeliest thing to freeze, before it has landed
-        // anywhere. Frozen lava is ROCK, a static solid that never falls, so it
-        // would hang in the sky forever.
-        fillNeighborFrame(x, y, engine.gravity, frame);
-        if (engine.getMaterial(x + frame.down.dx, y + frame.down.dy) === MaterialType.EMPTY) {
-          // Airborne: keep it molten and hold its heat at the freezing point so
-          // it sets promptly once it lands.
-          cg[idx] = TEMP_RAMP[Math.round(FREEZE_TEMP * (TEMP_STEPS - 1)) + 1];
-          engine.markRenderDirty(x, y);
-          continue;
-        }
-        engine.setMaterial(x, y, MaterialType.ROCK);
-        frozen++;
+      const t = engine.getHeat(x, y);
+      if (mat === MaterialType.LAVA) {
+        setStiffness(engine, x, y, stiffnessForTemp(t));
+      } else if (t <= floor) {
+        // Cold rock: bedrock that was never heated keeps the palette grey, and
+        // rock that has finished cooling keeps the last dark tint it was given.
+        continue;
       }
 
-      // Written after any setMaterial, which clears colorGrid on a real change.
-      cg[idx] = TEMP_RAMP[nextStep];
-      // Stiffen as it chills. This is the step that turns a cooling curve into
-      // flow morphology — margins and fronts lock while the core keeps moving.
-      if (mat === MaterialType.LAVA) setStiffness(engine, x, y, stiffnessForTemp(t));
-      engine.markRenderDirty(x, y);
+      const i = Math.max(0, Math.min(TEMP_STEPS - 1, Math.round(t * (TEMP_STEPS - 1))));
+      const c = TEMP_RAMP[i];
+      if (cg[idx] !== c) {
+        cg[idx] = c;
+        engine.markRenderDirty(x, y);
+      }
+      glowing++;
     }
   }
-  return frozen;
+  return glowing;
 }
 
 // ---------------------------------------------------------------------------
 // Plumbing maintenance
 // ---------------------------------------------------------------------------
+
+/**
+ * Hold the magma reservoir at depth temperature.
+ *
+ * **Required, not decorative**, and it is new with the engine's heat field.
+ * The old host-side cooling had no conduction term at all — a buried cell lost
+ * only a token fraction of the exposed rate — so a chamber stayed molten
+ * essentially for free. The engine does conduct, and a chamber is a hot blob
+ * wrapped in cold bedrock, which is an enormous heat sink: measured, an
+ * unfed chamber chills from 0.75 through the freezing point and sets solid in
+ * under 200 frames, taking the conduit with it.
+ *
+ * That is the correct physics for a *closed* body of magma, and the wrong model
+ * for a volcano. A real chamber is not closed — it is fed from the mantle, and
+ * the heat arriving from below is why it stays molten between eruptions. This
+ * supplies that feed. It is the same category of thing as
+ * {@link pressurizeConduit}: plumbing the host owns, not thermodynamics the
+ * engine should be guessing at.
+ *
+ * Only re-heats cells that are *already* magma, so it never melts the bedrock
+ * walls that keep the chamber a chamber.
+ *
+ * @returns how many cells were recharged.
+ */
+const RECHARGE_HEADROOM = 3;
+
+export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): number {
+  let n = 0;
+
+  /**
+   * Feed one cell, if it is magma and still buried.
+   *
+   * The exposure test is what keeps the vent working as a vent. Magma open to
+   * the sky is radiating, and it is *supposed* to crust over — that is the
+   * whole repose phase. Feeding it would hold the summit permanently molten and
+   * the cone would never close over between eruptions.
+   */
+  const feed = (x: number, y: number): void => {
+    const m = engine.getMaterial(x, y);
+    // Magma, or plumbing that has set solid since the last episode. Nothing
+    // else: restricting it to these keeps the feed from eating the bedrock
+    // walls that make the chamber a chamber, the same rule `remeltConduit`
+    // follows for the bore.
+    if (m !== MaterialType.LAVA && m !== MaterialType.ROCK && m !== MaterialType.SAND) return;
+    if (
+      engine.getMaterial(x, y - 1) === MaterialType.EMPTY ||
+      engine.getMaterial(x, y + 1) === MaterialType.EMPTY ||
+      engine.getMaterial(x - 1, y) === MaterialType.EMPTY ||
+      engine.getMaterial(x + 1, y) === MaterialType.EMPTY
+    ) return;
+
+    const t = reservoirTemp(x, y);
+    if (m === MaterialType.LAVA) {
+      // Only ever add heat. Letting this pull a cell *down* to reservoir
+      // temperature would cool freshly-risen magma back toward the chamber
+      // value on its way out.
+      if (engine.getHeat(x, y) < t) engine.setHeat(x, y, t);
+      setStiffness(engine, x, y, stiffnessForTemp(t));
+    } else {
+      // Re-melt. A volcano that has gone dormant stops being fed, so its
+      // reservoir chills and sets — which is real enough (it is how a pluton
+      // forms), and it is why the chamber goes dark between episodes. But the
+      // next episode has to be able to wake it up again, and a frozen chamber
+      // that could only ever be topped up if it were already molten would stay
+      // rock forever.
+      setMagma(engine, x, y, t);
+    }
+    n++;
+  };
+
+  const chamberR = cfg.planetRadius - cfg.chamberDepth;
+
+  // The bore. `reservoirTemp` covers the conduit as well as the chamber, and it
+  // needs the feed more: a narrow bore wrapped in bedrock is nearly all surface,
+  // so it loses heat faster than the blob it rises from.
+  //
+  // The feed stops short of the surface. Heat arrives from the mantle, so it is
+  // a function of depth — and near-surface magma is precisely what the
+  // atmosphere cools. Holding the column molten right to the summit pins the
+  // vent cap above the freezing point forever (it equilibrates around 0.44
+  // against a fed neighbour), so the crater never crusts and repose stops
+  // reading as repose.
+  for (let r = chamberR; r <= cfg.planetRadius - RECHARGE_HEADROOM; r++) {
+    const hw = boreHalfWidth(cfg, r);
+    for (let w = -hw; w <= hw; w++) {
+      const p = borePos(cfg, r, w);
+      feed(p.x, p.y);
+    }
+  }
+
+  // The chamber blob, same geometry `stampVolcano` lays down.
+  const ux = Math.cos(cfg.ventAngle);
+  const uy = Math.sin(cfg.ventAngle);
+  const cxc = cfg.centerX + ux * chamberR;
+  const cyc = cfg.centerY + uy * chamberR;
+  const maxR = cfg.chamberRadius * 1.35;
+  for (let dy = -maxR; dy <= maxR; dy++) {
+    for (let dx = -maxR; dx <= maxR; dx++) {
+      const d = Math.hypot(dx, dy);
+      if (d > cfg.chamberRadius * chamberWall(Math.atan2(dy, dx))) continue;
+      feed(Math.round(cxc + dx), Math.round(cyc + dy));
+    }
+  }
+  return n;
+}
 
 /**
  * Remelt anything that has fallen back into the plumbing.
@@ -1158,7 +1189,6 @@ function pickBreach(rng: () => number, spread: number): number {
 export interface VolcanoStepOptions {
   plume: PlumeOptions;
   pressure: PressureOptions;
-  cool: CoolOptions;
   /** Per-frame chance of melting an embedded tephra cell. */
   assimilateRate: number;
   phases?: PhaseDurations;
@@ -1203,7 +1233,16 @@ export function stepVolcanoPre(
   }
 }
 
-/** The post-`update()` half of a frame: maintenance, cooling, assimilation. */
+/**
+ * The post-`update()` half of a frame: plumbing maintenance and assimilation.
+ *
+ * Deliberately does **not** call {@link syncFromHeat}. Cooling is the engine's
+ * now and runs every frame whether or not the volcano is erupting, so the
+ * appearance sync has to run every frame too — see its own docs. Bundling it
+ * here would tie it to the eruption, and lava that set during a dormant spell
+ * would never be repainted: freezing clears the cell's colour, so it would fall
+ * back to bedrock grey instead of cooling basalt.
+ */
 export function stepVolcanoPost(
   engine: PixelEngine,
   cfg: VolcanoConfig,
@@ -1214,7 +1253,9 @@ export function stepVolcanoPost(
   // Fallout sinks through the magma (tephra is denser than lava), so the bore
   // has to be reclaimed or the volcano chokes on its own ejecta.
   if (state.phase !== 'repose') remeltConduit(engine, cfg);
-  coolLava(engine, rng, opts.cool);
+  // Every phase, repose included: the chamber is molten between eruptions too,
+  // and left unfed it would set solid and end the volcano permanently.
+  rechargeReservoir(engine, cfg);
   assimilateTephra(engine, rng, { rate: opts.assimilateRate });
 }
 

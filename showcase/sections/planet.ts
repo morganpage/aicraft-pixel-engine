@@ -26,6 +26,7 @@ import {
   stampVolcano,
   stepVolcanoPre,
   stepVolcanoPost,
+  syncFromHeat,
   createVolcanoState,
   isDormant,
   makeRng,
@@ -157,6 +158,12 @@ function buildWorld(
       height: size,
       seed: 1,
       gravity: new RadialGravity({ centerX: cx, centerY: cy }),
+      // The volcano runs on the engine's heat field: lava is born hot, cools by
+      // exposure, and freezes to rock on its own. `ambientTemperature` is the
+      // dial the Ambient slider drives -- it sets how cold the world the flows
+      // are losing heat to is, so it is what decides whether they set into
+      // short stubby tongues or drape the whole cone.
+      enableHeat: true,
     });
 
     // Offscreen canvas holds the unrotated grid each frame. The visible canvas
@@ -265,8 +272,8 @@ export function initPlanet(container: HTMLElement): void {
   // Live values for the eruption. Each `input` event updates both the display
   // and the value the loop reads next tick, so changes apply mid-eruption.
   // Mirrors the brush-size slider pattern above.
-  const coolingInput = container.querySelector<HTMLInputElement>('.planet-volcano-cooling')!;
-  const coolingValue = container.querySelector<HTMLElement>('.planet-volcano-cooling-value')!;
+  const ambientInput = container.querySelector<HTMLInputElement>('.planet-volcano-ambient')!;
+  const ambientValue = container.querySelector<HTMLElement>('.planet-volcano-ambient-value')!;
   const effusionInput = container.querySelector<HTMLInputElement>('.planet-volcano-effusion')!;
   const effusionValue = container.querySelector<HTMLElement>('.planet-volcano-effusion-value')!;
   const ashInput = container.querySelector<HTMLInputElement>('.planet-volcano-ash')!;
@@ -276,15 +283,20 @@ export function initPlanet(container: HTMLElement): void {
   const phaseLabel = container.querySelector<HTMLElement>('.planet-volcano-phase')!;
 
   const volcanoParams = {
-    cooling: Number(coolingInput.value),
+    ambient: Number(ambientInput.value),
     effusion: Number(effusionInput.value),
     ash: Number(ashInput.value),
     spread: Number(spreadInput.value),
   };
   const fmt = (v: number): string => Number.isInteger(v) ? String(v) : v.toFixed(2);
-  coolingInput.addEventListener('input', () => {
-    volcanoParams.cooling = Number(coolingInput.value);
-    coolingValue.textContent = fmt(volcanoParams.cooling);
+  world.engine.ambientTemperature = volcanoParams.ambient;
+  ambientInput.addEventListener('input', () => {
+    volcanoParams.ambient = Number(ambientInput.value);
+    ambientValue.textContent = fmt(volcanoParams.ambient);
+    // Applied straight to the live engine rather than stashed for the next
+    // frame: ambient temperature is settable at runtime, and setting it wakes
+    // every thermal chunk so already-settled regions pick the change up too.
+    world.engine.ambientTemperature = volcanoParams.ambient;
   });
   effusionInput.addEventListener('input', () => {
     volcanoParams.effusion = Number(effusionInput.value);
@@ -466,10 +478,6 @@ export function initPlanet(container: HTMLElement): void {
       // away; the rest keeps the crater molten.
       breachFraction: 0.85,
     },
-    // cooling: the dial between short stubby flows (freeze fast) and long ones
-    //   that drape the cone (freeze slow). Too slow and lava levels into a
-    //   shell around the whole planet like water. Slider, default 0.08.
-    cool: { rate: volcanoParams.cooling, insulatedFactor: 0.02 },
     assimilateRate: 0.5,
   });
 
@@ -587,6 +595,7 @@ export function initPlanet(container: HTMLElement): void {
 
   const rebuild = (): void => {
     world = buildWorld(Number(resInput.value), Number(diaInput.value), canvas, world);
+    world.engine.ambientTemperature = volcanoParams.ambient;
     // A new backing store clears the context's settings along with its pixels.
     ctx.imageSmoothingEnabled = false;
     resetScene();
@@ -724,6 +733,10 @@ export function initPlanet(container: HTMLElement): void {
     } else {
       engine.update();
     }
+    // Every frame, erupting or not: the engine keeps cooling and freezing cells
+    // during a dormant spell, and a freeze clears the cell's colour, so flows
+    // that set while the volcano is quiet need repainting too.
+    syncFromHeat(engine);
     if (clouds.length > 0) clouds = removeDead(clouds);
 
     perfMs += performance.now() - t0;

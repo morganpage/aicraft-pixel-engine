@@ -114,6 +114,8 @@ Heat settles: changes below `HEAT_EPSILON` are discarded so chunks can sleep, an
 
 Enabling heat also changes three existing contact reactions in `stepLavaOrFire`: lava+water, fire+water, and ice touching either. They stop being instant and become temperature-mediated, so lava chills into rock and water heats until it boils. Left instant they would pre-empt the whole field — `ICE.meltsAt` would be decorative in any world containing lava. **Combustion is deliberately not mediated:** ignition stays a probabilistic roll against `flammability`, identical with heat on or off. With heat disabled all three reactions are byte-for-byte unchanged.
 
+`showcase/helpers/volcano.ts` is the worked example: it stores nothing itself, calls `setHeat`/`getHeat`, and maps temperature onto rheology and colour in one `syncFromHeat` pass. Note that pass runs **every frame, not only while the volcano is erupting** — the engine cools and freezes cells regardless of what the host is doing, and a freeze clears the cell's colour, so anything that sets during a quiet spell would otherwise render as bedrock.
+
 One tuning note: steam condenses well below where water boils (0.20 vs 0.70) rather than just under it. Because temperature carries across a change, water boiling at 0.70 becomes steam at 0.70, and a threshold just below gave steam a measured lifetime of **one frame**. The wide gap stands in for latent heat — the energy real steam must shed before condensing — without needing per-cell energy state. It lowers only the condensation leg, so boiling does not lag.
 
 ---

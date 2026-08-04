@@ -294,11 +294,29 @@ export class PixelEngine {
   /** The gravity model driving movement direction. */
   readonly gravity: GravityModel;
 
+  private _ambientTemperature: number;
+
   /**
    * The environment temperature exposed cells exchange toward. See
    * {@link PixelEngineOptions.ambientTemperature}.
+   *
+   * Writable at runtime — this is the climate dial, and seasons, day/night, or
+   * a terraforming verb all want to turn it while the world is running. Setting
+   * it wakes every thermal chunk, because it moves the equilibrium of every
+   * cell in the world including those in regions that had settled and gone
+   * quiet; without that the change would only reach whatever happened to still
+   * be thermally active.
    */
-  readonly ambientTemperature: number;
+  get ambientTemperature(): number {
+    return this._ambientTemperature;
+  }
+
+  set ambientTemperature(v: number) {
+    if (v === this._ambientTemperature) return;
+    this._ambientTemperature = v;
+    if (this.thermalChunks) this.thermalChunks.fill(1);
+    if (this.nextThermalChunks) this.nextThermalChunks.fill(1);
+  }
 
   /**
    * Per-cell heat flux accumulator for the conduction pass, in temperature
@@ -367,7 +385,7 @@ export class PixelEngine {
     this.CHUNK_SIZE = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
     this.liquidDispersion = options.liquidDispersion ?? DEFAULT_LIQUID_DISPERSION;
     this._onExplode = options.onExplode ?? (() => {});
-    this.ambientTemperature = options.ambientTemperature ?? DEFAULT_AMBIENT_TEMPERATURE;
+    this._ambientTemperature = options.ambientTemperature ?? DEFAULT_AMBIENT_TEMPERATURE;
 
     this.chunkWidth = Math.ceil(width / this.CHUNK_SIZE);
     this.chunkHeight = Math.ceil(height / this.CHUNK_SIZE);

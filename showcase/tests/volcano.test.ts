@@ -1,12 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { PixelEngine } from '../../src/sand';
-import { MaterialType } from '../../src/materials';
+import { MaterialType, Materials } from '../../src/materials';
 import { RadialGravity, FlatGravity } from '../../src/gravity';
 import {
   stampVolcano,
   emitPlume,
-  coolLava,
+  syncFromHeat,
   remeltConduit,
+  rechargeReservoir,
   assimilateTephra,
   pressurizeConduit,
   craterLowPoint,
@@ -17,13 +18,10 @@ import {
   summitRadius,
   edificeHeight,
   surfaceRadiusAt,
-  tempAt,
-  setTemp,
   makeRng,
   volcanoGeometryFor,
   TEMP_RAMP,
   TEMP_STEPS,
-  FREEZE_TEMP,
   MAGMA_TEMP,
   type VolcanoConfig,
   type VolcanoStepOptions,
@@ -55,7 +53,6 @@ const CFG: VolcanoConfig = {
 const OPTS: VolcanoStepOptions = {
   plume: { perFrame: 8, spread: 0.36, loft: 5, lavaFraction: 0.05, maxHeight: 20, rimBias: 0.45 },
   pressure: { riseInterval: 1, effusion: 1, craterHalfAngle: 0.06, maxHeight: 22, breachFraction: 0.85 },
-  cool: { rate: 0.12, insulatedFactor: 0.02 },
   assimilateRate: 0.5,
 };
 
@@ -63,6 +60,9 @@ function buildPlanet(): PixelEngine {
   const e = new PixelEngine({
     width: SIZE, height: SIZE, seed: 1,
     gravity: new RadialGravity({ centerX: CX, centerY: CY }),
+    // The volcano runs on the engine's heat field now: lava is born hot, cools
+    // by exposure, and freezes to rock without the host doing anything.
+    enableHeat: true,
   });
   for (let y = 0; y < SIZE; y++) {
     for (let x = 0; x < SIZE; x++) {
@@ -89,6 +89,7 @@ function erupt(frames: number, seed = 4242): PixelEngine {
     stepVolcanoPre(e, CFG, st, rng, OPTS);
     e.update();
     stepVolcanoPost(e, CFG, st, rng, OPTS);
+    syncFromHeat(e); // every frame, as the showcase does
   }
   return e;
 }
@@ -116,32 +117,16 @@ function edifice(e: PixelEngine): { cells: number; height: number; halfWidth: nu
   return { cells, height, halfWidth, spreadDeg };
 }
 
-describe('temperature field', () => {
-  it('round-trips a temperature through the colour ramp', () => {
-    const e = buildPlanet();
-    setTemp(e, 10, 10, 0.5);
-    expect(tempAt(e, 10, 10)).toBeCloseTo(0.5, 1);
-    setTemp(e, 11, 10, 1);
-    expect(tempAt(e, 11, 10)).toBe(1);
-  });
-
-  it('reports -1 for cells carrying no ramp colour', () => {
-    const e = buildPlanet();
-    expect(tempAt(e, CX, CY)).toBe(-1); // plain bedrock
-  });
-
-  it('keeps the ramp disjoint from every possible tephra tint', () => {
-    // Both live in the same colorGrid, and a cell is identified as hot by
-    // looking its exact packed colour up in the ramp. An overlap would make a
-    // tephra cell read as warm rock and be cooled as though it were lava.
-    const ramp = new Set<number>(Array.from(TEMP_RAMP));
-    for (let n = 0; n < 18; n++) {
-      const r = 38 + n, g = 34 + n, b = 36 + n;
-      const packed = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
-      expect(ramp.has(packed)).toBe(false);
-    }
-    expect(ramp.size).toBe(TEMP_STEPS); // no duplicate steps either
-  });
+describe('temperature and appearance', () => {
+  // The ramp used to be a *storage format*: temperature was quantized into 48
+  // packed colours and decoded by looking a cell's exact RGBA back up. Two
+  // tests here pinned that machinery -- a set/get round-trip through the
+  // colours, and a disjointness invariant forcing every ramp entry to differ
+  // from every possible tephra tint forever, or tephra would read as warm rock
+  // and be cooled as though it were lava.
+  //
+  // Both are gone with the machinery. Temperature is `engine.heatGrid` and
+  // nothing reads colour back, so the ramp is free to be just a palette.
 
   it('renders solidified lava darker than the planet bedrock', () => {
     // Cold basalt has to be distinguishable from the ground it was poured over,
@@ -149,6 +134,39 @@ describe('temperature field', () => {
     const cold = TEMP_RAMP[0];
     const r = cold & 0xff, g = (cold >>> 8) & 0xff, b = (cold >>> 16) & 0xff;
     expect(Math.max(r, g, b)).toBeLessThan(80); // ROCK palette is (80,80,80)
+  });
+
+  it('paints a cell by its temperature and leaves cold bedrock alone', () => {
+    // syncFromHeat is what is left of coolLava: rendering is the host's job,
+    // so the host maps getHeat onto the ramp. Bedrock sits at ambient and must
+    // keep the palette grey, or the whole planet turns basalt-dark.
+    const e = buildPlanet();
+    e.setMaterial(CX, CY - R - 1, MaterialType.LAVA);
+    e.setHeat(CX, CY - R - 1, 1);
+    syncFromHeat(e);
+
+    const hot = e.colorGrid![(CY - R - 1) * SIZE + CX];
+    expect(hot).toBe(TEMP_RAMP[TEMP_STEPS - 1]); // white-hot end of the ramp
+    expect(e.colorGrid![CY * SIZE + CX]).toBe(0); // core bedrock: untouched
+  });
+
+  it('keeps per-cell stiffness in step with temperature as lava chills', () => {
+    // stiffnessGrid is a host input, so something has to keep it current -- it
+    // is the mapping that turns a cooling curve into flow morphology, with
+    // margins and fronts locking while the core keeps moving.
+    const e = buildPlanet();
+    e.setMaterial(CX, CY - R - 1, MaterialType.LAVA);
+    e.setHeat(CX, CY - R - 1, 1);
+    syncFromHeat(e);
+    const whenHot = e.stiffnessGrid![(CY - R - 1) * SIZE + CX];
+
+    e.setHeat(CX, CY - R - 1, 0.35);
+    syncFromHeat(e);
+    const whenCool = e.stiffnessGrid![(CY - R - 1) * SIZE + CX];
+
+    expect(whenHot).toBe(stiffnessForTemp(1));
+    expect(whenCool).toBe(stiffnessForTemp(0.35));
+    expect(whenCool).toBeGreaterThan(whenHot);
   });
 
   it('stiffens lava monotonically as it cools, never below 2', () => {
@@ -172,9 +190,24 @@ describe('conduit and vent', () => {
     // filled conduit is stable, which is what makes it usable as a reservoir.
     const e = buildPlanet();
     stampVolcano(e, CFG);
-    const before = count(e, MaterialType.LAVA);
-    for (let i = 0; i < 500; i++) e.update();
-    expect(count(e, MaterialType.LAVA)).toBe(before);
+    // The reservoir has to be fed, or this measures the chamber freezing rather
+    // than the conduit draining: bedrock is a large cold sink and an unfed
+    // chamber sets solid in under 200 frames.
+    for (let i = 0; i < 500; i++) { e.update(); rechargeReservoir(e, CFG); }
+
+    // Draining is measured as a void opening up, not as a lava count. Magma
+    // near the surface is *meant* to crust over to rock -- that is the repose
+    // phase -- so counting lava cells would conflate freezing with draining.
+    // If any magma had actually run away it would leave EMPTY behind it, and
+    // the stamped planet has no empty cell inside its surface to begin with.
+    let voids = 0;
+    for (let y = 0; y < SIZE; y++) {
+      for (let x = 0; x < SIZE; x++) {
+        if (Math.hypot(x - CX, y - CY) > R) continue;
+        if (e.getMaterial(x, y) === MaterialType.EMPTY) voids++;
+      }
+    }
+    expect(voids).toBe(0);
     expect(e.swapsLastFrame).toBe(0);
   });
 
@@ -272,13 +305,17 @@ describe('conduit and vent', () => {
 });
 
 describe('cooling', () => {
+  // Cooling now belongs to the engine. These pin the *behaviours* the volcano
+  // depends on, not the mechanism -- the host no longer supplies one, so each
+  // is driven by `engine.update()` alone.
+
   it('sets exposed lava to rock but leaves buried lava molten', () => {
     // Both halves matter: without cooling nothing solidifies at all, and if
     // buried lava cooled too the conduit would freeze solid and plug itself.
+    // That split is exactly what the engine's exposure term produces.
     const e = buildPlanet();
     stampVolcano(e, CFG);
-    const rng = makeRng(7);
-    for (let i = 0; i < 400; i++) { e.update(); coolLava(e, rng, OPTS.cool); }
+    for (let i = 0; i < 400; i++) { e.update(); rechargeReservoir(e, CFG); }
     const deepY = Math.round(CY - (R - 15));
     expect(e.getMaterial(Math.round(CX), deepY)).toBe(MaterialType.LAVA);
     // The exposed cap at the vent has set.
@@ -289,28 +326,34 @@ describe('cooling', () => {
     // Gradual decay is what keeps a flow's cells within a step or two of their
     // neighbours. A freeze roll put adjacent cells at opposite ends of the
     // palette and made the cone look like pepper stirred through gravel.
-    const e = buildPlanet();
-    // A bar of lava resting on the bedrock, all at the same starting heat.
-    for (let x = CX - 8; x <= CX + 8; x++) {
-      e.setMaterial(x, CY - R - 1, MaterialType.LAVA);
-      setTemp(e, x, CY - R - 1, 1);
+    // Flat gravity, not the planet: cooling now happens inside `update()`, and
+    // a straight bar of cells laid across a *curved* surface is not resting on
+    // it -- the ends sit clear of the ground and simply fall, leaving nothing
+    // to measure. The claim here is about the shape of the cooling curve, which
+    // does not care about the gravity model.
+    const e = new PixelEngine({
+      width: 40, height: 24, seed: 1, gravity: new FlatGravity(), enableHeat: true,
+    });
+    for (let x = 0; x < 40; x++) e.setMaterial(x, 23, MaterialType.WALL);
+    for (let x = 10; x <= 26; x++) {
+      e.setMaterial(x, 22, MaterialType.LAVA);
+      e.setHeat(x, 22, 1);
     }
-    const rng = makeRng(5);
-    for (let i = 0; i < 6; i++) coolLava(e, rng, OPTS.cool);
+    for (let i = 0; i < 6; i++) e.update();
+
     const temps: number[] = [];
-    for (let x = CX - 8; x <= CX + 8; x++) {
-      const t = tempAt(e, x, CY - R - 1);
-      if (t >= 0) temps.push(t);
+    for (let x = 10; x <= 26; x++) {
+      if (e.getMaterial(x, 22) === MaterialType.LAVA) temps.push(e.getHeat(x, 22));
     }
     expect(temps.length).toBeGreaterThan(10);
-    // All still molten — nothing has jumped straight to rock.
-    expect(Math.min(...temps)).toBeGreaterThan(FREEZE_TEMP);
+    // All still molten -- nothing has jumped straight to rock.
+    const freeze = Materials[MaterialType.LAVA].freezesAt!;
+    expect(Math.min(...temps)).toBeGreaterThan(freeze);
     // The claim that matters visually is *local*: adjacent cells of one flow
     // stay within a step or two of each other, so the flow reads as one body.
     // A per-cell freeze roll instead lands neighbours at opposite ends of the
-    // palette — molten orange beside cold grey — which is the salt-and-pepper
-    // look. Asserting on the neighbour gap tests that directly, and unlike a
-    // bound on the overall range it does not drift when the cooling rate does.
+    // palette -- molten orange beside cold grey -- which is the salt-and-pepper
+    // look. Asserting on the neighbour gap tests that directly.
     let maxJump = 0;
     for (let i = 1; i < temps.length; i++) maxJump = Math.max(maxJump, Math.abs(temps[i] - temps[i - 1]));
     expect(maxJump).toBeLessThan(0.2);
@@ -318,9 +361,10 @@ describe('cooling', () => {
 
   it('does not leave frozen ejecta hanging in mid-air', () => {
     // Ejecta is spawned in mid-air and the engine has no velocity, so a cell in
-    // flight is a lone airborne cell — maximum exposure by the cooling rule, and
-    // therefore the likeliest thing to freeze, before it has landed. Frozen lava
-    // is ROCK, a static solid that never falls, so it would hang in the sky.
+    // flight is a lone airborne cell -- maximum exposure by the cooling rule,
+    // and therefore the likeliest thing to freeze before it has landed. Frozen
+    // lava is ROCK, a static solid that never falls, so it would hang in the
+    // sky. The guard for this is now the engine's, applied for every host.
     const e = erupt(900);
     const solid = (m: MaterialType): boolean =>
       m === MaterialType.ROCK || m === MaterialType.SAND || m === MaterialType.LAVA;
@@ -475,8 +519,8 @@ describe('the eruption as a whole', () => {
       e.update();
       stepVolcanoPost(e, CFG, st, rng, OPTS);
     }
-    // Tap off: keep cooling so the remaining flows set, then let it rest.
-    for (let f = 0; f < 1500; f++) { e.update(); coolLava(e, rng, OPTS.cool); }
+    // Tap off: the engine keeps cooling the remaining flows so they set.
+    for (let f = 0; f < 1500; f++) e.update();
     for (let f = 0; f < 400; f++) e.update();
     expect(e.swapsLastFrame).toBe(0);
   }, 30_000);
@@ -504,8 +548,10 @@ describe('tephra assimilation', () => {
 
     expect(flat.getMaterial(6, 6)).toBe(MaterialType.LAVA);
     expect(after).toBe(before); // 1:1 conserved
-    // The tint is replaced by a ramp colour, so it renders molten, not grey.
-    expect(tempAt(flat, 6, 6)).toBeCloseTo(MAGMA_TEMP, 1);
+    // Remelted magma is hot, and setMaterial has cleared the dark basalt tint,
+    // so it no longer renders grey over the new material.
+    expect(flat.getHeat(6, 6)).toBeCloseTo(MAGMA_TEMP, 2);
+    expect(flat.colorGrid![6 * 12 + 6]).not.toBe(0xff242428);
   });
 
   it('leaves mere flank contact untouched', () => {
@@ -542,7 +588,6 @@ describe('the explosive plume', () => {
       emitPlume(e, CFG, rng, OPTS.plume);
       e.update();
       remeltConduit(e, CFG);
-      coolLava(e, rng, OPTS.cool);
     }
     const axis = surfaceRadiusAt(e, CFG, CFG.ventAngle);
     const rimL = surfaceRadiusAt(e, CFG, CFG.ventAngle - OPTS.plume.spread * 0.8);
