@@ -19,6 +19,7 @@ import { PixelEngine } from '../../src/sand';
 import { MaterialType, Materials } from '../../src/materials';
 import { FlatGravity } from '../../src/gravity';
 import { paintGridInto, buildPalette } from '../helpers/renderer';
+import { attachViewport } from '../helpers/viewport';
 
 /** Grid resolution. ~3px-per-cell at the CSS display size. */
 const WIDTH = 300;
@@ -56,6 +57,21 @@ export function initSandbox(container: HTMLElement): void {
   for (let x = Math.floor(WIDTH * 0.65); x < Math.floor(WIDTH * 0.85); x++) {
     engine.setMaterial(x, HEIGHT - 50, MaterialType.ROCK);
   }
+
+  // --- View ----------------------------------------------------------------
+  // Zoom/pan is a CSS transform on the canvas, so `toGrid` below needs no
+  // knowledge of it: `getBoundingClientRect()` already reports the transformed
+  // box. Pan gestures are swallowed in the capture phase before they reach the
+  // paint handlers.
+  attachViewport({
+    viewport: container.querySelector<HTMLElement>('.canvas-viewport')!,
+    canvas,
+    zoomIn: container.querySelector<HTMLButtonElement>('.viewctl-in')!,
+    zoomOut: container.querySelector<HTMLButtonElement>('.viewctl-out')!,
+    fit: container.querySelector<HTMLButtonElement>('.viewctl-fit')!,
+    pan: container.querySelector<HTMLButtonElement>('.viewctl-pan')!,
+    readout: container.querySelector<HTMLElement>('.viewctl-level')!,
+  });
 
   // --- Brush state ---------------------------------------------------------
   let activeBrush: MaterialType = MaterialType.SAND;

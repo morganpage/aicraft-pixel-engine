@@ -1,8 +1,81 @@
 # Plan: growth — spreading, branching, and aggregating life
 
-> Design document, not yet implemented. Status: proposed (v2, supersedes the
-> spread-only v1). Builds on [temperature](./plan-temperature.md) but is
-> independently useful.
+> Status: **implemented**. See `src/tests/sand-growth.test.ts` and the "Growth"
+> section of [integration.md](./integration.md). The design below stands as
+> written; the ways contact with the engine changed it are recorded under
+> [As built](#as-built) at the end.
+
+## As built
+
+Seven things the design got wrong or left out, each found by running it. They are
+listed here rather than edited silently into the text above, because in every
+case the reasoning that produced the wrong answer is the interesting part.
+
+1. **`needs` had to move to the source, and grew a `range`.** The plan argued at
+   length that every spread condition belongs at the target. That is right for
+   crowding and wrong for a resource: target-side moisture confines grass to the
+   one ring of cells physically touching water, so a pond grows a fringe and a
+   meadow is unreachable at any `chance`. `needs` is now checked at the source
+   and carries a `range` — a reach counter that refreshes on contact, decrements
+   into each child, and stops at zero. It rides in the spread cell's state word,
+   which was otherwise only holding a backoff counter.
+
+2. **Ground cover needed `needsFooting`.** Grass permitted to spread upward at
+   all did so without limit and built a tangle standing several cells clear of
+   the soil. The reach limit bounds how far it gets, not whether it is touching
+   anything. Footing must also exclude the growing material itself, or grass
+   grows its own footing and goes up in one-wide columns.
+
+3. **Diagonal limbs collapsed, so tips brace their corners.** The support test
+   is cardinal-only, so a 45° chain of trunk cells touches only at the corners
+   and is unsupported along its whole length. Traced on a 24-energy tree: every
+   trunk cell written after a diagonal step fell one row on the following frame.
+   Tips now fill one corner cell per diagonal step.
+
+4. **Wobble had to stop being a turn.** Storing the wobbled heading let it
+   accumulate with no restoring force: one wobble on frame 3 sent a whole trunk
+   off at 45° for its life. Only a genuine blockage now rewrites the heading —
+   `preferOpen` and wobble decide the step, not the direction.
+
+5. **The canopy-collapses-when-burnt idea had to be abandoned, and it was the
+   design's favourite argument.** `LEAF` was `needsSupport` so that burning a
+   trunk would bring its foliage down — cited throughout as the proof that
+   growth composes with the destructive rules. It cannot work. Support is
+   satisfied only by structural cells and `LEAF` must not be one (leaves holding
+   up leaves turns a collapse into a one-cell-per-frame drizzle), so a leaf can
+   survive only cardinally adjacent to wood. That permits a one-cell fringe
+   along a branch and makes a *canopy* — leaves two or more cells from any
+   branch — physically impossible. An 11-energy tree grew as a bare stick with a
+   few green specks, which is precisely what the rules allowed and nothing like
+   a tree. Foliage is now static; fire clears it instead, which is the
+   genre-standard behaviour and still a real composition. `FROND` (21), added
+   because a fern built of `LEAF` collapsed into a heap, now earns its id on
+   palette alone.
+
+6. **Scale is a parameter, and the default was wrong by 3×.** Germination at
+   `energy: 26` put a tree three quarters of the way to the centre of the
+   showcase's r=66 planet. Trees are silhouettes seen against a world, so the
+   number has to be set against that world's size; 10 reads correctly. Branch
+   taper came down with it — at 0.55 over three generations the lowest limbs
+   were longer than the trunk was tall, and the tree read as a spider.
+
+7. **The membership invariant is a superset, not an equivalence.** The reaction
+   steps write `this.grid[i]` directly, so grass burning to FIRE leaves its index
+   behind. This is safe because no direct write anywhere in the engine produces a
+   material that has a growth rule — stale entries can only ever be spurious,
+   never missing — and the pass drops them as it goes. The behaviour depends on
+   the superset half; exactness returns after each growth tick.
+
+The estimate held: five phases, ~6 days of scope. Phase 2 was indeed where the
+time went, and for the reason predicted — items 2 through 6 above are all "run
+it and look at it", which does not compress. Note how many of them are the same
+mistake: a rule that was sound in the abstract, and wrong once something had to
+be *looked at*. None of them would have been caught by reasoning harder.
+
+---
+
+> Original design document below, unchanged (v2, supersedes the spread-only v1).
+> Builds on [temperature](./plan-temperature.md) but is independently useful.
 
 ## The problem
 

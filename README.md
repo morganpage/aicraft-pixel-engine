@@ -6,7 +6,7 @@ Inspired by Noita / Worms-style destructible-terrain sims. Extracted from the `a
 
 ## What it does
 
-- **Falling-sand simulation.** A typed-array pixel grid (`Uint8Array`) of materials — sand, water, lava, oil, acid, fire, smoke, steam, gas, rock, wood, ice, walls. Density-driven displacement, granular flow, liquid leveling, gas rising.
+- **Falling-sand simulation.** A typed-array pixel grid (`Uint8Array`) of materials — sand, tephra, water, lava, oil, acid, fire, smoke, steam, gas, rock, wood, ice, walls. Density-driven displacement, granular flow, liquid leveling, gas rising.
 - **Material interactions.** Lava + water → rock + steam. Acid dissolves solids. Fire spreads via flammability and is extinguished by water. Flammable gas ignites and explodes. Ice melts near heat.
 - **Destructible terrain + explosions.** Carve circles out of walls/rock, scatter colored debris as sand particles, ignite fire/smoke cores.
 - **Pluggable gravity models.** Movement rules ask "which way is down here?" instead of assuming `+Y`.

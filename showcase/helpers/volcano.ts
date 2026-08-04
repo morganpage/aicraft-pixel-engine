@@ -242,6 +242,41 @@ export const TEMP_RAMP: Uint32Array = (() => {
   return ramp;
 })();
 
+/** Quantization of the tephra temperature range. */
+export const TEPHRA_STEPS = 24;
+
+/**
+ * Thermal appearance for fragmented ejecta.
+ *
+ * Tephra used to reuse {@link TEMP_RAMP}, which made surviving ejecta visually
+ * identical to glowing lava while hot and to solidified basalt while cold. The
+ * material existed in the grid but could not be read as a granular deposit.
+ * This ash-brown ramp stays distinct from both the grey planet bedrock and the
+ * near-black basalt ramp while retaining a warm glow in fresh fragments.
+ *
+ * Alpha 254 is a deliberately invisible provenance bit. `colorGrid` rides with
+ * a parcel, so it lets {@link syncFromHeat} recognise cooled tephra after its
+ * heat has fallen to ambient without adding another per-cell state array.
+ */
+export const TEPHRA_RAMP: Uint32Array = (() => {
+  const ramp = new Uint32Array(TEPHRA_STEPS);
+  const cold = [132, 112, 98] as const;
+  const hot = [232, 108, 44] as const;
+  for (let i = 0; i < TEPHRA_STEPS; i++) {
+    const t = i / (TEPHRA_STEPS - 1);
+    const r = Math.round(cold[0] + (hot[0] - cold[0]) * t);
+    const g = Math.round(cold[1] + (hot[1] - cold[1]) * t);
+    const b = Math.round(cold[2] + (hot[2] - cold[2]) * t);
+    ramp[i] = ((254 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+  }
+  return ramp;
+})();
+
+/** True when a packed colour carries the tephra provenance marker. */
+function isTephraTint(packed: number): boolean {
+  return packed !== 0 && (packed >>> 24) === 254;
+}
+
 function ensureColorGrid(engine: PixelEngine): Uint32Array {
   if (!engine.colorGrid) engine.colorGrid = new Uint32Array(engine.width * engine.height);
   return engine.colorGrid;
@@ -494,186 +529,45 @@ export function stampVolcano(engine: PixelEngine, cfg: VolcanoConfig): void {
 // Conduit ascent + vent effusion
 // ---------------------------------------------------------------------------
 
-/** Tuning for {@link pressurizeConduit}. */
+/** Tuning for the engine pressure source that drives effusive ascent. */
 export interface PressureOptions {
   /**
-   * Frames per one-cell rise of the magma column. 1 is a cell per frame; higher
-   * is a slower, more viscous ascent.
+   * Whole-cell volumes the source accrues per frame. Maps to the old `effusion`
+   * slider: how vigorously magma is supplied to the conduit.
    */
-  riseInterval: number;
-  /** Cells of magma spilled into the crater per rise step. */
   effusion: number;
   /**
-   * Half-angle of the crater mouth, in radians. Magma is spilled at a random
-   * angle within this of the vent axis rather than always on the axis itself.
-   *
-   * Emitting on the axis alone stacks a one-cell-wide spire: each new cell lands
-   * on the previous one, and the column grows faster than it can topple. Filling
-   * across the crater's width instead lets the pool find its own level, thicken
-   * past lava's yield thickness, and overflow the rim as a flow.
+   * Hydraulic head accrued per frame while the source is blocked. Together with
+   * `maxPressure` this determines how long a cap must hold before fracture: at
+   * `pressureRate` 1 and ROCK strength 15, a blocked vent takes ~15 frames to
+   * build enough head to break through.
    */
-  craterHalfAngle: number;
+  pressureRate: number;
+  /** Cap on available head. Bounds how hard a blocked source can push. */
+  maxPressure: number;
+  /** Cap on accrued whole-cell volume. Bounds the surge when an outlet opens. */
+  maxPending: number;
   /**
-   * Stop spilling once the summit reaches this height above the original
-   * surface, in cells.
-   *
-   * Effusion needs the same cap the plume has. Nothing in the simulation removes
-   * material, so an uncapped vent keeps feeding a cone that keeps lifting the
-   * summit the vent tracks, and the edifice grows until it runs off the grid.
+   * Stop the source once the edifice reaches this height above the original
+   * surface, in cells. Nothing removes material, so an uncapped vent keeps
+   * feeding a cone that runs off the grid.
    */
   maxHeight: number;
   /**
-   * Fraction of the effusion delivered to the breach rather than the crater
-   * pond, 0..1. Default 0.75.
-   *
-   * A vent that only fills its crater has two states and neither is what a
-   * volcano looks like. Feed it gently and the pond sits there and chills, never
-   * overtopping the rim: measured, 0–14 cells of lava ever reached the flanks.
-   * Feed it hard enough to overtop and it does not run *down* — it floods the
-   * whole summit and levels, freezing as a wide lens with straight diagonal
-   * edges standing proud of the cone.
-   *
-   * Real flows mostly leave through a notch in the rim or a flank fissure rather
-   * than by brimming over a full crater, and that is also the only version that
-   * looks right: lava delivered onto the outer flank is on ground that already
-   * falls away, so it runs as a tongue immediately.
+   * Source tuning for the explosive-phase lava fountain. When present, the
+   * explosive phase creates a high-pressure source alongside `emitPlume` so
+   * surplus head at the vent converts to fountain velocity (Torricelli, 6B).
+   * When absent, no fountain source is created and the explosive phase is plume-
+   * only (the pre-6C behaviour).
    */
-  breachFraction?: number;
-}
-
-/**
- * Drive magma up the conduit and spill it into the crater — the host standing in
- * for the pressure term the engine does not have.
- *
- * The column is *advected*, not teleported: on each rise step every bore cell
- * takes the material and heat of the cell below it, the top of the column is
- * pushed out into the crater, and the base is recharged from the chamber. So
- * the conduit is a moving column rather than a painted stripe — hot magma
- * visibly climbs it, since heat rides in `colorGrid` and moves with the cells.
- *
- * @returns how many cells of magma were spilled into the crater.
- */
-export function pressurizeConduit(
-  engine: PixelEngine,
-  cfg: VolcanoConfig,
-  frame: number,
-  rng: () => number,
-  opts: PressureOptions,
-  /** Angular offset of the active rim breach from the vent axis, in radians. */
-  breachOffset = 0,
-): number {
-  if (opts.riseInterval > 1 && frame % opts.riseInterval !== 0) return 0;
-  if (edificeHeight(engine, cfg) >= opts.maxHeight) return 0;
-
-  const chamberR = cfg.planetRadius - cfg.chamberDepth;
-  const topR = cfg.planetRadius;
-
-  // Advect each lane of the bore upward by one cell. Walking from the top down
-  // means every cell is read before it is overwritten.
-  for (let r = topR; r > chamberR; r--) {
-    const hw = boreHalfWidth(cfg, r);
-    for (let w = -hw; w <= hw; w++) {
-      const p = borePos(cfg, r, w);
-      const b = borePos(cfg, r - 1, w);
-      // A lane that has no source below it (the bore swells here) starts from
-      // reservoir heat rather than inheriting nothing. Asking the material
-      // directly replaces what used to be a sentinel from the colour decode:
-      // `tempAt` returned -1 for any cell carrying no ramp colour, which was
-      // only ever a proxy for "not magma".
-      const belowIsMagma = engine.getMaterial(b.x, b.y) === MaterialType.LAVA;
-      setMagma(
-        engine,
-        p.x,
-        p.y,
-        belowIsMagma ? engine.getHeat(b.x, b.y) : reservoirTemp(p.x, p.y),
-      );
-    }
-  }
-  // Recharge the base of the bore from the chamber.
-  const baseHw = boreHalfWidth(cfg, chamberR);
-  for (let w = -baseHw; w <= baseHw; w++) {
-    const p = borePos(cfg, chamberR, w);
-    setMagma(engine, p.x, p.y, reservoirTemp(p.x, p.y));
-  }
-
-  // Spill the head of the column onto the lowest ground in the crater.
-  //
-  // Finding the low point is what makes the difference between a volcano and a
-  // stalagmite. Spilling on the vent axis instead puts every new cell on top of
-  // the last one, and a lone cell on a peak can never flow: its column is one
-  // cell deep, which is under lava's yield thickness, so it freezes exactly
-  // where it lands and the next cell lands on *that*. The result is a
-  // one-cell-wide spire climbing out of the summit.
-  //
-  // Filling the low point instead makes the crater pond. A pond is many cells
-  // deep, so it is over the yield thickness and behaves as a fluid body: it
-  // finds its own level, rises to the rim, and then spills over the lowest
-  // notch and runs down the flank as a tongue. Which is what a lava flow is.
-  const breachFraction = breachOffset === 0 ? 0 : (opts.breachFraction ?? 0.75);
-  const summitH = edificeHeight(engine, cfg);
-  let placed = 0;
-  for (let i = 0; i < opts.effusion; i++) {
-    let angle: number;
-    let radius: number;
-    const toe = rng() < breachFraction ? breachToe(engine, cfg, breachOffset, summitH) : null;
-    if (toe) {
-      // Out through the notch and onto the toe of the flow.
-      angle = toe.angle + (rng() * 2 - 1) * opts.craterHalfAngle * 0.5;
-      radius = surfaceRadiusAt(engine, cfg, angle);
-    } else {
-      // The rest keeps the crater itself molten and glowing.
-      const spot = craterLowPoint(engine, cfg, opts.craterHalfAngle, rng);
-      angle = spot.angle;
-      radius = spot.radius;
-    }
-    const x = Math.round(cfg.centerX + Math.cos(angle) * (radius + 1));
-    const y = Math.round(cfg.centerY + Math.sin(angle) * (radius + 1));
-    if (engine.getMaterial(x, y) !== MaterialType.EMPTY) continue;
-    setMagma(engine, x, y, VENT_TEMP);
-    placed++;
-  }
-  return placed;
-}
-
-/**
- * Cells below the summit that ground must be before the breach will feed it.
- *
- * Small, but not zero: it is what makes the flow advance instead of thicken.
- */
-const BREACH_MIN_DROP = 5;
-
-/**
- * Where along the breach side to deliver lava — the first ground far enough
- * below the summit to count as downhill. Returns `null` when the whole flank is
- * already built up to near the summit.
- *
- * Feeding a *fixed* point on the flank instead is what built a mesa on one side
- * of the cone. Effusion is only capped globally, on the highest point anywhere,
- * so a breach sitting where the cone is lower kept accepting lava until its own
- * pile reached summit height — and because a lava pond levels and then stops at
- * a blunt yield-strength front, the result was a flat terrace 14° wide and as
- * tall as the summit, ending in a cliff. Measured, that one terrace took the
- * flank from a 42° taper to a 54° wall.
- *
- * Following the toe fixes it at the source: as the near flank fills, the
- * delivery point walks further down, so the flow *extends* rather than
- * thickening — which is also what a real channel-fed flow does, delivering to
- * its own front through an insulated tube.
- */
-function breachToe(
-  engine: PixelEngine,
-  cfg: VolcanoConfig,
-  breachOffset: number,
-  summitH: number,
-): { angle: number; radius: number } | null {
-  const sign = breachOffset < 0 ? -1 : 1;
-  const start = Math.abs(breachOffset);
-  for (let m = start; m <= start * 3.5; m += 0.02) {
-    const angle = cfg.ventAngle + sign * m;
-    const radius = surfaceRadiusAt(engine, cfg, angle);
-    if (radius - cfg.planetRadius <= summitH - BREACH_MIN_DROP) return { angle, radius };
-  }
-  return null;
+  explosive?: {
+    rate: number;
+    pressureRate: number;
+    maxPressure: number;
+    maxPending: number;
+    /** Fraction of surplus head converted to launch speed. Default 0.7. */
+    outletVelocityEfficiency?: number;
+  };
 }
 
 /**
@@ -747,8 +641,10 @@ export interface PlumeOptions {
 function tintTephra(engine: PixelEngine, x: number, y: number, rng: () => number): void {
   const cg = ensureColorGrid(engine);
   const n = Math.floor(rng() * 18);
-  const r = 38 + n, g = 34 + n, b = 36 + n;
-  cg[y * engine.width + x] = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+  const r = 123 + n, g = 103 + n, b = 91 + n;
+  // Alpha 254 marks this as tephra for syncFromHeat while remaining visually
+  // indistinguishable from fully opaque at showcase scale.
+  cg[y * engine.width + x] = ((254 << 24) | (b << 16) | (g << 8) | r) >>> 0;
 }
 
 /**
@@ -807,7 +703,7 @@ export function emitPlume(
     if (rng() < opts.lavaFraction) {
       setMagma(engine, x, y, VENT_TEMP);
     } else {
-      engine.setMaterial(x, y, MaterialType.SAND);
+      engine.setMaterial(x, y, MaterialType.TEPHRA);
       tintTephra(engine, x, y, rng);
     }
     placed++;
@@ -870,11 +766,27 @@ export function syncFromHeat(engine: PixelEngine): number {
     for (let x = 0; x < w; x++) {
       const idx = rowOff + x;
       const mat = grid[idx];
-      if (mat !== MaterialType.LAVA && mat !== MaterialType.ROCK) continue;
+      if (mat !== MaterialType.LAVA && mat !== MaterialType.ROCK && mat !== MaterialType.TEPHRA) continue;
 
       const t = engine.getHeat(x, y);
       if (mat === MaterialType.LAVA) {
         setStiffness(engine, x, y, stiffnessForTemp(t));
+      } else if (mat === MaterialType.TEPHRA) {
+        // A hot unmarked cell is a fresh fragment. Once painted, the alpha
+        // marker rides with it and identifies it after cooling so the final
+        // granular deposit keeps its ash-brown tint.
+        const marked = isTephraTint(cg[idx]);
+        if (!marked && t <= floor) continue;
+
+        const ti = Math.max(0, Math.min(TEPHRA_STEPS - 1, Math.round(t * (TEPHRA_STEPS - 1))));
+        const tephra = TEPHRA_RAMP[ti];
+        if (cg[idx] !== tephra) {
+          cg[idx] = tephra;
+          engine.markRenderDirty(x, y);
+        }
+        if (t <= floor) continue;
+        glowing++;
+        continue;
       } else if (t <= floor) {
         // Cold rock: bedrock that was never heated keeps the palette grey, and
         // rock that has finished cooling keeps the last dark tint it was given.
@@ -920,8 +832,6 @@ export function syncFromHeat(engine: PixelEngine): number {
  *
  * @returns how many cells were recharged.
  */
-const RECHARGE_HEADROOM = 3;
-
 export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): number {
   let n = 0;
 
@@ -937,9 +847,8 @@ export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): numb
     const m = engine.getMaterial(x, y);
     // Magma, or plumbing that has set solid since the last episode. Nothing
     // else: restricting it to these keeps the feed from eating the bedrock
-    // walls that make the chamber a chamber, the same rule `remeltConduit`
-    // follows for the bore.
-    if (m !== MaterialType.LAVA && m !== MaterialType.ROCK && m !== MaterialType.SAND) return;
+    // walls that make the chamber a chamber.
+    if (m !== MaterialType.LAVA && m !== MaterialType.ROCK && m !== MaterialType.TEPHRA) return;
     if (
       engine.getMaterial(x, y - 1) === MaterialType.EMPTY ||
       engine.getMaterial(x, y + 1) === MaterialType.EMPTY ||
@@ -966,27 +875,47 @@ export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): numb
     n++;
   };
 
+  /**
+   * Feed a bore cell — heat only, never remelt. The bore must stay molten so the
+   * pressure source can route through it the instant effusion starts, but frozen
+   * ROCK cells are left for the engine's fracture to break. This is the
+   * difference between routine thermal maintenance (keeping a conduit alive) and
+   * a genuinely blocked vent (a cap the engine must fracture).
+   */
+  const feedBore = (x: number, y: number): void => {
+    if (engine.getMaterial(x, y) !== MaterialType.LAVA) return;
+    if (
+      engine.getMaterial(x, y - 1) === MaterialType.EMPTY ||
+      engine.getMaterial(x, y + 1) === MaterialType.EMPTY ||
+      engine.getMaterial(x - 1, y) === MaterialType.EMPTY ||
+      engine.getMaterial(x + 1, y) === MaterialType.EMPTY
+    ) return;
+    const t = reservoirTemp(x, y);
+    if (engine.getHeat(x, y) < t) engine.setHeat(x, y, t);
+    setStiffness(engine, x, y, stiffnessForTemp(t));
+    n++;
+  };
+
   const chamberR = cfg.planetRadius - cfg.chamberDepth;
 
-  // The bore. `reservoirTemp` covers the conduit as well as the chamber, and it
-  // needs the feed more: a narrow bore wrapped in bedrock is nearly all surface,
-  // so it loses heat faster than the blob it rises from.
-  //
-  // The feed stops short of the surface. Heat arrives from the mantle, so it is
-  // a function of depth — and near-surface magma is precisely what the
-  // atmosphere cools. Holding the column molten right to the summit pins the
-  // vent cap above the freezing point forever (it equilibrates around 0.44
-  // against a fed neighbour), so the crater never crusts and repose stops
-  // reading as repose.
-  for (let r = chamberR; r <= cfg.planetRadius - RECHARGE_HEADROOM; r++) {
+  // The bore: heat-only (never remelt). This keeps the conduit's existing lava
+  // molten so the pressure source can route through it immediately when an
+  // effusive episode starts, without the bore freezing solid during the long
+  // explosive phase. Frozen ROCK cells are left untouched — the engine's
+  // fracture handles genuinely blocked vents. The feed stops short of the
+  // surface so the vent cap is allowed to crust (the exposure guard sees to
+  // that).
+  for (let r = chamberR; r <= cfg.planetRadius - 3; r++) {
     const hw = boreHalfWidth(cfg, r);
     for (let w = -hw; w <= hw; w++) {
       const p = borePos(cfg, r, w);
-      feed(p.x, p.y);
+      feedBore(p.x, p.y);
     }
   }
 
-  // The chamber blob, same geometry `stampVolcano` lays down.
+  // The chamber blob, same geometry `stampVolcano` lays down. The chamber can
+  // remelt (ROCK→LAVA) because a dormant volcano's reservoir sets solid between
+  // eruptions and the next episode has to be able to wake it.
   const ux = Math.cos(cfg.ventAngle);
   const uy = Math.sin(cfg.ventAngle);
   const cxc = cfg.centerX + ux * chamberR;
@@ -1005,11 +934,10 @@ export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): numb
 /**
  * Remelt anything that has fallen back into the plumbing.
  *
- * **Required, not cosmetic.** Tephra is `SAND` at density 10 and lava is density
- * 8, so ejecta landing on the open vent does not sit on top of the magma — it
- * *sinks through it*, filling the conduit and chamber from the top down. Magma
- * remelts what falls into it, so restoring the bore each frame is both the
- * physical answer and the cheap one.
+ * **Required, not cosmetic.** Tephra is lighter than lava and normally remains
+ * on its surface, but a ballistic grain can still enter an open conduit or be
+ * buried by a later pressure pulse. Magma remelts debris that reaches the
+ * plumbing, so restoring this bounded region keeps the source functional.
  *
  * @returns how many cells were remelted this call.
  */
@@ -1021,7 +949,7 @@ export function remeltConduit(engine: PixelEngine, cfg: VolcanoConfig): number {
     const m = engine.getMaterial(x, y);
     // Only reclaim fallen debris — never eat the surrounding bedrock outside
     // the bore, which is what keeps the conduit walls intact.
-    if (m !== MaterialType.SAND && m !== MaterialType.ROCK) return;
+    if (m !== MaterialType.TEPHRA && m !== MaterialType.ROCK) return;
     setMagma(engine, x, y, reservoirTemp(x, y));
     melted++;
   };
@@ -1072,9 +1000,9 @@ export interface AssimilateOptions {
 /**
  * Magma dissolves the tephra trapped inside it.
  *
- * Tephra is `SAND` (density 10) and lava is density 8, so ejecta that lands in a
- * flow sinks *through* it and lodges there, which is why grey particles would
- * otherwise hang around in the magma.
+ * Tephra normally floats on lava, but ballistic impacts and later pressure
+ * pulses can still trap grains inside a molten body. Only deeply embedded
+ * grains are reclaimed; surface deposits remain available to build the cone.
  *
  * @returns how many tephra cells were assimilated this call.
  */
@@ -1090,7 +1018,7 @@ export function assimilateTephra(
   for (let y = 0; y < engine.height; y++) {
     const rowOff = y * w;
     for (let x = 0; x < w; x++) {
-      if (grid[rowOff + x] !== MaterialType.SAND) continue;
+      if (grid[rowOff + x] !== MaterialType.TEPHRA) continue;
 
       // Count lava among the four orthogonal neighbours. Embedding, not contact.
       let lavaN = 0;
@@ -1141,6 +1069,13 @@ export interface VolcanoState {
    * different sides and drape the cone unevenly the way real ones do.
    */
   breach: number;
+  /**
+   * Engine pressure source id for the active effusive episode, or `null` when
+   * no source is live. Created when effusion begins, removed when it ends — the
+   * engine routes magma from the chamber feed through the connected conduit to
+   * a real outlet, replacing the host-side `pressurizeConduit` advection.
+   */
+  sourceId: number | null;
 }
 
 /** Frames each phase lasts. */
@@ -1171,23 +1106,13 @@ export function createVolcanoState(): VolcanoState {
   // Open explosively: a real eruption clears its throat with ash and tephra
   // before lava reaches the surface, and it gives the first flows a cone to
   // run down instead of a bare planet.
-  return { phase: 'explosive', phaseFrame: 0, frame: 0, cycle: 0, breach: 0 };
-}
-
-/**
- * Pick where this episode's flows break out of the rim.
- *
- * Placed part-way out the flank rather than on the rim crest: on the crest the
- * ground is still near-level and lava ponds instead of running.
- */
-function pickBreach(rng: () => number, spread: number): number {
-  const side = rng() < 0.5 ? -1 : 1;
-  return side * spread * (0.45 + 0.35 * rng());
+  return { phase: 'explosive', phaseFrame: 0, frame: 0, cycle: 0, breach: 0, sourceId: null };
 }
 
 /** Tuning for {@link stepVolcano}. */
 export interface VolcanoStepOptions {
-  plume: PlumeOptions;
+  /** Plume options. No longer used in the eruption path (the plume was replaced by engine pressure + fragmentation) but retained for tests that call emitPlume directly. */
+  plume?: PlumeOptions;
   pressure: PressureOptions;
   /** Per-frame chance of melting an embedded tephra cell. */
   assimilateRate: number;
@@ -1195,13 +1120,23 @@ export interface VolcanoStepOptions {
 }
 
 /**
+ * The chamber feed cell — where the engine pressure source injects magma.
+ * Deepest bore position, at the chamber radius.
+ */
+function chamberFeed(cfg: VolcanoConfig): { x: number; y: number } {
+  const chamberR = cfg.planetRadius - cfg.chamberDepth;
+  return borePos(cfg, chamberR, 0);
+}
+
+/**
  * Advance the eruption one frame. Call *around* `engine.update()`:
- * {@link stepVolcanoPre} before it, this after it.
+ * {@link stepVolcanoPre} before it, {@link stepVolcanoPost} after it.
  *
- * Split in two because the order matters. Emission has to happen before the
- * engine step so new cells move on the same frame they appear, while cooling and
- * plumbing maintenance have to happen after it, so a flow gets a chance to
- * travel before it is asked whether it has set.
+ * The effusive phase is now engine-driven: a persistent pressure source at the
+ * chamber feed routes magma through the connected conduit to a real outlet, so
+ * the host no longer advects the bore or spawns lava at a guessed destination.
+ * The source is created when effusion begins and removed when it ends, so the
+ * engine does nothing during explosive and repose phases.
  */
 export function stepVolcanoPre(
   engine: PixelEngine,
@@ -1210,12 +1145,57 @@ export function stepVolcanoPre(
   rng: () => number,
   opts: VolcanoStepOptions,
 ): void {
+  void rng; // no longer used after plume removal; retained for API symmetry
   const phases = opts.phases ?? DEFAULT_PHASES;
 
   if (state.phase === 'explosive') {
-    emitPlume(engine, cfg, rng, opts.plume);
+    // The explosive phase is now entirely engine-driven: a high-pressure source
+    // at the chamber feed routes magma to the vent, where surplus head converts
+    // to ballistic velocity (Torricelli). Lava arcs outward, cools in flight,
+    // and fragments into TEPHRA — building the cone from physics-driven
+    // ejecta. No host-side plume, no host-named destinations.
+    if (opts.pressure.explosive && state.sourceId === null) {
+      const feed = chamberFeed(cfg);
+      state.sourceId = engine.addPressureSource({
+        x: feed.x, y: feed.y,
+        material: MaterialType.LAVA,
+        rate: opts.pressure.explosive.rate,
+        pressureRate: opts.pressure.explosive.pressureRate,
+        maxPressure: opts.pressure.explosive.maxPressure,
+        maxPending: opts.pressure.explosive.maxPending,
+        temperature: MAGMA_TEMP,
+        outletVelocityEfficiency: opts.pressure.explosive.outletVelocityEfficiency,
+      });
+    }
+    // Height cap applies to the explosive source too.
+    if (edificeHeight(engine, cfg) >= opts.pressure.maxHeight && state.sourceId !== null) {
+      engine.removePressureSource(state.sourceId);
+      state.sourceId = null;
+    }
   } else if (state.phase === 'effusive') {
-    pressurizeConduit(engine, cfg, state.frame, rng, opts.pressure, state.breach);
+    // Create the source on the first frame of effusion. The engine routes from
+    // here through the connected conduit to a real outlet — no host advection,
+    // no host-named destination. `temperature` keeps the injected magma at
+    // reservoir heat so the heat field carries it visibly up the bore.
+    if (state.sourceId === null) {
+      const feed = chamberFeed(cfg);
+      state.sourceId = engine.addPressureSource({
+        x: feed.x, y: feed.y,
+        material: MaterialType.LAVA,
+        rate: opts.pressure.effusion,
+        pressureRate: opts.pressure.pressureRate,
+        maxPressure: opts.pressure.maxPressure,
+        maxPending: opts.pressure.maxPending,
+        temperature: MAGMA_TEMP,
+      });
+    }
+    // The height cap is a host concern: the engine has no concept of an
+    // edifice. Stop the source once the cone reaches the cap, and remove it so
+    // the engine stops routing.
+    if (edificeHeight(engine, cfg) >= opts.pressure.maxHeight && state.sourceId !== null) {
+      engine.removePressureSource(state.sourceId);
+      state.sourceId = null;
+    }
   }
   // 'repose' emits nothing — the flows crust over and the glow fades, which is
   // what makes the next burst read as a new episode rather than more of the same.
@@ -1226,10 +1206,27 @@ export function stepVolcanoPre(
   if (state.phaseFrame >= limit) {
     state.phaseFrame = 0;
     if (state.phase === 'explosive') {
+      // Remove the explosive-phase source before transitioning. The effusive
+      // phase creates its own moderate-pressure source on its first frame.
+      if (state.sourceId !== null) {
+        engine.removePressureSource(state.sourceId);
+        state.sourceId = null;
+      }
       state.phase = 'effusive';
-      state.breach = pickBreach(rng, opts.plume.spread);
-    } else if (state.phase === 'effusive') state.phase = 'repose';
-    else { state.phase = 'explosive'; state.cycle++; }
+    } else if (state.phase === 'effusive') {
+      // End of effusion: remove the source. The engine stops routing; remaining
+      // magma in the conduit cools and sets under the heat field.
+      if (state.sourceId !== null) {
+        engine.removePressureSource(state.sourceId);
+        state.sourceId = null;
+      }
+      state.phase = 'repose';
+    } else {
+      // End of repose: the single eruption cycle is complete. Stop rather than
+      // looping back to explosive. The host can restart with another click.
+      state.cycle++;
+      state.phaseFrame = -1; // signal: eruption complete
+    }
   }
 }
 
@@ -1242,6 +1239,11 @@ export function stepVolcanoPre(
  * here would tie it to the eruption, and lava that set during a dormant spell
  * would never be repainted: freezing clears the cell's colour, so it would fall
  * back to bedrock grey instead of cooling basalt.
+ *
+ * Bore remelting (`remeltConduit`) is gone from the eruption path. The engine's
+ * fracture handles a blocked vent, and the pressure source keeps the conduit
+ * molten while effusion is active. During repose the bore is allowed to crust
+ * — that is the point of repose.
  */
 export function stepVolcanoPost(
   engine: PixelEngine,
@@ -1250,11 +1252,10 @@ export function stepVolcanoPost(
   rng: () => number,
   opts: VolcanoStepOptions,
 ): void {
-  // Fallout sinks through the magma (tephra is denser than lava), so the bore
-  // has to be reclaimed or the volcano chokes on its own ejecta.
-  if (state.phase !== 'repose') remeltConduit(engine, cfg);
   // Every phase, repose included: the chamber is molten between eruptions too,
-  // and left unfed it would set solid and end the volcano permanently.
+  // and left unfed it would set solid and end the volcano permanently. Chamber-
+  // only now — the bore is the engine's to keep clear or plug.
+  void state; // symmetric with stepVolcanoPre; no longer read after bore remelt was removed
   rechargeReservoir(engine, cfg);
   assimilateTephra(engine, rng, { rate: opts.assimilateRate });
 }

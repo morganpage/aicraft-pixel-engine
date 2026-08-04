@@ -209,10 +209,34 @@ main {
   text-align: center;
 }
 
-canvas {
+/* The clipping frame a canvas is zoomed and panned inside.
+   It carries the sizing and the chrome that used to live on the canvas itself,
+   so a zoomed canvas is cropped by a fixed-size bordered box instead of
+   growing the page layout. */
+.canvas-viewport {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
   background: #000;
   border: 1px solid var(--line);
   border-radius: 4px;
+  touch-action: none;
+}
+
+.sandbox-viewport {
+  /* 300×195 grid → wide aspect so it reads as a sandbox. */
+  max-width: 720px;
+  aspect-ratio: 300 / 195;
+}
+
+.planet-viewport {
+  /* 220×220 square grid. */
+  max-width: 560px;
+  aspect-ratio: 1 / 1;
+}
+
+canvas {
+  background: #000;
   /* 1px-per-cell backing store, stretched crisp. */
   image-rendering: pixelated;
   image-rendering: crisp-edges;
@@ -221,18 +245,76 @@ canvas {
   height: auto;
 }
 
-.sandbox-canvas {
-  /* 300×195 grid → wide aspect so it reads as a sandbox. */
+/* Inside a viewport the canvas fills the frame exactly and is moved only by
+   `transform`. The origin must stay at the top-left corner: the pan offsets in
+   helpers/viewport.ts are measured from there, and a centred origin would put
+   the zoom anchor half a frame away from where the maths expects it. */
+.canvas-viewport canvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
-  max-width: 720px;
-  aspect-ratio: 300 / 195;
+  height: 100%;
+  max-width: none;
+  border: 0;
+  border-radius: 0;
+  transform-origin: 0 0;
+  will-change: transform;
 }
 
-.planet-canvas {
-  /* 220×220 square grid. */
-  width: 100%;
-  max-width: 560px;
-  aspect-ratio: 1 / 1;
+/* --- View controls ------------------------------------------------------- */
+
+.viewctl {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.viewctl-level {
+  min-width: 3.4em;
+  text-align: center;
+  font-size: 0.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-dim);
+}
+
+.btn.viewctl-zoom {
+  min-width: 2.1rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 1rem;
+  line-height: 1.15;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.btn:disabled:hover {
+  border-color: var(--line);
+}
+
+/* Kept quiet, and hidden entirely at fit where none of it applies — the
+   gestures only matter once there is something to pan. */
+.viewctl-hint {
+  font-size: 0.75rem;
+  text-align: center;
+  margin: -0.15rem 0 0;
+}
+
+.stage:not(.is-zoomed) .viewctl-hint {
+  display: none;
+}
+
+/* Only show a grab cursor when panning would actually do something. */
+.canvas-viewport.is-pannable {
+  cursor: grab;
+}
+
+.canvas-viewport.is-panning {
+  cursor: grabbing;
 }
 
 /* --- Footer -------------------------------------------------------------- */

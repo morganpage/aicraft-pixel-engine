@@ -24,7 +24,7 @@
  * offsets — verified by `gravity-flat.test.ts`.
  */
 import type { GravityModel, Vec2 } from '../gravity/types.js';
-import type { NeighborFrame } from './types.js';
+import type { CellOffset, NeighborFrame } from './types.js';
 
 /** Inline a small sign helper to avoid allocating closures. */
 function sign(v: number): number {
@@ -101,4 +101,59 @@ export function fillNeighborFrame(
   out.right.dx = -sign(leftX); out.right.dy = -sign(leftY);
   out.downLeft.dx = dlX;   out.downLeft.dy = dlY;
   out.downRight.dx = drX;  out.downRight.dy = drY;
+}
+
+/**
+ * Write the offset for gravity-relative `octant` into `out`.
+ *
+ * Octants run clockwise from "up", where up is directly away from gravity:
+ *
+ * ```
+ *   0 up        = −down          4 down
+ *   1 upRight   = −downLeft      5 downLeft
+ *   2 right                      6 left
+ *   3 downRight                  7 upLeft = −downRight
+ * ```
+ *
+ * {@link NeighborFrame} carries five of the eight because that is all the
+ * movement rules ever needed; the other three are negations of the frame's
+ * diagonals, exactly as the gas-rising path already derives "up" as `−down`.
+ *
+ * Directed growth is what needs all eight. A tip stores its heading as an
+ * octant, so a tree planted anywhere on a `RadialGravity` planet grows radially
+ * outward with no special-casing — the gravitropism The Powder Toy computes
+ * explicitly from its gravity field falls out of the frame here for free.
+ *
+ * The eight offsets are a **rotation of the full 8-neighbourhood at any gravity
+ * angle**, not a subset, which is what makes storing a heading as an octant
+ * well-defined. Under 45° gravity `down = (1,1)`, `left = (-1,1)`,
+ * `downLeft = (0,1)` and `downRight = (1,0)`, so the octants come out as
+ * `{(-1,-1), (0,-1), (1,-1), (1,0), (1,1), (0,1), (-1,1), (-1,0)}` — all eight
+ * neighbours, each exactly once. A four-direction subset would not have that
+ * property, and a heading expressed in one would quietly mean different things
+ * at different gravity angles.
+ *
+ * `octant` is taken modulo 8, so callers may pass `dir + turn` without
+ * normalising, including negative turns.
+ */
+export function octantOffset(frame: NeighborFrame, octant: number, out: CellOffset): void {
+  let dx: number;
+  let dy: number;
+  // Normalise into 0..7 for negative inputs too (JS `%` keeps the sign).
+  switch (((octant % 8) + 8) % 8) {
+    case 0: dx = -frame.down.dx;       dy = -frame.down.dy;       break; // up
+    case 1: dx = -frame.downLeft.dx;   dy = -frame.downLeft.dy;   break; // upRight
+    case 2: dx = frame.right.dx;       dy = frame.right.dy;       break;
+    case 3: dx = frame.downRight.dx;   dy = frame.downRight.dy;   break;
+    case 4: dx = frame.down.dx;        dy = frame.down.dy;        break;
+    case 5: dx = frame.downLeft.dx;    dy = frame.downLeft.dy;    break;
+    case 6: dx = frame.left.dx;        dy = frame.left.dy;        break;
+    default: dx = -frame.downRight.dx; dy = -frame.downRight.dy;  break; // 7, upLeft
+  }
+  // `+ 0` collapses the negative zero that negating a zero component leaves
+  // behind. It compares equal to `0` but not under `Object.is`, so leaving it
+  // in makes an offset that is arithmetically correct fail a deep-equality
+  // check — which is a trap to hand a consumer, not a nicety.
+  out.dx = dx + 0;
+  out.dy = dy + 0;
 }

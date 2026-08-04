@@ -22,6 +22,7 @@ import { PixelEngine } from '../../src/sand';
 import { MaterialType, Materials } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
 import { paintGridInto, buildPalette } from '../helpers/renderer';
+import { attachViewport } from '../helpers/viewport';
 import {
   stampVolcano,
   stepVolcanoPre,
@@ -164,6 +165,11 @@ function buildWorld(
       // are losing heat to is, so it is what decides whether they set into
       // short stubby tongues or drape the whole cone.
       enableHeat: true,
+      // The volcano's pressure source fractures frozen conduit rock to reopen a
+      // blocked vent. The default of 1/frame is too slow to clear a ~26-cell
+      // bore before it re-freezes; 4 lets a new effusive episode break through
+      // in under 10 frames.
+      fracturePerFrame: 4,
     });
 
     // Offscreen canvas holds the unrotated grid each frame. The visible canvas
@@ -224,6 +230,21 @@ export function initPlanet(container: HTMLElement): void {
   let world = buildWorld(Number(resInput.value), Number(diaInput.value), canvas);
   ctx.imageSmoothingEnabled = false;
 
+  // --- View ----------------------------------------------------------------
+  // A CSS transform on the canvas, so `toGrid` needs no knowledge of it — the
+  // transformed `getBoundingClientRect()` keeps its screen→grid maths correct,
+  // and the spin un-rotation composes on top unchanged. Pan gestures are
+  // swallowed in the capture phase before they reach the paint handlers.
+  attachViewport({
+    viewport: container.querySelector<HTMLElement>('.canvas-viewport')!,
+    canvas,
+    zoomIn: container.querySelector<HTMLButtonElement>('.viewctl-in')!,
+    zoomOut: container.querySelector<HTMLButtonElement>('.viewctl-out')!,
+    fit: container.querySelector<HTMLButtonElement>('.viewctl-fit')!,
+    pan: container.querySelector<HTMLButtonElement>('.viewctl-pan')!,
+    readout: container.querySelector<HTMLElement>('.viewctl-level')!,
+  });
+
   // --- Brush state ---------------------------------------------------------
   let activeBrush: MaterialType = MaterialType.SAND;
   let brushRadius = 3;
@@ -276,8 +297,6 @@ export function initPlanet(container: HTMLElement): void {
   const ambientValue = container.querySelector<HTMLElement>('.planet-volcano-ambient-value')!;
   const effusionInput = container.querySelector<HTMLInputElement>('.planet-volcano-effusion')!;
   const effusionValue = container.querySelector<HTMLElement>('.planet-volcano-effusion-value')!;
-  const ashInput = container.querySelector<HTMLInputElement>('.planet-volcano-ash')!;
-  const ashValue = container.querySelector<HTMLElement>('.planet-volcano-ash-value')!;
   const spreadInput = container.querySelector<HTMLInputElement>('.planet-volcano-spread')!;
   const spreadValue = container.querySelector<HTMLElement>('.planet-volcano-spread-value')!;
   const phaseLabel = container.querySelector<HTMLElement>('.planet-volcano-phase')!;
@@ -285,9 +304,49 @@ export function initPlanet(container: HTMLElement): void {
   const volcanoParams = {
     ambient: Number(ambientInput.value),
     effusion: Number(effusionInput.value),
-    ash: Number(ashInput.value),
     spread: Number(spreadInput.value),
+    fountainRate: 1,
+    fountainPressure: 100,
+    fragmentsAt: 0.65,
+    tephraStrength: 6,
   };
+  // Temporary fountain/fragmentation tuning sliders (remove after tuning).
+  const frateInput = container.querySelector<HTMLInputElement>('.planet-volcano-frate')!;
+  const frateValue = container.querySelector<HTMLElement>('.planet-volcano-frate-value')!;
+  const fpressInput = container.querySelector<HTMLInputElement>('.planet-volcano-fpress')!;
+  const fpressValue = container.querySelector<HTMLElement>('.planet-volcano-fpress-value')!;
+  const fragInput = container.querySelector<HTMLInputElement>('.planet-volcano-frag')!;
+  const fragValue = container.querySelector<HTMLElement>('.planet-volcano-frag-value')!;
+  const tstrengthInput = container.querySelector<HTMLInputElement>('.planet-volcano-tstrength')!;
+  const tstrengthValue = container.querySelector<HTMLElement>('.planet-volcano-tstrength-value')!;
+  volcanoParams.fountainRate = Number(frateInput.value);
+  volcanoParams.fountainPressure = Number(fpressInput.value);
+  volcanoParams.fragmentsAt = Number(fragInput.value);
+  volcanoParams.tephraStrength = Number(tstrengthInput.value);
+  frateInput.addEventListener('input', () => {
+    volcanoParams.fountainRate = Number(frateInput.value);
+    frateValue.textContent = fmt(volcanoParams.fountainRate);
+  });
+  fpressInput.addEventListener('input', () => {
+    volcanoParams.fountainPressure = Number(fpressInput.value);
+    fpressValue.textContent = fmt(volcanoParams.fountainPressure);
+  });
+  fragInput.addEventListener('input', () => {
+    volcanoParams.fragmentsAt = Number(fragInput.value);
+    fragValue.textContent = volcanoParams.fragmentsAt.toFixed(2);
+    // Apply live to the material definition so fragmentation takes effect
+    // immediately without restarting the eruption.
+    Materials[MaterialType.LAVA].fragmentsAt = volcanoParams.fragmentsAt;
+  });
+  tstrengthInput.addEventListener('input', () => {
+    volcanoParams.tephraStrength = Number(tstrengthInput.value);
+    tstrengthValue.textContent = String(volcanoParams.tephraStrength);
+    // Applied straight to the material def: the engine's fracture path reads
+    // pressureStrength each attempt, so a vent-capping tephra crust instantly
+    // becomes easier or harder to punch through without rebuilding the world.
+    Materials[MaterialType.TEPHRA].pressureStrength = volcanoParams.tephraStrength;
+  });
+
   const fmt = (v: number): string => Number.isInteger(v) ? String(v) : v.toFixed(2);
   world.engine.ambientTemperature = volcanoParams.ambient;
   ambientInput.addEventListener('input', () => {
@@ -301,10 +360,6 @@ export function initPlanet(container: HTMLElement): void {
   effusionInput.addEventListener('input', () => {
     volcanoParams.effusion = Number(effusionInput.value);
     effusionValue.textContent = fmt(volcanoParams.effusion);
-  });
-  ashInput.addEventListener('input', () => {
-    volcanoParams.ash = Number(ashInput.value);
-    ashValue.textContent = fmt(volcanoParams.ash);
   });
   spreadInput.addEventListener('input', () => {
     volcanoParams.spread = Number(spreadInput.value);
@@ -448,37 +503,42 @@ export function initPlanet(container: HTMLElement): void {
    * mid-eruption. The cap has to be read live too — "Erupt again" raises it.
    */
   const volcanoOpts = (): VolcanoStepOptions => ({
-    plume: {
-      // perFrame: how vigorous the explosive phase is (slider, default 8).
-      perFrame: volcanoParams.ash,
-      // spread: launch half-angle (slider, default 0.18 ≈ 10°). Wider scatters
-      //   ejecta further → broader, flatter cone; narrower → tall thin spire.
-      spread: volcanoParams.spread,
-      loft: 5,
-      // Mostly tephra. Granular ejecta piles at its own angle of repose, which
-      // is what gives the cone its tapering profile — lava ponds level out and
-      // freeze with cliff edges, so a lava-built edifice is a flat-topped mesa,
-      // not a cone. The lava's job is the flows down the flanks, not the shape.
-      lavaFraction: 0.05,
-      maxHeight: capHeight,
-      // Centre the fallout on the rim rather than the axis, so the summit gets
-      // a crater instead of a dome. It tapers both ways from here: outward into
-      // the flank, inward to keep the crater floor rising with the cone.
-      rimBias: 0.45,
-    },
     pressure: {
-      riseInterval: 1,
-      // effusion: cells of magma spilled per frame (slider).
+      // effusion: cells of magma supplied per frame (slider). The engine routes
+      // this from the chamber feed through the connected conduit to a real
+      // outlet — no host advection or destination painting.
       effusion: volcanoParams.effusion,
-      craterHalfAngle: 0.06,
-      // Only just above the plume's cap. More headroom than this and lava stops
+      // High enough to route through the full ~26-cell conduit immediately when
+      // effusion starts, and to fracture frozen bore cells (ROCK strength 15)
+      // within a few frames. The bore freezes between episodes; the source
+      // fractures it back open at the start of each effusive phase.
+      pressureRate: 35,
+      maxPressure: 60,
+      maxPending: 5,
+      // Only just above the cone's cap. More headroom than this and lava stops
       // running down the cone and starts building a level slab on top of it.
       maxHeight: capHeight + 2,
-      // Most of it out through the rim breach, onto ground that already falls
-      // away; the rest keeps the crater molten.
-      breachFraction: 0.85,
+      // Explosive-phase fountain: high pressure so surplus at the vent converts
+      // to ballistic velocity (Torricelli, 6B). Fragmented fountain parcels
+      // build the tephra cone and leave a few visible hot bombs in the arc.
+      explosive: {
+        rate: volcanoParams.fountainRate,
+        pressureRate: Math.max(10, volcanoParams.fountainPressure),
+        maxPressure: volcanoParams.fountainPressure,
+        // The parcel cap tracks the Fountain Rate slider's ceiling (4). One
+        // parcel per frame keeps a focused tephra jet; multiple same-frame
+        // routes see the first parcel as still-liquid (fragmentation runs
+        // later), branch through its lateral boundaries, and widen the jet
+        // into a spray. The cap bounds that widening so a maxed-out fountain
+        // is dense but not a broad fan, and `rate` is what actually controls
+        // density up to it.
+        maxPending: 4,
+      },
     },
-    assimilateRate: 0.5,
+    // Tephra is lighter than lava and stays above surface flows. A slow cleanup
+    // rate still remelts the occasional grain trapped deep in the plumbing
+    // without erasing the cone-building exterior deposit.
+    assimilateRate: 0.03,
   });
 
   const PHASE_LABEL: Record<string, string> = {
@@ -494,11 +554,23 @@ export function initPlanet(container: HTMLElement): void {
   };
 
   /**
+   * Remove the live pressure source if one exists, so a paused or reset volcano
+   * does not keep pumping magma into the grid with no host consuming the results.
+   */
+  const removeLiveSource = (): void => {
+    if (volcanoState.sourceId !== null) {
+      world.engine.removePressureSource(volcanoState.sourceId);
+      volcanoState.sourceId = null;
+    }
+  };
+
+  /**
    * The eruption ran its course. Say so explicitly — a scene that simply stops
    * moving is indistinguishable from the page having frozen, which is exactly
    * how this read before.
    */
   const goDormant = (): void => {
+    removeLiveSource();
     erupting = false;
     setVolcanoLabel('🌋 Erupt again', false);
     phaseLabel.textContent = 'dormant';
@@ -511,6 +583,7 @@ export function initPlanet(container: HTMLElement): void {
    * positions always produces the same eruption.
    */
   const resetScene = (): void => {
+    removeLiveSource();
     spinAngle = 0;
     erupting = false;
     started = false;
@@ -530,6 +603,7 @@ export function initPlanet(container: HTMLElement): void {
 
   volcanoBtn.addEventListener('click', () => {
     if (erupting) {
+      removeLiveSource();
       erupting = false;
       setVolcanoLabel('🌋 Erupt again', false);
       phaseLabel.textContent = 'paused';
@@ -727,9 +801,9 @@ export function initPlanet(container: HTMLElement): void {
       engine.update();
       stepVolcanoPost(engine, volcanoCfg, volcanoState, volcanoRng, opts);
       phaseLabel.textContent = PHASE_LABEL[volcanoState.phase] ?? volcanoState.phase;
-      // Ask the cone's height directly. An episode placing nothing this frame
-      // only means its sample cells were occupied, not that it has finished.
-      if (isDormant(engine, volcanoCfg, capHeight)) goDormant();
+      // The eruption cycle runs once: explosive → effusive → repose → done.
+      // phaseFrame === -1 signals completion (set by stepVolcanoPre).
+      if (volcanoState.phaseFrame < 0 || isDormant(engine, volcanoCfg, capHeight)) goDormant();
     } else {
       engine.update();
     }

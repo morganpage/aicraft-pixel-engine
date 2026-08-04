@@ -76,7 +76,7 @@ Levelling is automatic — there is nothing to configure. It settles to a dead s
 
 Remaining limits, all static rather than shimmering:
 - A gentle residual slope of roughly **one cell per 32 cells of span** — about 5 rows across a 300-wide pool. Set by how far the pass looks along the surface.
-- **No pressurised flow.** This acts on free surfaces only: water in a sealed pipe will not rise, and a U-tube will not equalise. That needs a full pressure solve.
+- **Pressurised flow is opt-in and lava-only (V1).** Ordinary movement acts on free surfaces, so unpressurised water in a sealed pipe will not rise. `injectLiquid` adds connected pressure transport for lava — see [§4c](#4c-pressure--connected-liquid-transport). Water and oil are not yet supported: a low-resistance body can make every cell reachable within a modest head budget, which needs a different solver before it can be enabled safely.
 - **Sub-cell volumes.** A blob too small to cover its span at one cell deep pools into a lens rather than a film — a 9-cell brush blob on a 220-wide planet is 0.4 cells thick spread out, which no rule can render evenly. Use more water for a full shell.
 
 **Yield strength (`yieldThickness`) — liquids that are not water.** Levelling above describes a *Newtonian* liquid: it flows until level however thin the film gets. Lava does not behave that way. It is a Bingham plastic with a real yield strength, so a flow only advances while the driving stress — which scales with its thickness — beats that strength, and it simply stops where it thins out.
@@ -111,6 +111,8 @@ Heat evolves through two mechanisms each frame. **Conduction** moves heat cell-t
 Heat settles: changes below `HEAT_EPSILON` are discarded so chunks can sleep, and a thermally equilibrated world costs the same as one with heat disabled (measured at 0.0006 ms/frame either way on a 220×220 world). Use `engine.activeThermalChunkCount` to observe it. One consequence worth knowing: a heat source at temperature `T` can never drive a neighbour past `T`, so a phase threshold above the hottest source is unreachable by construction.
 
 **Phase change.** A cell crossing `freezesAt` or `meltsAt` transforms into `freezesInto`/`meltsInto`, carrying its temperature across — rock created by freezing lava arrives at the freezing point and fades from there rather than snapping to ambient. A mobile material freezing into an immobile one (lava→rock, water→ice) additionally requires support underneath, or a parcel still in flight would set in mid-air and hang there, since rock never falls.
+
+**Fragmentation.** LAVA additionally sets `fragmentsAt: 0.65` (above `freezesAt: 0.30`). A ballistic lava cell — one with velocity — that cools below this threshold during flight transforms into TEPHRA instead of waiting to land and freeze to ROCK. The fragment retains the parcel's velocity and temperature. TEPHRA is granular and less dense than LAVA, so it remains above molten flows and piles at its angle of repose; ordinary SAND is denser than LAVA and would sink back into the reservoir. Grounded lava (no velocity) is unaffected — it freezes via `freezesAt` as before. See [§5b](#5b-velocity-and-impulse).
 
 Enabling heat also changes three existing contact reactions in `stepLavaOrFire`: lava+water, fire+water, and ice touching either. They stop being instant and become temperature-mediated, so lava chills into rock and water heats until it boils. Left instant they would pre-empt the whole field — `ICE.meltsAt` would be decorative in any world containing lava. **Combustion is deliberately not mediated:** ignition stays a probabilistic roll against `flammability`, identical with heat on or off. With heat disabled all three reactions are byte-for-byte unchanged.
 
@@ -211,13 +213,276 @@ engine.update();
 
 ---
 
+## 4b. Growth — grass, trees, ferns, coral
+
+Growth is the generative counterpart to the engine's destructive reactions.
+Every rule is opt-in data on a `MaterialDef`, and a world containing none of the
+growing materials never runs the pass, never allocates its grid, and never draws
+from the RNG — so behaviour is unchanged for hosts that don't want life.
+
+```ts
+engine.setMaterial(x, y, MaterialType.GRASS);         // spreads on its own
+engine.plant(x, y, MaterialType.TREE_TIP, { energy: 26, dir: 0 });
+engine.setMaterial(x, y, MaterialType.SEED);          // falls, then germinates
+```
+
+**Three kinds, because "life" is three problems.** Isotropic copying is fine for
+ground cover and cannot produce a tree at any setting — a tree needs a growing
+point that knows which way it is heading and how much budget it has left.
+
+| Kind | Materials | What it does |
+|---|---|---|
+| `spread` | `GRASS` | Copies itself into a neighbouring cell, subject to conditions at the *target*. |
+| `tip` | `TREE_TIP`, `FERN_TIP` | Advances along a heading, leaves structure behind, forks, and dies. |
+| `aggregate` | `SEED`, `SPORE` | Transforms *itself* on contact — germination, and accretion. |
+
+**Per-cell state.** `engine.growthGrid` is an optional `Uint16Array`, lazily
+allocated, that rides with the material through swaps exactly like
+`stiffnessGrid`. For a tip it packs `energy(7) | dir(3) | gen(2) | variant(4)`;
+for a spreading cell it holds a backoff counter and the remaining reach of its
+`needs`. Read it with `getGrowthState(x, y)`, write it with `plant()` or
+`setGrowthState()`.
+
+`variant` is a genome: rolled once per plant, inherited by every branch, and used
+as a mask over `branchTurns`. One material yields systematically different
+silhouettes — a tree that only ever branches left is a different tree, not just a
+different roll.
+
+**Headings are gravity-relative octants**, `0` = away from gravity, clockwise. A
+tree planted anywhere on a `RadialGravity` planet grows radially outward with no
+special-casing. `octantOffset(frame, octant, out)` is exported if you need it.
+
+**Pacing.** `growthInterval` (default 4) is frames between growth ticks — a tip
+advances one cell per tick, so a 26-energy tree takes about two seconds at 60 fps.
+Raise it for a slower world; there is no reason to lower it below 1.
+
+**Settling.** Growth counts as activity: `beginSettle()` will not report settled
+while anything is still growing, and `growthEventsLastFrame` exposes the count. A
+mature patch backs off exponentially and goes fully quiet, so a finished world
+still reaches a dead stop.
+
+**Serialization.** `growthCells` is derived purely from the grid, so after
+restoring a saved grid call `rebuildGrowthCells()` and growth resumes exactly as
+before. Save `growthGrid` alongside the grid if you want mid-growth plants to
+survive the round-trip.
+
+### Writing your own
+
+```ts
+[MaterialType.MOSS]: {
+  /* ...the usual fields... */
+  isStatic: true,
+  growth: {
+    kind: 'spread',
+    into: MaterialType.MOSS,
+    needs: [MaterialType.WATER],  // checked at the source
+    range: 4,                     // how far that licence travels
+    intoMaterial: [MaterialType.ROCK, MaterialType.EMPTY],
+    needsFooting: true,           // stay on surfaces
+    maxNeighbors: 3,              // checked at the target
+    chance: 0.05,
+  },
+},
+```
+
+Three settings do most of the work, and each of them exists because the obvious
+alternative was tried and produced something wrong:
+
+- **`isStatic`** — a plant is not a powder. `GRASS` at density 20 outweighs
+  `SAND` at 10, so without this it sinks into the soil it is meant to root in.
+- **`needs` is checked at the source, with `range`** — checking it at the target
+  confines growth to the single ring of cells physically touching water, which
+  grows a fringe around a pond and can never grow a meadow. `maxNeighbors`, which
+  really does need to bound coverage, stays at the target.
+- **`needsFooting`** — ground cover allowed to spread upward at all does so
+  without limit and builds a tangle standing clear of the terrain.
+
+For a `tip`, `becomes` must be a material that can hold itself up — in practice
+`isStatic`, or `needsSupport` with something structural to hang from. `WOOD` uses
+the latter, which is why tips brace the corner on a diagonal step: the support
+test is cardinal-only, so an unbraced 45° limb is unsupported along its whole
+length and collapses as fast as it is drawn.
+
+**Foliage is static, deliberately.** `needsSupport` was tried on `LEAF` first, to
+get a canopy that collapses when its trunk burns away. It cannot work: support is
+satisfied only by structural cells, and `LEAF` must not be one — so a leaf could
+survive only cardinally adjacent to wood, which permits a one-cell fringe along a
+branch and makes a canopy impossible. An 11-energy tree grew as a bare stick with
+a few green specks. A crown is most of what makes a small tree read as a tree, so
+it won. Fire is what clears foliage now, and `LEAF` is the most flammable thing
+in the table.
+
+**Scale matters more than it looks.** `energy` is roughly the trunk length in
+cells, so it wants setting against your world, not left at a default. On the
+showcase's r=66 planet a 26-energy tree stood three quarters of the way to the
+core; 10 puts it at about a fifth of the radius.
+
+---
+
+## 4c. Pressure — connected liquid transport
+
+Ordinary liquid motion is driven by density and gravitational potential alone:
+a liquid falls, spreads sideways toward a descent, and is explicitly blocked
+from taking a step that raises its potential. That is correct for an
+unpressurized body, and it is why a pool settles and a flow runs downhill to a
+finite front. It cannot represent a chamber pushing a full column of magma
+uphill through a conduit. `injectLiquid` is the opt-in pass that does.
+
+```ts
+const id = engine.injectLiquid({
+  x: chamberFeed.x,
+  y: chamberFeed.y,
+  material: MaterialType.LAVA,
+  amount: 1,        // whole-cell volumes for the next update
+  pressure: 20,     // max hydraulic head available to each volume
+  temperature: 0.9, // optional; LAVA spawnTemp by default
+});
+engine.update();
+const [result] = engine.consumeInjectionResults();
+// result.accepted === 1, or 0 with result.reason explaining why not
+```
+
+A material opts in by setting `pressureResistance` (lava does; water and oil do
+not). The engine then finds an actual connected route from the source through
+that liquid to a real boundary outlet — an EMPTY cardinal neighbour of the
+body — accounting for gravitational head and path resistance along the way. It
+extrudes material only at that outlet, never at a host-guessed destination.
+
+**Why this is a new API style.** Every other host method (`setMaterial`,
+`swap`, `plant`, `explode`) mutates the grid immediately. `injectLiquid` queues
+work and drains it inside `update`, so that processed flags, chunk wake-up,
+routing, and ordinary movement share one deterministic transaction. Requests
+drain FIFO in public-call order; that order is part of the "same seed + same
+sequence of public calls" determinism contract — reversing two competing
+requests is allowed (and tested) to reverse their outcome. The returned id
+correlates the queued call with its later `InjectionResult`.
+
+**Cost.** The router draws no `random()` — it is a pure function of grid state
+and request order — so a world that never calls `injectLiquid` is
+byte-for-byte identical to one without the feature, allocates nothing, and pays
+no per-frame cost. The search is bounded Dijkstra with a generation-stamped
+visited array (no full clear), stopped by both the pressure budget and a
+visited-cell ceiling (`pressureVisitLimit`, default 2048).
+
+**Head, resistance, and the unit that ties them.** Pressure is hydraulic head:
+energy per unit weight. The gravity model's `potentialAt` is already in
+cell-head units (a difference of 1.0 = one cell of head), so raising liquid one
+cell costs approximately one head unit plus the material's `pressureResistance`
+(0.15 for lava). Moving downhill costs no head, though it still pays
+resistance. There is no density multiplier: it would double-count the unit
+conversion and break the "one cell up ≈ one head unit" invariant. Under
+`RadialGravity` the same equation works with no volcano-specific direction —
+moving away from the centre costs head, toward it does not.
+
+**The ceiling is a correctness limit, not just a safety guard.** A
+low-resistance liquid in a broad body can make every cell physically reachable
+within a modest head budget. V1 sidesteps this by supporting lava alone (high
+resistance, small connected bodies), where the head budget expires well before
+the ceiling. General water routing needs a different algorithm and is out of
+scope until it exists. If the ceiling *is* hit, routing returns `searchLimit`
+and selects **no** candidate — a valid outlet may lie beyond, and reporting it
+honestly (rather than as `noOutlet` or a guessed destination) is what keeps the
+limit from silently corrupting results.
+
+**Conservation and rejection reasons.** Pressure alone never creates material.
+A one-cell injection into a body with a real outlet raises the material count
+by exactly one (test it in a phase-change-disabled fixture, since lava can
+become rock and confuse a bare count). A blocked request reports why without
+spawning anything downstream:
+
+- `noOutlet` — the connected component has no EMPTY cardinal neighbour (sealed).
+- `insufficientHead` — outlets exist but every reachable one costs more than the pressure budget.
+- `searchLimit` — the visited ceiling was reached before the search completed.
+- `unsupportedMaterial` — the material sets no `pressureResistance` (anything but lava, today).
+- `incompatibleSource` — the source cell holds another liquid or a solid; V1 does not overwrite it.
+- `missingPotential` — the gravity model exposes no `potentialAt`, so head cannot be accounted.
+
+**Dry sources.** The first volume into an EMPTY source cell materializes that
+cell — an explicit source creation that costs no route head — after which later
+volumes in the same request route through the newly seeded body. This gives a
+generic pump a defined startup path without pretending an empty cell was already
+a connected component.
+
+**What the one-shot API does not do.** It is enough to prove connected
+transport through an open conduit, and it is the right tool for unit tests and
+one-off player actions. It is intentionally awkward as a steady flow
+controller: a host would have to re-request every frame and would flicker
+between accepted and blocked as the outlet changed, discarding the physical
+meaning of pressure accumulated behind a cooling cap.
+
+**Persistent sources.** `addPressureSource` is the steady-flow controller for
+exactly that case. A source accrues whole-cell volume in `pending` at `rate`
+and available head at `pressureRate` each frame — no host call needed — then
+routes as much pending volume as its head allows through the connected body.
+While blocked, both accrue up to their caps (`maxPending`, `maxPressure`); when
+an outlet opens the backlog releases as a bounded surge rather than an
+unbounded dump.
+
+```ts
+const sourceId = engine.addPressureSource({
+  x: chamberFeed.x, y: chamberFeed.y,
+  material: MaterialType.LAVA,
+  rate: 1,            // whole-cell volumes per frame (fractional rates accumulate)
+  pressureRate: 1,    // hydraulic head accrued per frame while blocked
+  maxPressure: 40,    // cap on available head
+  maxPending: 8,      // cap on accrued volume — bounds the surge
+  temperature: 0.9,
+});
+// ...later, when the host is done with this source:
+engine.removePressureSource(sourceId);
+```
+
+Sources process in creation order each frame, which is another explicit part
+of the call-sequence determinism contract. Removing a source stops accrual but
+does not delete material already in the grid; removed ids are not reused.
+`getPressureSourceState(id)` reads the accumulated `pending` and
+`availablePressure` for debugging and tuning.
+
+**Rock fracture — when a blocked vent fails.** A solid opts into fracturing by
+setting `pressureStrength` (ROCK does, at 15 head; WALL does not, so editor
+geometry stays permanent). When a persistent source cannot find an affordable
+liquid outlet, the engine scans the solid boundaries of the connected liquid
+body and fractures the weakest one whose strength is below the source's
+available pressure.
+
+Fracture converts the solid into the source material — the rock becomes part of
+the conduit, conserving mass rather than vanishing. It consumes pressure equal
+to the solid's strength, so a weakened source stops breaking until it has
+accumulated more. And it is capped at `fracturePerFrame` cells (default 1), so
+a thick plug clears over multiple frames rather than disappearing in one step.
+
+```ts
+// A frozen vent cap (ROCK, strength 15) holding back a pressurized source.
+// Once the source accumulates >15 head, the cap fractures into lava and the
+// surge releases — no host remelt needed.
+engine.addPressureSource({
+  x: chamberFeed.x, y: chamberFeed.y,
+  material: MaterialType.LAVA,
+  rate: 1, pressureRate: 2, maxPressure: 30, maxPending: 5,
+});
+```
+
+Cooling-created caps exist only when heat is enabled, because the LAVA→ROCK
+phase change is part of the heat step. A no-heat world may still fracture
+host-placed rock, but lava never freezes on its own. `engine.fracturesLastFrame`
+exposes the count for debugging and tuning.
+
+All pressure phases are implemented: connected routing (Phase 2), persistent
+sources (Phase 3), fracture (Phase 4), the volcano migration (Phase 5), and
+momentum/velocity (Phase 6). See [plan-pressure.md](./plan-pressure.md) for the
+full design, including the "As built" notes on what the implementation learned.
+
+---
+
 ## 5. Explosions and destructible terrain
 
 ```ts
 engine.explode(centerX, centerY, radius, force);
 ```
 
-`explode` carves a circle: walls/rock within `falloff > 0.7` are cleared, within `> 0.3` are pulverized into colored sand debris and scattered outward, and a fire/smoke core ignites in the inner 40% of the radius. The optional explosion hook (set via engine config) receives the explosion metadata if you want to layer rigid-body impulses on top in a future integration.
+`explode` carves a circle: walls/rock within `falloff > 0.7` are cleared, within `> 0.3` are pulverized into colored sand debris. Debris is launched from its origin cell with a velocity impulse scaled by `force` — greater force sends debris further along ballistic arcs before drag and gravity win. A fire/smoke core ignites in the inner 40% of the radius. The optional explosion hook (set via engine config) receives the explosion metadata.
+
+The `force` parameter scales the impulse magnitude: `force=3` (the deferred-explosion default) produces gentle scatter; `force=9` produces violent ballistic debris. Before the velocity field existed, debris was teleported to a guessed destination; now it travels a real arc under gravity and drag (see [§5b](#5b-velocity-and-impulse)).
 
 ---
 
@@ -240,7 +505,27 @@ class WindGravity implements GravityModel {
 }
 ```
 
-**v1 note:** `PixelEngine` is a displacement-based CA — particles move one cell (or not) per frame, with no per-particle velocity. Gravity *direction* affects motion cleanly; gravity *magnitude* does not, because there is nothing to integrate without injecting probability (which would break determinism). So all v1 models are effectively uniform-magnitude. The `magnitudeAt` field on the interface is reserved for a future velocity-integrated layer.
+**v1 note:** `PixelEngine` is a displacement-based CA — particles move one cell (or not) per frame. Gravity *direction* affects all motion cleanly. Gravity *magnitude* affects ballistic velocity (see [§5b](#5b-velocity-and-impulse)), but does not affect the ordinary gravity-driven displacement rules, which are uniform-magnitude by design (injecting probability would break determinism). The `magnitudeAt` field on the interface is consumed by the velocity pass and defaults to 1.0 when absent.
+
+---
+
+## 5b. Velocity and impulse
+
+The engine carries an optional per-cell velocity field (`velX`, `velY`) in fixed-point sub-cell units — a value of `VELOCITY_CELL_UNIT` (8) represents one cell of displacement per frame. A cell given velocity attempts to move along its velocity vector each frame, under gravity and drag, until it lands or collides. The field is lazily allocated on first use and costs nothing in a world that never imparts velocity.
+
+```ts
+engine.setVelocity(x, y, vx, vy);    // set velocity directly
+engine.applyImpulse(x, y, dvx, dvy); // add to existing velocity (delta)
+const { vx, vy } = engine.getVelocity(x, y);
+```
+
+Each frame the velocity pass (which runs before pressure and the checkerboard) integrates gravity, applies drag (`velocityDrag`, default 0.92/frame), accumulates a sub-cell remainder so fractional velocities are not truncated, and moves the cell via a Bresenham-style multi-cell step. Collisions (target occupied by equal/higher density) zero the velocity — no tunneling, no chain pushing. Velocity rides with the parcel through swaps and transfers (it is parcel state), and is zeroed on material change (a phase-changed cell starts at rest).
+
+**Pressure outlet velocity (Torricelli).** When a pressure source routes magma to an outlet with surplus head, the surplus converts to launch velocity: `speed = √(2·surplus) · efficiency`. This is what produces a lava fountain — high pressure launches magma in a ballistic arc; low pressure (effusive) extrudes gently. The kinetic head is deducted from the source alongside the route cost, so the same pressure cannot launch multiple parcels (no energy double-count).
+
+**Fragmentation.** LAVA sets `fragmentsAt: 0.65` — above `freezesAt: 0.30`. When a ballistic lava cell (one with velocity) cools below this threshold during flight, it transforms into TEPHRA rather than waiting to land and freeze to ROCK. The granular product keeps the parcel's velocity and temperature, then settles above denser molten LAVA to build a tapering cone. Grounded lava (no velocity) freezes via `freezesAt` as before — fragmentation is for airborne ejecta only.
+
+`engine.velocityMovesLastFrame` and `engine.activeVelocityCount` are the diagnostics, paralleling `swapsLastFrame`.
 
 ---
 

@@ -30,6 +30,212 @@ export enum MaterialType {
   WOOD = 11,
   FGAS = 12,
   ICE = 13,
+  /** Spreading ground cover. See {@link SpreadRule}. */
+  GRASS = 14,
+  /** Falls, then germinates into {@link TREE_TIP} on soil. */
+  SEED = 15,
+  /** Ephemeral growing point of a tree. See {@link TipRule}. */
+  TREE_TIP = 16,
+  /** Static foliage forming a tree crown. */
+  LEAF = 17,
+  /** Ephemeral growing point of a fern. */
+  FERN_TIP = 18,
+  /** Wandering gas that accretes onto {@link CORAL}. */
+  SPORE = 19,
+  CORAL = 20,
+  /** Fern blade — the static counterpart to {@link LEAF}. */
+  FROND = 21,
+  /** Granular volcanic ejecta; light enough to remain above molten lava. */
+  TEPHRA = 22,
+}
+
+/**
+ * A gravity-relative direction, `0` = "up" (directly away from gravity),
+ * numbered clockwise. Under {@link FlatGravity} octant 0 is `(0, -1)`; on a
+ * planet it points radially outward from the core.
+ *
+ * @see octantOffset
+ */
+export type Octant = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
+
+/**
+ * A generative rule: the conditions under which a material creates new cells.
+ *
+ * Three kinds, because "life" is three different problems and only the first is
+ * solvable by an isotropic copy rule:
+ *
+ *  - {@link SpreadRule} — grass, moss, algae. Stateless and directionless.
+ *  - {@link TipRule} — trees, ferns, vines. A *directed, stateful* growing
+ *    point that leaves structure behind it. No amount of spreading produces a
+ *    tree; it produces a blob.
+ *  - {@link AggregateRule} — coral, germination. A cell that transforms itself
+ *    on contact rather than writing into a neighbour.
+ *
+ * Absent = the material is inert, which is every material that predates this
+ * field. See {@link PixelEngine.runGrowth} for the pass that consumes it.
+ */
+export type GrowthRule = SpreadRule | TipRule | AggregateRule;
+
+/**
+ * Isotropic spreading — the "texture" tier.
+ *
+ * Every condition here is evaluated at the **target** cell, not the source.
+ * That is not a detail: a source-side crowding check only slows the interior of
+ * a patch down while its frontier keeps expanding at exactly the same final
+ * extent, so it cannot bound coverage. Sandspiel arrives at the same place,
+ * refusing to grow when the cells flanking the destination are already plant.
+ */
+export interface SpreadRule {
+  kind: 'spread';
+  /** What appears in the target cell. Usually the material itself. */
+  into: MaterialType;
+  /** What the source becomes after a successful spawn. Absent = unchanged. */
+  becomes?: MaterialType;
+  /** Materials the target may overwrite. Default `[EMPTY]`. */
+  intoMaterial?: MaterialType[];
+  /**
+   * Materials that must be present in the **source's** 8-neighbourhood for it
+   * to spawn at all — and, with {@link range}, for how far its descendants can
+   * carry that licence.
+   *
+   * Checked at the source rather than the target, unlike every other condition
+   * here, and the asymmetry is deliberate. A target-side moisture test sounds
+   * stricter and is: it confines grass to the single ring of cells physically
+   * touching water, so a pond grows a green fringe and a lawn is unreachable at
+   * any chance value. Crowding still belongs at the target — that one really
+   * does bound coverage — but a resource has to be able to travel.
+   */
+  needs?: MaterialType[];
+
+  /**
+   * How many generations of spread a {@link needs} licence survives. Default 1:
+   * only cells that themselves touch what they need may spawn.
+   *
+   * A cell adjacent to everything in `needs` is refreshed to `range` on every
+   * tick; a cell that is not keeps whatever its parent passed down, minus one,
+   * and stops spawning at zero. So `range` is the radius of the living zone
+   * around a resource, in cells, and grass with `range: 6` puts a six-cell
+   * meadow around a pond that grows outward and then stops.
+   *
+   * The counter lives in the cell's growth word, which for a spreading material
+   * is otherwise only holding a backoff counter. This is the per-cell state
+   * paying for itself a second time: a moisture gradient with no extra grid.
+   */
+  range?: number;
+  /** Headings allowed, gravity-relative. Default: all eight. */
+  directions?: Octant[];
+
+  /**
+   * Require the target to have something solid directly "below" it in the
+   * gravity frame. Off by default.
+   *
+   * This is what makes ground cover ground cover. Without it, grass permitted
+   * to spread upward at all does so without limit and builds a tangle standing
+   * several cells clear of the soil — the reach limit bounds how far it gets,
+   * not whether it is touching anything. With it, a lawn follows the terrain,
+   * climbs a slope, and stops at a cliff edge; on a planet it wraps the surface
+   * because "below" is re-derived per cell from the gravity model.
+   */
+  needsFooting?: boolean;
+  /** Refuse to spawn if the target already has more than this many `into` neighbours. */
+  maxNeighbors?: number;
+  /** Probability per growth tick, 0–1. Rolled against `engine.random()`. */
+  chance: number;
+  /** Only grow while the target's temperature is within `[min, max]`. */
+  tempRange?: [number, number];
+}
+
+/**
+ * Directed, stateful growth — the "structure" tier, and the reason this engine
+ * can grow a tree rather than a stain.
+ *
+ * A tip is a mobile, ephemeral cell. Each growth tick it advances one cell
+ * along its heading, converts the cell it vacated into {@link becomes}, and
+ * spends a unit of energy. When the energy runs out — or the way ahead is
+ * blocked — it converts to {@link terminal} and is gone. **Tips always die**,
+ * which is the only self-limiting property in the whole design and the reason a
+ * forest converges instead of consuming the grid.
+ *
+ * Per-cell state (heading, remaining energy, branch depth, genome) lives in
+ * {@link PixelEngine.growthGrid}. The Powder Toy packs the same four fields
+ * into a particle's `ctype`, and Sandspiel into its `ra`/`rb` registers; both
+ * arrived there because directed growth is impossible without per-cell memory.
+ */
+export interface TipRule {
+  kind: 'tip';
+  /** What the tip leaves behind as it advances — the trunk or stem. */
+  becomes: MaterialType;
+  /** What the tip turns into when it stops, out of energy or blocked. */
+  terminal: MaterialType;
+  /** Materials the tip may grow into. Default `[EMPTY]`. */
+  intoMaterial?: MaterialType[];
+  /** Chance per advance of veering one octant. 0 = ruler-straight. */
+  wobble?: number;
+  /** Octant turns a branch may take, e.g. `[-1, 1]` (45°) or `[-2, 2]` (90°). */
+  branchTurns?: number[];
+  /** Stochastic branching (trees): probability per advance, per turn. */
+  branchChance?: number;
+  /**
+   * Deterministic branching (ferns): fork every N cells of energy instead of by
+   * chance. A frond's pinnae are regularly spaced; a tree's limbs are not, and
+   * this one field is the difference between the two silhouettes.
+   */
+  branchEvery?: number;
+  /** Child energy = `floor(parent energy × taper)`. Default 0.6. */
+  branchTaper?: number;
+  /** Maximum branch depth. Default 3, and 3 is the ceiling (`gen` is 2 bits). */
+  maxGen?: 0 | 1 | 2 | 3;
+  /** Don't branch below this energy — keeps twigs from forking. Default 4. */
+  branchMinEnergy?: number;
+  /**
+   * Bias each advance toward the heading with the most open space within a
+   * two-cell probe: the cheap cellular reduction of space colonization's
+   * premise that what shapes a canopy is competition for room. Stops adjacent
+   * trees from growing through each other.
+   *
+   * Ties break deterministically — toward the current heading, then by
+   * ascending octant — so this cannot make growth depend on sort stability.
+   */
+  preferOpen?: boolean;
+  /** Foliage scattered along the branches as the tip advances. */
+  foliage?: { into: MaterialType; chance: number };
+  /** Cluster stamped where a tip terminates. Radius in cells; 1 = the 8-ring. */
+  canopy?: { into: MaterialType; radius: number };
+  /** On termination, maybe drop a seed — closes the life cycle. */
+  seeds?: { into: MaterialType; chance: number };
+  /** Only advance while the tip's own temperature is within `[min, max]`. */
+  tempRange?: [number, number];
+}
+
+/**
+ * Contact transformation — a cell that changes *itself* when it touches
+ * something, rather than writing into a neighbour.
+ *
+ * Two jobs share this shape. Germination is one: a SEED that has landed on soil
+ * becomes a growing tip, seeded with the {@link state} the tip needs. Accretion
+ * is the other: a wandering SPORE that touches CORAL becomes CORAL.
+ *
+ * The accretion case is deliberately **not** diffusion-limited aggregation,
+ * whatever the resemblance. DLA's dendrites come from isotropic walkers — a
+ * walker equally likely to arrive from any direction, so protrusions shadow the
+ * interior and the cluster branches. This engine's gas path tries straight up
+ * first, then the up-diagonals, then lateral, so approaches almost always
+ * arrive from below and the result combs upward. For coral growing toward the
+ * light that bias is the right shape rather than an artefact, but it is not
+ * DLA, and calling it that would set the wrong expectation for anyone tuning it.
+ */
+export interface AggregateRule {
+  kind: 'aggregate';
+  /** Transform when adjacent to any of these. */
+  contact: MaterialType[];
+  /** What this cell becomes. */
+  into: MaterialType;
+  /** Probability per growth tick, 0–1. */
+  chance: number;
+  /** Initial growth state for the produced cell — used to sprout a tip. */
+  state?: { energy: number; dir: Octant | 'up'; variant?: 'random' | number };
+  /** Only transform while this cell's temperature is within `[min, max]`. */
+  tempRange?: [number, number];
 }
 
 /**
@@ -81,6 +287,71 @@ export interface MaterialDef {
    * @see PixelEngine.flowThickness for how thickness is measured.
    */
   yieldThickness?: number;
+
+  /**
+   * Hydraulic head lost per routed cell when this material moves under a
+   * pressure gradient, in cell-head units. Absent means pressure transport is
+   * **unsupported** for this material — an {@link PixelEngine.injectLiquid}
+   * request for it returns `unsupportedMaterial` without exploring its
+   * connected component.
+   *
+   * Pressure routing is lava-only in V1, deliberately. A low-resistance liquid
+   * in a broad body can make every cell physically reachable within a modest
+   * head budget, which turns the router's visited-cell ceiling from a safety
+   * guard into a correctness limit (a valid outlet beyond the ceiling is
+   * falsely reported as unreachable). General water routing needs a different
+   * algorithm and is out of scope until that exists.
+   *
+   * As with {@link yieldThickness}, this is a material constant today and the
+   * real quantity climbs steeply as magma cools and crystallizes. A V1 conduit
+   * cell therefore routes exactly like a fresh one; per-cell,
+   * temperature-dependent resistance is a later extension that mirrors
+   * {@link PixelEngine.stiffnessGrid}.
+   */
+  pressureResistance?: number;
+
+  /**
+   * Pressure (in hydraulic head) at which this **solid** fractures under a
+   * sustained pressure gradient from an adjacent pressurized liquid body.
+   * Absent means the solid is unbreakable by pressure — `WALL` deliberately
+   * sets none, so editor geometry stays permanent.
+   *
+   * This is what lets a blocked vent fail: when routing finds no affordable
+   * liquid outlet, the engine checks the solid boundaries of the explored
+   * body. A boundary whose `pressureStrength` is below the source's available
+   * pressure fractures into the source material (the rock becomes part of the
+   * conduit), opening a path for the next routing attempt. Fracture is bounded
+   * per frame and consumes pressure equal to the strength, so it cannot clear a
+   * mountain in one update.
+   *
+   * `ROCK` opts in — a cooling cap that froze from lava can be broken back open
+   * by sufficient sustained pressure. Hosts can add it to other solids; `WALL`
+   * stays unbreakable unless explicitly configured.
+   */
+  pressureStrength?: number;
+
+  /**
+   * Temperature at/below which an **airborne** cell of this material fragments
+   * into granular tephra ({@link fragmentsInto}). Absent means no fragmentation
+   * — the material transforms only via `freezesAt`/`meltsAt` as usual.
+   *
+   * This is what builds a volcano's cone from physics-driven ejecta rather than
+   * host-placed cells. A pressure-launched lava bomb cools during its ballistic
+   * arc; if it crosses this threshold *while still in flight* it becomes the
+   * granular `fragmentsInto` material, which piles at its angle of repose and
+   * builds a tapering flank. A bomb that
+   * lands hot (short arc) does not fragment and freezes to ROCK from ponded
+   * lava — which is the mesa-forming path. The flight-time dependence is the
+   * physically correct fragmentation criterion, and it emerges for free from
+   * the cooling curve.
+   *
+   * Set above `freezesAt` (lava: 0.65 vs 0.30) so fragmentation begins earlier
+   * in the arc than full freezing, producing more tephra. Grounded cells never
+   * fragment — they freeze via `freezesAt` like any other material.
+   */
+  fragmentsAt?: number;
+  /** What {@link fragmentsAt} produces. Required if `fragmentsAt` is set. */
+  fragmentsInto?: MaterialType;
 
   /**
    * Temperature a freshly-placed cell of this material is born at, 0–1.
@@ -146,6 +417,42 @@ export interface MaterialDef {
   meltsAt?: number;
   /** What {@link meltsAt} produces. Required if `meltsAt` is set. */
   meltsInto?: MaterialType;
+
+  /**
+   * This material never moves under gravity — it never falls, flows, or rises,
+   * and the movement core skips it outright. Default false.
+   *
+   * Vegetation is why this is a field rather than the hardcoded id list it
+   * replaces. A plant is not a powder: GRASS at density 20 outweighs SAND at
+   * 10, so without this it would sink through the soil it is supposed to be
+   * rooted in. See {@link isImmobile}, which the phase-change guard also reads.
+   */
+  isStatic?: boolean;
+
+  /**
+   * This material falls unless a {@link isTerrainSolid} neighbour holds it up —
+   * the rule WOOD has always had, generalised out of the movement core.
+   *
+   * Note the support test is **cardinal only**, and that is deliberate rather
+   * than an oversight to fix: a diagonally-braced cell falls, today and after.
+   *
+   * Support is satisfied only by {@link isTerrainSolid} cells, which makes this
+   * a narrow tool. Foliage was built on it first, for the sake of a canopy that
+   * collapses when its trunk burns; that had to be abandoned, because a leaf
+   * could then only survive cardinally adjacent to wood and a *canopy* — leaves
+   * two or more cells from any branch — could not exist at all. See LEAF.
+   */
+  needsSupport?: boolean;
+
+  /**
+   * Generative rule — under what conditions this material creates new cells.
+   * Absent = inert, which is every material that predates this field.
+   *
+   * This is the opt-in that separates life from matter in the sim. A flammable
+   * material burns (destructive); a growing one spreads (generative). Most are
+   * neither.
+   */
+  growth?: GrowthRule;
 }
 
 /**
@@ -199,7 +506,7 @@ export interface MaterialDef {
  */
 export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.EMPTY]: { id: MaterialType.EMPTY, name: 'Empty', color: [0, 0, 0, 0], density: 0, isLiquid: false, isGas: false, flammability: 0, friction: 0 },
-  [MaterialType.WALL]: { id: MaterialType.WALL, name: 'Wall', color: [100, 100, 100, 255], density: 1000, isLiquid: false, isGas: false, flammability: 0, friction: 1, conductivity: 0.2, emissivity: 0.10 },
+  [MaterialType.WALL]: { id: MaterialType.WALL, name: 'Wall', color: [100, 100, 100, 255], density: 1000, isLiquid: false, isGas: false, flammability: 0, friction: 1, isStatic: true, conductivity: 0.2, emissivity: 0.10 },
   [MaterialType.SAND]: { id: MaterialType.SAND, name: 'Sand', color: [230, 200, 100, 255], density: 10, isLiquid: false, isGas: false, flammability: 0, friction: 0.8, conductivity: 0.2, emissivity: 0.10 },
   [MaterialType.WATER]: { id: MaterialType.WATER, name: 'Water', color: [50, 100, 255, 200], density: 5, isLiquid: true, isGas: false, flammability: 0, friction: 0.1, spawnTemp: 0.15, conductivity: 0.9, emissivity: 0.05, freezesAt: 0.05, freezesInto: MaterialType.ICE, meltsAt: 0.70, meltsInto: MaterialType.STEAM },
   // yieldThickness 3: lava spreads only where the flow is at least 3 cells
@@ -207,16 +514,186 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   // front once it thins. This is the value for lava with no temperature behind
   // it — a host tracking heat overrides it per cell via `stiffnessGrid`, since
   // the real quantity climbs steeply as the melt cools.
-  [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5, yieldThickness: 3, spawnTemp: 1.0, conductivity: 0.6, emissivity: 0.13, freezesAt: 0.30, freezesInto: MaterialType.ROCK },
-  [MaterialType.ROCK]: { id: MaterialType.ROCK, name: 'Rock', color: [80, 80, 80, 255], density: 100, isLiquid: false, isGas: false, flammability: 0, friction: 0.9, conductivity: 0.2, emissivity: 0.15 },
+  [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5, yieldThickness: 3, spawnTemp: 1.0, conductivity: 0.6, emissivity: 0.13, freezesAt: 0.30, freezesInto: MaterialType.ROCK, pressureResistance: 0.15, fragmentsAt: 0.65, fragmentsInto: MaterialType.TEPHRA },
+  [MaterialType.ROCK]: { id: MaterialType.ROCK, name: 'Rock', color: [80, 80, 80, 255], density: 100, isLiquid: false, isGas: false, flammability: 0, friction: 0.9, isStatic: true, conductivity: 0.2, emissivity: 0.15, pressureStrength: 15 },
   [MaterialType.STEAM]: { id: MaterialType.STEAM, name: 'Steam', color: [200, 200, 200, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 0.75, conductivity: 0.4, emissivity: 0.05, freezesAt: 0.20, freezesInto: MaterialType.WATER },
   [MaterialType.FIRE]: { id: MaterialType.FIRE, name: 'Fire', color: [255, 150, 0, 255], density: -2, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 1.0, heatSource: true, conductivity: 0.8, emissivity: 0.10 },
   [MaterialType.SMOKE]: { id: MaterialType.SMOKE, name: 'Smoke', color: [100, 100, 100, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1 },
   [MaterialType.OIL]: { id: MaterialType.OIL, name: 'Oil', color: [50, 50, 50, 255], density: 4, isLiquid: true, isGas: false, flammability: 100, friction: 0.05 },
   [MaterialType.ACID]: { id: MaterialType.ACID, name: 'Acid', color: [100, 255, 100, 200], density: 6, isLiquid: true, isGas: false, flammability: 0, friction: 0.1 },
-  [MaterialType.WOOD]: { id: MaterialType.WOOD, name: 'Wood', color: [139, 69, 19, 255], density: 50, isLiquid: false, isGas: false, flammability: 30, friction: 0.9, conductivity: 0.2, emissivity: 0.10 },
+  [MaterialType.WOOD]: { id: MaterialType.WOOD, name: 'Wood', color: [139, 69, 19, 255], density: 50, isLiquid: false, isGas: false, flammability: 30, friction: 0.9, needsSupport: true, conductivity: 0.2, emissivity: 0.10 },
   [MaterialType.FGAS]: { id: MaterialType.FGAS, name: 'F.Gas', color: [180, 255, 50, 120], density: -1.5, isLiquid: false, isGas: true, flammability: 100, friction: 0.1 },
-  [MaterialType.ICE]: { id: MaterialType.ICE, name: 'Ice', color: [200, 230, 255, 200], density: 5, isLiquid: false, isGas: false, flammability: 0, friction: 0.05, spawnTemp: 0.0, conductivity: 0.3, emissivity: 0.20, meltsAt: 0.15, meltsInto: MaterialType.WATER },
+  [MaterialType.ICE]: { id: MaterialType.ICE, name: 'Ice', color: [200, 230, 255, 200], density: 5, isLiquid: false, isGas: false, flammability: 0, friction: 0.05, isStatic: true, spawnTemp: 0.0, conductivity: 0.3, emissivity: 0.20, meltsAt: 0.15, meltsInto: MaterialType.WATER },
+
+  // Fragmented volcanic ejecta needs its own physics identity. Reusing SAND
+  // (density 10) made every grain sink through LAVA (density 8), travel back
+  // into the reservoir, and remelt; raising the fragmentation threshold could
+  // not change that. Tephra at density 7 still falls through air and water but
+  // remains on molten lava long enough to pile into a granular cone.
+  //
+  // Like ROCK, tephra opts into pressure fracture: a vent-capping crust must
+  // fail open under sustained magma pressure rather than sealing the eruption
+  // for good. Its strength (6) is far below rock (15) — loose unconsolidated
+  // ash — so the cap holds only briefly, pressure builds, and the vent pops in
+  // a rhythmic build-up-and-release cycle. Cone flanks see no accumulated head
+  // against them and stay put; only the pressurized vent clears.
+  [MaterialType.TEPHRA]: { id: MaterialType.TEPHRA, name: 'Tephra', color: [132, 112, 98, 255], density: 7, isLiquid: false, isGas: false, flammability: 0, friction: 0.85, conductivity: 0.2, emissivity: 0.10, pressureStrength: 6 },
+
+  // --- Life -------------------------------------------------------------
+  //
+  // Every material below is inert until its `growth` rule fires, and every one
+  // of them is skipped entirely by hosts that never place them. The thermal
+  // values mirror WOOD, so a forest conducts and radiates like the timber it is
+  // rather than sitting outside the heat field as a hole in the conduction map.
+
+  // Ground cover. Static, or it would sink through the sand it roots in.
+  // `directions` covers the upper hemisphere only: grass creeps across a
+  // surface and up over obstacles, but does not tunnel down into the soil.
+  [MaterialType.GRASS]: {
+    id: MaterialType.GRASS, name: 'Grass', color: [90, 180, 70, 255],
+    density: 20, isLiquid: false, isGas: false, flammability: 40, friction: 0.7,
+    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    growth: {
+      kind: 'spread',
+      into: MaterialType.GRASS,
+      needs: [MaterialType.WATER],
+      range: 6,
+      intoMaterial: [MaterialType.SAND, MaterialType.EMPTY],
+      // Upper hemisphere only, so a lawn creeps sideways and up over obstacles
+      // instead of tunnelling into the soil, and `needsFooting` keeps it on the
+      // surface rather than climbing into the air.
+      directions: [7, 0, 1, 6, 2],
+      needsFooting: true,
+      maxNeighbors: 3,
+      chance: 0.05,
+    },
+  },
+
+  // Falls like a powder until it lands on something it can root in, then
+  // germinates. Deliberately not static: dispersal is half of what a seed is.
+  // Its density must stay below SAND's 10. At 12 it buried itself inside a
+  // painted soil mound; the new tip was boxed in by sand and terminated as a
+  // five-leaf speck instead of ever producing a trunk. Nine still falls through
+  // water, but comes to rest on the soil surface where a shoot has open space.
+  [MaterialType.SEED]: {
+    id: MaterialType.SEED, name: 'Seed', color: [180, 140, 60, 255],
+    density: 9, isLiquid: false, isGas: false, flammability: 50, friction: 0.6,
+    conductivity: 0.2, emissivity: 0.10,
+    growth: {
+      kind: 'aggregate',
+      contact: [MaterialType.SAND, MaterialType.GRASS],
+      into: MaterialType.TREE_TIP,
+      chance: 0.25,
+      // 10, not 26. Energy is the trunk length in cells, and the showcase's
+      // default planet has a radius of 66 — a 26-energy tree plus its limbs
+      // stood about three quarters of the way to the planet's centre, which is
+      // a beanstalk. This puts a tree at roughly a fifth of the radius.
+      state: { energy: 10, dir: 'up', variant: 'random' },
+    },
+  },
+
+  // The growing point of a tree. On screen for a handful of frames per cell,
+  // and given a bright bud colour deliberately: a visible growing tip reads as
+  // life happening rather than as machinery leaking through.
+  [MaterialType.TREE_TIP]: {
+    id: MaterialType.TREE_TIP, name: 'Bud', color: [140, 230, 90, 255],
+    density: 20, isLiquid: false, isGas: false, flammability: 40, friction: 0.7,
+    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    growth: {
+      kind: 'tip',
+      becomes: MaterialType.WOOD,
+      terminal: MaterialType.LEAF,
+      branchTurns: [-1, 1],
+      branchChance: 0.18,
+      // Limbs are a bit under half the remaining trunk, two generations deep.
+      // At 0.55 and three generations the lowest limbs came out longer than
+      // the trunk was tall and the tree read as a spider rather than a tree.
+      branchTaper: 0.45,
+      maxGen: 2,
+      branchMinEnergy: 4,
+      wobble: 0.15,
+      preferOpen: true,
+      // A small tree is mostly crown. Foliage fills in along the limbs and the
+      // canopy caps each spent tip; between them they close into one mass.
+      foliage: { into: MaterialType.LEAF, chance: 0.5 },
+      canopy: { into: MaterialType.LEAF, radius: 2 },
+      seeds: { into: MaterialType.SEED, chance: 0.1 },
+    },
+  },
+
+  // Foliage. Static, and that is a trade made with eyes open.
+  //
+  // `needsSupport` was tried first, for the sake of a canopy that collapses when
+  // its trunk burns away. It cannot work: support is satisfied only by
+  // `isStructural` cells, and LEAF is deliberately not one (if leaves held up
+  // leaves, a collapse would unwind one cell per frame as a slow drizzle). So a
+  // leaf could only survive cardinally adjacent to wood — which permits a
+  // one-cell fringe along a branch and makes a *canopy* physically impossible.
+  // Measured: an 11-energy tree grew as a bare stick with a few green specks.
+  //
+  // A crown is most of what makes a small tree read as a tree, so it wins. Fire
+  // is what removes foliage now, which is both the genre-standard behaviour and
+  // still a real composition with the destructive rules — LEAF is the most
+  // flammable thing in the table.
+  [MaterialType.LEAF]: {
+    id: MaterialType.LEAF, name: 'Leaf', color: [60, 150, 60, 255],
+    density: 15, isLiquid: false, isGas: false, flammability: 60, friction: 0.6,
+    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+  },
+
+  // A frond, not a tree: regular pinnae at 90° (`branchEvery` rather than
+  // `branchChance`), a shallow hierarchy, and no wood anywhere in it.
+  [MaterialType.FERN_TIP]: {
+    id: MaterialType.FERN_TIP, name: 'Frond', color: [120, 210, 110, 255],
+    density: 20, isLiquid: false, isGas: false, flammability: 50, friction: 0.6,
+    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    growth: {
+      kind: 'tip',
+      becomes: MaterialType.FROND,
+      terminal: MaterialType.FROND,
+      branchTurns: [-2, 2],
+      branchEvery: 2,
+      branchTaper: 0.35,
+      // One generation, unlike the tree's two. Let pinnae fork again and the
+      // gaps between them fill in, and the frond reads as a solid triangle
+      // rather than as separate leaflets — the negative space is most of what
+      // makes a fern a fern.
+      maxGen: 1,
+      branchMinEnergy: 3,
+      wobble: 0.05,
+    },
+  },
+
+  // A drifting gas that sets where it lands on reef. The rise bias is why the
+  // result combs upward instead of branching — see AggregateRule.
+  [MaterialType.SPORE]: {
+    id: MaterialType.SPORE, name: 'Spore', color: [200, 235, 205, 130],
+    density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1,
+    growth: {
+      kind: 'aggregate',
+      contact: [MaterialType.CORAL, MaterialType.ROCK],
+      into: MaterialType.CORAL,
+      chance: 0.4,
+    },
+  },
+
+  [MaterialType.CORAL]: {
+    id: MaterialType.CORAL, name: 'Coral', color: [230, 120, 140, 255],
+    density: 60, isLiquid: false, isGas: false, flammability: 0, friction: 0.8,
+    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+  },
+
+  // The fern's blade. Physically identical to LEAF now that foliage is static —
+  // it earns its id on palette alone, because a frond and a tree's canopy
+  // reading as the same green flattens a mixed planet into one mass of foliage.
+  // It was originally a necessity rather than a choice: while LEAF needed
+  // support, a plant built entirely of it collapsed into a heap, and a
+  // 16-energy fern rendered as a solid triangle of settled debris.
+  [MaterialType.FROND]: {
+    id: MaterialType.FROND, name: 'Frond', color: [80, 175, 85, 255],
+    density: 18, isLiquid: false, isGas: false, flammability: 55, friction: 0.6,
+    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+  },
 };
 
 /**
@@ -257,22 +734,72 @@ export const isThermal: readonly boolean[] = materialDefs.map(
  * Whether each material is skipped outright by the movement core — it never
  * falls, flows, or rises under any circumstance. Indexed by id.
  *
- * Mirrors the early-out at the top of `runCheckerboardUpdate` (minus EMPTY,
- * which is skipped for a different reason). Kept as data because the phase
- * change step needs the same question answered: freezing a *mobile* material
- * into an immobile one mid-air produces a cell that can never fall, so a lava
- * bomb still in flight would freeze into rock and hang in the sky forever.
- * That guard is only correct if "immobile" means exactly what the movement
- * core thinks it means, so the two must not drift apart.
+ * *Is* the early-out at the top of `runCheckerboardUpdate` (minus EMPTY, which
+ * is skipped for a different reason), rather than a copy of it. It was a
+ * hardcoded id list on both sides until vegetation needed to join: a plant is
+ * not a powder, and there is no density that makes GRASS sit on sand rather
+ * than sink into it. Now both sides read {@link MaterialDef.isStatic}.
  *
- * WOOD is deliberately absent: it is in {@link TERRAIN_SOLIDS} but the core
- * does process it, falling when it loses structural support.
+ * The phase-change step needs the same question answered — freezing a *mobile*
+ * material into an immobile one mid-air produces a cell that can never fall, so
+ * a lava bomb still in flight would set into rock and hang in the sky forever.
+ * That guard is only correct if "immobile" means exactly what the movement core
+ * means by it, which is why this is one array and not two lists.
+ *
+ * WOOD is deliberately absent: it is in {@link TERRAIN_SOLIDS} but the core does
+ * process it, falling when it loses structural support. See
+ * {@link MaterialDef.needsSupport}.
  */
 export const isImmobile: readonly boolean[] = materialDefs.map(
-  (d) =>
-    d.id === MaterialType.WALL ||
-    d.id === MaterialType.ROCK ||
-    d.id === MaterialType.ICE
+  (d) => d.isStatic === true
+);
+
+/**
+ * Whether each material falls unless a structural neighbour holds it up.
+ * Indexed by id. See {@link MaterialDef.needsSupport}.
+ */
+export const needsSupport: readonly boolean[] = materialDefs.map(
+  (d) => d.needsSupport === true
+);
+
+/**
+ * Whether each material has a {@link GrowthRule}. Indexed by id.
+ *
+ * Precomputed because it is asked on every {@link PixelEngine.setMaterial} and
+ * every {@link PixelEngine.swap} to keep the growth candidate set in sync, and
+ * a property lookup on a `MaterialDef` in those paths is measurably worse than
+ * one array read.
+ */
+export const hasGrowth: readonly boolean[] = materialDefs.map(
+  (d) => d.growth !== undefined
+);
+
+/**
+ * Whether each material participates in pressure transport, indexed by id.
+ *
+ * Precomputed for the same reason {@link hasGrowth} is: the router asks it on
+ * every cell it visits, and a property lookup in that hot path is measurably
+ * worse than one array read. Today only LAVA sets {@link MaterialDef.pressureResistance}.
+ */
+export const hasPressure: readonly boolean[] = materialDefs.map(
+  (d) => d.pressureResistance !== undefined
+);
+
+/**
+ * Whether each solid may fracture under sustained pressure, indexed by id.
+ * True when {@link MaterialDef.pressureStrength} is set. WALL deliberately
+ * sets none; ROCK opts in so a cooling cap can fail.
+ */
+export const hasPressureStrength: readonly boolean[] = materialDefs.map(
+  (d) => d.pressureStrength !== undefined
+);
+
+/**
+ * Whether each material fragments into tephra when airborne and cold, indexed
+ * by id. Today only LAVA sets {@link MaterialDef.fragmentsAt}.
+ */
+export const hasFragmentation: readonly boolean[] = materialDefs.map(
+  (d) => d.fragmentsAt !== undefined
 );
 
 /**

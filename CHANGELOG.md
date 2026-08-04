@@ -4,6 +4,24 @@ All notable changes to **aicraft-pixel-engine** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Dedicated tephra material.** Ballistic lava now fragments into granular
+  `TEPHRA` rather than ordinary `SAND`. Its lower density keeps erupted grains
+  above molten lava so they can settle into a persistent cone.
+
+### Fixed
+- **Volcanic fountains now build tephra cones.** Fragmented parcels retain
+  their momentum and heat, use a distinct ash-brown palette, and the showcase
+  limits the explosive outlet to one routed parcel per frame so the vent stays
+  focused instead of branching into a broad same-frame spray.
+- **Tephra crust no longer seals the eruption.** Tephra now opts into pressure
+  fracture (`pressureStrength: 6`), so a vent-capping crust reopens under
+  sustained magma pressure the same way a frozen rock cap already does. Without
+  this, fallout deposited back over the vent formed a plug the engine could not
+  route around, route through, or fracture — magma was trapped beneath it.
+
 ## [0.1.1] — 2026-08-03
 
 ### Fixed

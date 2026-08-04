@@ -3,11 +3,26 @@ export {
   SETTLE_STABLE_THRESHOLD,
   SETTLE_TIMEOUT_FRAMES,
   DEFAULT_AMBIENT_TEMPERATURE,
+  DEFAULT_PRESSURE_VISIT_LIMIT,
+  DEFAULT_FRACTURE_PER_FRAME,
+  VELOCITY_CELL_UNIT,
+  DEFAULT_VELOCITY_DRAG,
+  VELOCITY_GRAVITY_SCALE,
+  OUTLET_VELOCITY_EFFICIENCY,
+  MIN_OUTLET_SURPLUS,
+  EXPLOSION_VELOCITY_SCALE,
   HEAT_EPSILON,
   CONDUCTION_MAX,
   INSULATED_EXPOSURE,
+  packGrowth,
+  unpackGrowth,
   type PixelEngineOptions,
   type ExplosionHook,
+  type LiquidInjection,
+  type InjectionResult,
+  type InjectionRejectionReason,
+  type PressureSourceOptions,
+  type PressureSourceState,
 } from './engine.js';
-export { neighborFrame, fillNeighborFrame } from './neighbors.js';
+export { neighborFrame, fillNeighborFrame, octantOffset } from './neighbors.js';
 export type { NeighborFrame, CellOffset } from './types.js';

@@ -7,8 +7,18 @@ import {
   isTerrainSolid,
 } from '../materials';
 
-/** Numeric ids only — a numeric enum's Object.values also includes name strings. */
-const IDS: MaterialType[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+/**
+ * Numeric ids only — a numeric enum's Object.values also includes name strings.
+ *
+ * **Extend this when adding a material.** It drives the table-coverage tests
+ * below, so a new id left out of it does not fail anything: the suite stays
+ * green while quietly not checking the material at all, which is worse than a
+ * red test. The guard below catches the omission.
+ */
+const IDS: MaterialType[] = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+  14, 15, 16, 17, 18, 19, 20, 21, 22,
+];
 
 describe('materials table', () => {
   it('exposes a definition for every enum value', () => {
@@ -25,6 +35,13 @@ describe('materials table', () => {
     for (const id of IDS) {
       expect(materialDefs[id].id).toBe(id);
     }
+  });
+
+  // Makes the omission above impossible to miss: if a material is added to the
+  // table and not to IDS, this fails rather than the coverage silently shrinking.
+  it('IDS covers every material in the table', () => {
+    expect(IDS.length).toBe(materialDefs.length);
+    expect(IDS).toEqual(materialDefs.map((d) => d.id));
   });
 
   it('EMPTY is id 0 and has zero density', () => {
@@ -53,6 +70,15 @@ describe('materials table', () => {
     expect(Materials[MaterialType.LAVA].isLiquid).toBe(true);
     expect(Materials[MaterialType.OIL].isLiquid).toBe(true);
     expect(Materials[MaterialType.ACID].isLiquid).toBe(true);
+  });
+
+  it('tephra is granular and floats on lava', () => {
+    const tephra = Materials[MaterialType.TEPHRA];
+    expect(tephra.isLiquid).toBe(false);
+    expect(tephra.isGas).toBe(false);
+    expect(tephra.isStatic).not.toBe(true);
+    expect(tephra.density).toBeLessThan(Materials[MaterialType.LAVA].density);
+    expect(tephra.density).toBeGreaterThan(Materials[MaterialType.WATER].density);
   });
 
   it('flammability is in 0..100 and oil/fgas/wood are flammable', () => {

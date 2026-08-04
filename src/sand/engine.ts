@@ -23,10 +23,26 @@
  * frame-alternating scan, the material interaction rules, the chunk system,
  * and the settle detection are all preserved from the original.
  */
-import { MaterialType, Materials, materialDefs, isTerrainSolid, isThermal, isImmobile } from '../materials/index.js';
+import {
+  MaterialType,
+  Materials,
+  materialDefs,
+  isTerrainSolid,
+  isThermal,
+  isImmobile,
+  needsSupport,
+  hasGrowth,
+  hasPressure,
+  hasPressureStrength,
+  hasFragmentation,
+  type Octant,
+  type SpreadRule,
+  type TipRule,
+  type AggregateRule,
+} from '../materials/index.js';
 import { FlatGravity, type GravityModel } from '../gravity/index.js';
-import type { NeighborFrame } from './types.js';
-import { fillNeighborFrame } from './neighbors.js';
+import type { CellOffset, NeighborFrame } from './types.js';
+import { fillNeighborFrame, octantOffset } from './neighbors.js';
 
 /** Default simulation seed. */
 const DEFAULT_SEED = 12345;
@@ -124,6 +140,70 @@ export const HEAT_EPSILON = 1e-4;
 export const CONDUCTION_MAX = 0.2;
 
 /**
+ * Frames between growth ticks. See {@link PixelEngineOptions.growthInterval}.
+ *
+ * 4 puts a tip's advance at 15 cells/second, so a 26-energy tree takes under
+ * two seconds to grow. Legible rather than instant is the whole point: growth
+ * that resolves in a frame reads as a stamp, not as something alive.
+ */
+const DEFAULT_GROWTH_INTERVAL = 4;
+
+/**
+ * Cap on the exponential backoff a saturated spread cell applies to itself, in
+ * growth ticks.
+ *
+ * Growth is spontaneous, so unlike movement it has no natural trigger to go
+ * quiet on — a mature grass field would otherwise re-scan its neighbourhood
+ * forever, and (worse) keep {@link PixelEngine.growthEventsLastFrame} nonzero
+ * so a turn-based host waiting on {@link beginSettle} would never resume. A
+ * cell that fails doubles its wait; any {@link wakeChunk} touching it resets
+ * that to zero, so a patch re-arms the instant a neighbour changes.
+ *
+ * 64 ticks is ~4 seconds at the default interval. The re-arm is what makes the
+ * number uncritical: it only bounds how long a *genuinely* saturated cell waits
+ * before checking a world that nothing has touched.
+ */
+const GROWTH_BACKOFF_MAX = 64;
+
+// --- Growth state word (see PixelEngine.growthGrid) ------------------------
+//
+// tip:    bits 0–6 energy 0–127 | 7–9 dir 0–7 | 10–11 gen 0–3 | 12–15 variant
+// spread: bits 0–6 backoff | bits 7–13 vigour (remaining `needs` reach)
+const GROWTH_ENERGY_MASK = 0x7f;
+const GROWTH_DIR_SHIFT = 7;
+const GROWTH_GEN_SHIFT = 10;
+const GROWTH_VARIANT_SHIFT = 12;
+const GROWTH_VIGOUR_SHIFT = 7;
+
+/** Pack a tip's growth state into the 16-bit word. */
+export function packGrowth(energy: number, dir: number, gen: number, variant: number): number {
+  return (
+    (energy & GROWTH_ENERGY_MASK) |
+    ((dir & 7) << GROWTH_DIR_SHIFT) |
+    ((gen & 3) << GROWTH_GEN_SHIFT) |
+    ((variant & 15) << GROWTH_VARIANT_SHIFT)
+  );
+}
+
+/** Every gravity-relative octant, the default direction set for spreading. */
+const ALL_OCTANTS: readonly Octant[] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/** Unpack a tip's growth state from the 16-bit word. */
+export function unpackGrowth(word: number): {
+  energy: number;
+  dir: Octant;
+  gen: number;
+  variant: number;
+} {
+  return {
+    energy: word & GROWTH_ENERGY_MASK,
+    dir: ((word >> GROWTH_DIR_SHIFT) & 7) as Octant,
+    gen: (word >> GROWTH_GEN_SHIFT) & 3,
+    variant: (word >> GROWTH_VARIANT_SHIFT) & 15,
+  };
+}
+
+/**
  * Environment-exchange factor for a cell with no exposed face.
  *
  * Small but deliberately nonzero, so a fully buried flow eventually sets
@@ -139,6 +219,81 @@ export const SETTLE_STABLE_THRESHOLD = 10;
 export const SETTLE_TIMEOUT_FRAMES = 600;
 
 /**
+ * Default ceiling on visited cells per pressure-routed volume. Sized for
+ * lava-scale conduits and chambers; see {@link PixelEngineOptions.pressureVisitLimit}.
+ */
+export const DEFAULT_PRESSURE_VISIT_LIMIT = 2048;
+
+/**
+ * Default cap on solid cells fractured by pressure per update. One cell per
+ * frame keeps a thick plug clearing over multiple frames rather than vanishing
+ * instantly.
+ */
+export const DEFAULT_FRACTURE_PER_FRAME = 1;
+
+// --- Velocity (Phase 6A) ----------------------------------------------------
+//
+// Velocity is fixed-point: a velocity value of VELOCITY_CELL_UNIT represents
+// one cell of displacement per frame. A value of 12 with a unit of 8 means 1.5
+// cells/frame — the half-cell carries in a per-cell remainder accumulator so
+// small lateral components are not silently truncated away. All values are
+// signed Int8, clamped to ±127; drag reduces them toward zero each frame.
+
+/** Fixed-point unit: a velocity of this many sub-cells = one cell/frame. */
+export const VELOCITY_CELL_UNIT = 8;
+
+/**
+ * Per-frame velocity retention (drag). Each frame both components are multiplied
+ * by this factor, so 0.92 halves speed in ~8 frames. Global in Phase 6A;
+ * per-material drag (lava losing momentum faster than tephra) is a 6B extension.
+ */
+export const DEFAULT_VELOCITY_DRAG = 0.92;
+
+/**
+ * Fixed-point gravity acceleration per frame², in sub-cell units. Tuned so a
+ * freely falling cell accelerates at roughly one cell/frame², matching the
+ * existing single-step gravity rule the checkerboard applies.
+ */
+export const VELOCITY_GRAVITY_SCALE = 8;
+
+/**
+ * Efficiency of surplus-pressure-to-velocity conversion at a pressure outlet
+ * (Torricelli). Not all hydraulic surplus becomes kinetic energy — some is lost
+ * to turbulence, viscosity, and conduit geometry. 0.7 means a parcel launches
+ * at 70% of the theoretical √(2gh) speed.
+ *
+ * This is also what closes the energy double-count: the kinetic head deducted
+ * from the source is `(speed/efficiency)² · efficiency² / 2g = surplus ·
+ * efficiency²`, which is less than `surplus` when `efficiency < 1`. The
+ * remainder stays in the source for subsequent parcels.
+ */
+export const OUTLET_VELOCITY_EFFICIENCY = 0.7;
+
+/**
+ * Lateral spread fraction for outlet velocity. Each launched parcel gets a
+ * deterministic lateral component (perpendicular to the exit heading) equal to
+ * this fraction of its launch speed, so a fountain fans outward rather than
+ * building a one-cell-wide spire. 0.25 means the lateral component is up to
+ * 25% of the vertical — enough to build a cone, not so much that ejecta flies
+ * sideways.
+ */
+export const OUTLET_LATERAL_SPREAD = 0.25;
+
+/**
+ * Minimum surplus head (in cell-head units) required to write velocity at a
+ * pressure outlet. Below this, the cell extrudes and falls normally — the
+ * effusive case. Above it, the surplus launches the parcel — the fountain case.
+ */
+export const MIN_OUTLET_SURPLUS = 2;
+
+/**
+ * Scales explosion `force` into a velocity impulse magnitude. Tuned so
+ * `force=5, falloff=0.5` gives ~2–3 cells of debris flight before drag and
+ * gravity win.
+ */
+export const EXPLOSION_VELOCITY_SCALE = 4;
+
+/**
  * Optional callback fired by {@link PixelEngine.explode} with the explosion
  * metadata. v1 does not apply rigid-body impulses; this hook exists so a
  * future rigid-body layer (or the host game) can react to explosions
@@ -150,6 +305,130 @@ export type ExplosionHook = (
   radius: number,
   force: number,
 ) => void;
+
+/**
+ * Why an {@link injectLiquid} request was not fully accepted.
+ *
+ * - `unsupportedMaterial` — the material defines no
+ *   {@link MaterialDef.pressureResistance} (V1: anything but LAVA). The router
+ *   does not even start a search.
+ * - `missingPotential` — the gravity model exposes no `potentialAt`, so head
+ *   cannot be accounted. Routing is refused rather than pretending uphill is
+ *   free.
+ * - `incompatibleSource` — the source cell holds another liquid or a solid,
+ *   and V1 does not overwrite it. Reactions, dissolution, and drilling are
+ *   separate behaviours.
+ * - `noOutlet` — the connected component has no EMPTY cardinal neighbour, so
+ *   there is nowhere to extrude.
+ * - `insufficientHead` — an outlet exists but every reachable one costs more
+ *   than the request pressure.
+ * - `searchLimit` — the visited-cell ceiling was reached before the search
+ *   completed. A valid outlet may lie beyond; this is reported honestly rather
+ *   than as `noOutlet`, and no partial candidate is selected.
+ */
+export type InjectionRejectionReason =
+  | 'noOutlet'
+  | 'insufficientHead'
+  | 'searchLimit'
+  | 'unsupportedMaterial'
+  | 'incompatibleSource'
+  | 'missingPotential';
+
+/**
+ * A queued request to inject liquid under pressure, drained during the next
+ * {@link PixelEngine.update}. See {@link PixelEngine.injectLiquid}.
+ */
+export interface LiquidInjection {
+  x: number;
+  y: number;
+  material: MaterialType;
+  /** Requested whole-cell volumes for the next update. */
+  amount: number;
+  /** Maximum hydraulic head available to each volume. */
+  pressure: number;
+  /** Optional initial parcel temperature. Material `spawnTemp` by default. */
+  temperature?: number;
+  /** Optional initial packed colour. */
+  color?: number;
+}
+
+/** Result of one {@link LiquidInjection}, available after the drain. */
+export interface InjectionResult {
+  /** Correlates with the id returned by {@link PixelEngine.injectLiquid}. */
+  requestId: number;
+  requested: number;
+  accepted: number;
+  blocked: number;
+  /** Greatest path cost paid by an accepted volume. */
+  maxCost: number;
+  /** Why work was rejected, when the result was not fully accepted. */
+  reason?: InjectionRejectionReason;
+}
+
+/** Options for {@link PixelEngine.addPressureSource}. */
+export interface PressureSourceOptions {
+  /** Source cell x. The body must be cardinally connected from here. */
+  x: number;
+  /** Source cell y. */
+  y: number;
+  /** Liquid material. V1: LAVA (the only material with `pressureResistance`). */
+  material: MaterialType;
+  /** Whole-cell volumes accrued per frame. Fractional rates accumulate a remainder. */
+  rate: number;
+  /** Hydraulic head accrued per frame while blocked. */
+  pressureRate: number;
+  /** Cap on available head. Bounds how hard a blocked source can eventually push. */
+  maxPressure: number;
+  /** Cap on accrued whole-cell volume. Bounds the surge when an outlet opens. */
+  maxPending: number;
+  /** Initial parcel temperature. Material `spawnTemp` by default. */
+  temperature?: number;
+  /**
+   * Fraction of surplus head converted to outlet launch velocity (Torricelli).
+   * Default {@link OUTLET_VELOCITY_EFFICIENCY} (0.7). Lower values leave more
+   * head in the source for subsequent parcels; higher values produce faster
+   * single-parcel launches. The explosive source can set this independently of
+   * the effusive source.
+   */
+  outletVelocityEfficiency?: number;
+}
+
+/** Readable snapshot of a persistent source's accumulated state. */
+export interface PressureSourceState {
+  id: number;
+  x: number;
+  y: number;
+  material: MaterialType;
+  pending: number;
+  availablePressure: number;
+}
+
+/**
+ * Internal persistent source record. Volume accrues in `pending` at `rate` each
+ * frame (with a fixed-point remainder for fractional rates); available head
+ * accrues at `pressureRate` while blocked, up to `maxPressure`. On a successful
+ * route, the path cost is deducted from `availablePressure` and one cell from
+ * `pending`. This is what produces a bounded surge after a plug clears rather
+ * than discarding every blocked frame.
+ */
+interface PressureSource {
+  id: number;
+  x: number;
+  y: number;
+  material: MaterialType;
+  rate: number;
+  pressureRate: number;
+  maxPressure: number;
+  maxPending: number;
+  temperature: number | undefined;
+  outletVelocityEfficiency: number;
+  /** Accrued whole-cell volumes waiting for an outlet. */
+  pending: number;
+  /** Fractional volume remainder, for rates < 1. */
+  pendingRem: number;
+  /** Available hydraulic head, accrued while blocked. */
+  availablePressure: number;
+}
 
 /** Construction options for {@link PixelEngine}. */
 export interface PixelEngineOptions {
@@ -192,6 +471,37 @@ export interface PixelEngineOptions {
    * turn it down and oceans freeze on their own.
    */
   ambientTemperature?: number;
+  /**
+   * Frames between growth ticks. Default {@link DEFAULT_GROWTH_INTERVAL} (4).
+   *
+   * The pacing dial for everything alive: raise it and a forest takes longer to
+   * establish, lower it and growth starts to look like a stamp rather than a
+   * process. Costs nothing in a world with no growing materials, where the pass
+   * never runs at all.
+   */
+  growthInterval?: number;
+  /**
+   * Hard ceiling on visited cells per pressure-routed volume, as a safety
+   * guard against runaway searches. Default {@link DEFAULT_PRESSURE_VISIT_LIMIT}.
+   *
+   * V1 supports high-resistance lava in bounded chambers and conduits, where
+   * the head budget expires well before this many cells. The ceiling also acts
+   * as a correctness limit: a valid low-resistance component can contain an
+   * affordable outlet beyond it, in which case routing returns `searchLimit`
+   * honestly rather than selecting a partial candidate or claiming no outlet.
+   * Raising it trades a wider search against per-frame cost.
+   */
+  pressureVisitLimit?: number;
+  /**
+   * Maximum solid cells fractured by pressure in one update. Default 1.
+   *
+   * Bounds the rate at which a blocked source can break through rock: a cap
+   * fractures one cell per frame at most, so clearing a thick plug takes
+   * multiple frames rather than vanishing a mountain in one step. Each fracture
+   * also consumes pressure equal to the solid's `pressureStrength`, so a
+   * weakened source stops breaking until it has accumulated more.
+   */
+  fracturePerFrame?: number;
 }
 
 /**
@@ -247,6 +557,39 @@ export class PixelEngine {
    * {@link setHeat}.
    */
   heatGrid: Float32Array | null = null;
+  /**
+   * Optional per-cell growth state. `null` until the first {@link plant} or
+   * growth write. Rides with the material through swaps, like
+   * {@link stiffnessGrid}, and is cleared by {@link setMaterial} on a material
+   * change — a trunk carries none of the tip's heading that left it behind.
+   *
+   * The word is interpreted by the cell's {@link GrowthRule} kind:
+   *
+   * ```
+   *  tip:     bits 0–6   energy   0–127  remaining growth budget
+   *           bits 7–9   dir      0–7    gravity-relative octant heading
+   *           bits 10–11 gen      0–3    branch depth
+   *           bits 12–15 variant  0–15   per-plant genome (branch mask)
+   *
+   *  spread:  bits 0–6   backoff         growth ticks until the next attempt
+   * ```
+   *
+   * Directed growth is impossible without per-cell memory, which is why every
+   * mature falling-sand sim has a field like this: The Powder Toy packs
+   * `(life | direction | phase)` into a particle's `ctype`, Sandspiel keeps two
+   * spare registers (`ra`/`rb`) on every cell. Without it a growth rule can only
+   * copy itself into a neighbour, and isotropic copying produces a blob however
+   * it is tuned — no trunk, no branches, no silhouette.
+   *
+   * `variant` is the genome: rolled once when a plant is seeded, inherited
+   * unchanged by every branch, and used as a mask over {@link TipRule.branchTurns}.
+   * Sixteen silhouettes from one material, all deterministic, which is what
+   * keeps a forest from looking stamped.
+   *
+   * @see packGrowth
+   * @see unpackGrowth
+   */
+  growthGrid: Uint16Array | null = null;
   /** Per-cell "already processed this frame" flag. */
   readonly updated: Uint8Array;
   /**
@@ -338,7 +681,47 @@ export class PixelEngine {
    */
   private readonly _potentialAt: ((x: number, y: number) => number) | null;
 
+  /**
+   * The gravity model's magnitude field, pre-bound, or `null` when the model
+   * does not provide one. Consumed by the velocity pass to accelerate ballistic
+   * cells. Defaults to uniform 1.0 — see {@link GravityModel.magnitudeAt}.
+   */
+  private readonly _magnitudeAt: ((x: number, y: number) => number) | null;
+
+  /**
+   * Indices of cells whose material has a {@link GrowthRule} — the growth pass's
+   * work list, and the reason its cost is proportional to the amount of life in
+   * the world rather than to the size of the grid.
+   *
+   * ## The membership invariant
+   *
+   * > Every cell whose material has a growth rule is in this set.
+   *
+   * A *superset*, deliberately, not an exact correspondence. {@link setMaterial}
+   * and {@link swap} maintain it precisely, but the reaction steps write
+   * `this.grid[i]` directly — so grass burning to FIRE leaves its index behind.
+   * That is safe, and it is safe for a reason worth stating: **no direct write
+   * anywhere in the engine produces a material that has a growth rule** (they
+   * produce FIRE, WATER, STEAM, ROCK, SMOKE, EMPTY), so a stale entry can only
+   * ever be spurious, never missing. {@link runGrowth} re-reads each cell's
+   * material and drops the ones that no longer qualify, which makes the set
+   * exact again after every growth tick.
+   *
+   * The superset property is what the *behaviour* depends on: a missing entry
+   * would be a plant that silently stopped growing, while a stale one costs one
+   * array read and is then gone.
+   *
+   * Membership is a pure function of the grid, never of history, so
+   * {@link rebuildGrowthCells} restores it exactly after deserialization — a
+   * world loaded from a saved grid grows identically to the one that was saved.
+   */
+  readonly growthCells: Set<number> = new Set();
+
+  /** Frames between growth ticks. See {@link PixelEngineOptions.growthInterval}. */
+  readonly growthInterval: number;
+
   private _rngState: number;
+  private _growthEventsThisFrame = 0;
   private _swapsThisFrame = 0;
   private _settleFrameCount = 0;
   private _settling = false;
@@ -370,6 +753,112 @@ export class PixelEngine {
     right: { dx: 0, dy: 0 },
   };
 
+  /** Scratch frame and offset for the growth pass. */
+  private readonly _growthFrame: NeighborFrame = {
+    down: { dx: 0, dy: 0 },
+    downLeft: { dx: 0, dy: 0 },
+    downRight: { dx: 0, dy: 0 },
+    left: { dx: 0, dy: 0 },
+    right: { dx: 0, dy: 0 },
+  };
+  private readonly _growthOffset: CellOffset = { dx: 0, dy: 0 };
+  /** Reused candidate buffers, so the growth pass allocates nothing per cell. */
+  private readonly _growthTargets: number[] = [];
+  private readonly _growthHeadings: number[] = [];
+  private readonly _growthScores: number[] = [];
+  /**
+   * Cells written by the growth pass this tick.
+   *
+   * A tip that advances into a cell later in the sorted snapshot would
+   * otherwise take a second turn in the same tick and grow at double rate. This
+   * cannot use the `updated` flags: those are cleared per *active chunk* at the
+   * top of the next frame, and growth deliberately reaches into sleeping ones.
+   */
+  private readonly _growthTouched: Set<number> = new Set();
+
+  // ----------------------------------------------------------------- pressure
+  //
+  // All pressure state is lazily allocated on the first `injectLiquid`, so a
+  // world that never uses pressure pays nothing — no array, no per-frame work,
+  // no draw from the RNG (the router is fully deterministic from grid state).
+  /** FIFO queue of pending injection requests, drained each update. */
+  private _injectionQueue: { id: number; req: LiquidInjection }[] = [];
+  /** Results from the most recent drain, consumed by the host. */
+  private _injectionResults: InjectionResult[] = [];
+  private _nextRequestId = 1;
+  private _pressureMovesThisFrame = 0;
+  private _pressureCellsVisitedThisFrame = 0;
+  private _blockedInjectionsThisFrame = 0;
+  /** Solid cells fractured this update; reset in {@link update}. */
+  private _fracturesThisFrame = 0;
+  /** Velocity-driven moves this frame; reset in {@link update}. */
+  private _velocityMovesThisFrame = 0;
+  /** Visited-cell ceiling per routed volume. See PixelEngineOptions. */
+  readonly pressureVisitLimit: number;
+  /** Cap on fractures per update. See PixelEngineOptions.fracturePerFrame. */
+  readonly fracturePerFrame: number;
+  /**
+   * Reused Dijkstra scratch, allocated on first `injectLiquid`. Generation-
+   * stamped so a search costs no full-array clear: `_pressGen` is incremented
+   * per volume and a cell is "visited this search" when its stamp equals it.
+   */
+  private _pressVisited: Uint32Array | null = null;
+  private _pressGen = 0;
+  private _pressCost: Float64Array | null = null;
+  /** Parent index for path reconstruction, or -1 for the source. */
+  private _pressParent: Int32Array | null = null;
+  /** Path length (edge count) to each cell, for the shorter-path tiebreak. */
+  private _pressHops: Int32Array | null = null;
+  /**
+   * Binary-heap index queue of settled-pending cells. Holds cell indices keyed
+   * by accumulated cost; reused across volumes to avoid per-search allocation.
+   */
+  private _pressHeap: Int32Array | null = null;
+  private _pressHeapSize = 0;
+  /** Heap keys parallel to {@link _pressHeap}: the cost at each heap slot. */
+  private _pressHeapCost: Float64Array | null = null;
+  /**
+   * Persistent pressure sources, in creation order. Processed each frame to
+   * accrue volume/pressure and route accumulated volume through the same
+   * machinery as one-shot injections. An empty array (the default) costs one
+   * length check per frame.
+   */
+  private _pressureSources: PressureSource[] = [];
+  private _nextSourceId = 1;
+
+  // ----------------------------------------------------------- velocity (6A)
+  //
+  // Per-cell ballistic velocity in fixed-point sub-cell units, lazily allocated
+  // on first impulse. A world that never imparts velocity pays nothing — no
+  // arrays, no per-frame scan, no draw from the RNG. Zero = at rest.
+  /**
+   * X-component of velocity, in sub-cell units (see {@link VELOCITY_CELL_UNIT}).
+   * Positive = +x (right). `null` until the first {@link setVelocity}/
+   * {@link applyImpulse}.
+   */
+  velX: Int8Array | null = null;
+  /** Y-component of velocity. Positive = +y (down in screen space). */
+  velY: Int8Array | null = null;
+  /**
+   * Sub-cell displacement remainder for X. Without this, a velocity of 12 at
+   * unit 8 (1.5 cells/frame) would floor to 1 cell/frame, losing half a cell
+   * every frame and silently zeroing small lateral components. The remainder
+   * carries the fractional part forward.
+   */
+  velRemX: Int8Array | null = null;
+  /** Sub-cell displacement remainder for Y. */
+  velRemY: Int8Array | null = null;
+  /**
+   * Indices of cells with nonzero velocity — the velocity pass's work list.
+   * Maintained on write (add on impulse, remove when drag zeroes velocity), so
+   * the integration pass is O(active velocity cells), not O(grid). A snapshot is
+   * taken before each pass so a cell that moves during the pass is not processed
+   * twice.
+   */
+  readonly velCells: Set<number> = new Set();
+  /** Per-frame velocity drag, applied to both components each step. */
+  readonly velocityDrag: number;
+
   constructor(options: PixelEngineOptions) {
     const { width, height } = options;
     this.width = width;
@@ -382,8 +871,17 @@ export class PixelEngine {
     this._potentialAt = this.gravity.potentialAt
       ? this.gravity.potentialAt.bind(this.gravity)
       : null;
+    // Gravity magnitude: consumed by the velocity pass to accelerate cells.
+    // Optional on the interface; defaults to uniform 1.0 — see gravity/types.ts.
+    this._magnitudeAt = this.gravity.magnitudeAt
+      ? this.gravity.magnitudeAt.bind(this.gravity)
+      : null;
     this.CHUNK_SIZE = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
     this.liquidDispersion = options.liquidDispersion ?? DEFAULT_LIQUID_DISPERSION;
+    this.growthInterval = Math.max(1, options.growthInterval ?? DEFAULT_GROWTH_INTERVAL);
+    this.pressureVisitLimit = Math.max(1, options.pressureVisitLimit ?? DEFAULT_PRESSURE_VISIT_LIMIT);
+    this.fracturePerFrame = Math.max(0, options.fracturePerFrame ?? DEFAULT_FRACTURE_PER_FRAME);
+    this.velocityDrag = DEFAULT_VELOCITY_DRAG;
     this._onExplode = options.onExplode ?? (() => {});
     this._ambientTemperature = options.ambientTemperature ?? DEFAULT_AMBIENT_TEMPERATURE;
 
@@ -502,6 +1000,14 @@ export class PixelEngine {
     this.grid.fill(MaterialType.EMPTY);
     if (this.colorGrid) this.colorGrid.fill(0);
     if (this.stiffnessGrid) this.stiffnessGrid.fill(0);
+    if (this.growthGrid) this.growthGrid.fill(0);
+    this.growthCells.clear();
+    // Pressure sources and queued injections are host-authored state that must
+    // not survive a clear: a source left alive would pump into the empty grid
+    // next frame, creating material from nothing.
+    this._pressureSources = [];
+    this._injectionQueue = [];
+    this._injectionResults = [];
     // Ambient, not zero: the grid is now all EMPTY, and EMPTY has no spawnTemp.
     // Zero-filling would leave a cleared world at absolute cold.
     if (this.heatGrid) this.heatGrid.fill(this.ambientTemperature);
@@ -509,6 +1015,11 @@ export class PixelEngine {
     if (this.nextThermalChunks) this.nextThermalChunks.fill(1);
     this.updated.fill(0);
     this.liquidVel.fill(0);
+    if (this.velX) this.velX.fill(0);
+    if (this.velY) this.velY.fill(0);
+    if (this.velRemX) this.velRemX.fill(0);
+    if (this.velRemY) this.velRemY.fill(0);
+    this.velCells.clear();
     this.activeChunks.fill(1);
     this.nextActiveChunks.fill(1);
     this.renderDirtyChunks.fill(1);
@@ -610,6 +1121,11 @@ export class PixelEngine {
       // A cell that has become a different material carries none of the old
       // one's rheology.
       if (this.stiffnessGrid) this.stiffnessGrid[idx] = 0;
+      // ...nor its growth state. The trunk a tip leaves behind must not inherit
+      // the tip's heading and energy, or it would resume growing on its own.
+      if (this.growthGrid) this.growthGrid[idx] = 0;
+      if (hasGrowth[mat]) this.growthCells.add(idx);
+      else if (hasGrowth[oldMat]) this.growthCells.delete(idx);
       // ...but it is born at its own temperature rather than reset to nothing,
       // which is the one place heat differs from the grids above: a freshly
       // spawned LAVA cell is born hot, and that is the point. A caller that
@@ -621,6 +1137,15 @@ export class PixelEngine {
     }
     // A freshly-placed cell carries no flow direction.
     this.liquidVel[idx] = 0;
+    // A material change resets velocity — a phase-changed cell starts at rest.
+    // Only zeroed when the material actually changed, so a caller that re-sets
+    // the same material (e.g. pressure's source write) does not clobber velocity
+    // that `copyParcel` may have placed.
+    if (oldMat !== mat && this.velX) {
+      const vx = this.velX, vy = this.velY!, rx = this.velRemX!, ry = this.velRemY!;
+      vx[idx] = 0; vy[idx] = 0; rx[idx] = 0; ry[idx] = 0;
+      this.velCells.delete(idx);
+    }
     this.grid[idx] = mat;
     this.wakeChunk(x, y);
     this.markRenderDirty(x, y);
@@ -653,6 +1178,19 @@ export class PixelEngine {
       this.stiffnessGrid[idx1] = this.stiffnessGrid[idx2];
       this.stiffnessGrid[idx2] = s1;
     }
+    if (this.growthGrid) {
+      const g1 = this.growthGrid[idx1];
+      this.growthGrid[idx1] = this.growthGrid[idx2];
+      this.growthGrid[idx2] = g1;
+    }
+    // Membership follows the material, not the cell. Only a growth-capable
+    // material can be involved at all, so a world with no life pays one test.
+    if (hasGrowth[m1] || hasGrowth[m2]) {
+      if (hasGrowth[m2]) this.growthCells.add(idx1);
+      else this.growthCells.delete(idx1);
+      if (hasGrowth[m1]) this.growthCells.add(idx2);
+      else this.growthCells.delete(idx2);
+    }
     if (this.heatGrid) {
       const h1 = this.heatGrid[idx1];
       this.heatGrid[idx1] = this.heatGrid[idx2];
@@ -662,11 +1200,136 @@ export class PixelEngine {
       this.wakeThermalChunk(x1, y1);
       this.wakeThermalChunk(x2, y2);
     }
+    if (this.velX) {
+      // Velocity is parcel state: it rides with the material through a swap,
+      // exactly as heat does.
+      const vx = this.velX, vy = this.velY!, rx = this.velRemX!, ry = this.velRemY!;
+      const vx1 = vx[idx1]; vx[idx1] = vx[idx2]; vx[idx2] = vx1;
+      const vy1 = vy[idx1]; vy[idx1] = vy[idx2]; vy[idx2] = vy1;
+      const rx1 = rx[idx1]; rx[idx1] = rx[idx2]; rx[idx2] = rx1;
+      const ry1 = ry[idx1]; ry[idx1] = ry[idx2]; ry[idx2] = ry1;
+      // Maintain the active-velocity set: membership follows whichever parcel
+      // ends up with nonzero velocity.
+      const v1new = vx[idx1] | vy[idx1];
+      const v2new = vx[idx2] | vy[idx2];
+      if (v1new) this.velCells.add(idx1); else this.velCells.delete(idx1);
+      if (v2new) this.velCells.add(idx2); else this.velCells.delete(idx2);
+    }
     this.wakeChunk(x1, y1);
     this.wakeChunk(x2, y2);
     this.markRenderDirty(x1, y1);
     this.markRenderDirty(x2, y2);
     this._swapsThisFrame++;
+  }
+
+  // ----------------------------------------------------------------------
+  // Parcel primitives.
+  //
+  // A "parcel" is the complete per-cell state that moves with a material:
+  // `grid`, `colorGrid`, `stiffnessGrid`, `growthGrid` (+ membership),
+  // `heatGrid`, and `liquidVel`. This bookkeeping was duplicated across
+  // `swap`, liquid levelling, phase change, explosions, and host placement
+  // before these helpers existed, which is exactly the shape of bug that a
+  // new movement path (pressure routing) would walk into — forgetting to
+  // carry heat, or stiffness, or a growth-set entry.
+  //
+  // These centralize the copy/clear/write paths. They are private because the
+  // distinction between a swap and a transfer is engine-internal; callers that
+  // already had their own inline logic now delegate here, and the pressure pass
+  // is built on the same primitives.
+  // ----------------------------------------------------------------------
+
+  /**
+   * Copy the parcel at `fromIdx` onto `toIdx`, overwriting whatever was there.
+   * The source cell is left untouched — this is a copy, not a move; callers
+   * that need the source cleared do so explicitly with {@link clearParcel}.
+   *
+   * This is the one-directional transfer primitive that the liquid-levelling
+   * pass and the pressure path-shift both reduce to, factored out so a new
+   * movement path cannot silently drop a field. {@link swap} is a genuine
+   * bidirectional exchange and does not decompose into two sequential copies
+   * (the second would read the first's overwrite), so it keeps its own inline
+   * exchange — but it shifts the same physical fields, kept in the same order,
+   * so the two paths cannot drift on which fields count as "the parcel".
+   *
+   * `liquidVel` is the one field that is movement-specific rather than
+   * parcel-specific: a pressure route is not a surface flow, and a parcel
+   * carried up a conduit should not inherit a lateral-flow preference that was
+   * meaningful only in the geometry it left. `clearLiquidVel` clears it at the
+   * destination instead of copying it, for that one path.
+   *
+   * Does NOT touch the `updated` flag, chunk wake-up, or the swap counter:
+   * those belong to the caller because a two-cell swap and a many-cell path
+   * shift wake and count differently. Only the thermal wake is included here,
+   * because heat moving is heat leaving equilibrium regardless of how the move
+   * was initiated.
+   *
+   * Coordinates are taken (not derived from the index) so the thermal wake
+   * resolves the right chunk.
+   *
+   * @internal
+   */
+  private copyParcel(
+    fromIdx: number, toIdx: number,
+    toX: number, toY: number,
+    clearLiquidVel = false,
+  ): void {
+    const mat = this.grid[fromIdx];
+    this.grid[toIdx] = mat;
+    if (this.colorGrid) this.colorGrid[toIdx] = this.colorGrid[fromIdx];
+    if (this.stiffnessGrid) this.stiffnessGrid[toIdx] = this.stiffnessGrid[fromIdx];
+    if (this.growthGrid) this.growthGrid[toIdx] = this.growthGrid[fromIdx];
+    // Membership follows the parcel: a growth-capable material arriving at
+    // `toIdx` joins the set, and the membership this method does NOT touch is
+    // the source's, which the caller reconciles (a swap leaves the source
+    // holding the other parcel; a transfer/shift clears it).
+    if (hasGrowth[mat]) this.growthCells.add(toIdx);
+    if (this.heatGrid) {
+      this.heatGrid[toIdx] = this.heatGrid[fromIdx];
+      this.wakeThermalChunk(toX, toY);
+    }
+    if (clearLiquidVel) {
+      this.liquidVel[toIdx] = 0;
+    } else {
+      this.liquidVel[toIdx] = this.liquidVel[fromIdx];
+    }
+    // Velocity is parcel state — copy unconditionally, independent of the
+    // `clearLiquidVel` flag (which governs surface-flow memory only). A pressure
+    // route must preserve a parcel's physical velocity; `liquidVel` is the one
+    // field that gets cleared because it is movement-specific, not parcel state.
+    if (this.velX) {
+      const vx = this.velX, vy = this.velY!, rx = this.velRemX!, ry = this.velRemY!;
+      vx[toIdx] = vx[fromIdx];
+      vy[toIdx] = vy[fromIdx];
+      rx[toIdx] = rx[fromIdx];
+      ry[toIdx] = ry[fromIdx];
+      if (vx[toIdx] | vy[toIdx]) this.velCells.add(toIdx);
+    }
+  }
+
+  /**
+   * Reset `idx` to an empty cell: EMPTY material, no companion state, heat back
+   * to ambient (matching what {@link clear} establishes and what a levelling
+   * source cell returns to). Maintains the {@link growthCells} membership
+   * invariant. Does NOT touch `updated`, chunks, or render dirtiness — callers
+   * own those, for the same reason {@link copyParcel} does.
+   *
+   * @internal
+   */
+  private clearParcel(idx: number): void {
+    const oldMat = this.grid[idx];
+    this.grid[idx] = MaterialType.EMPTY;
+    if (this.colorGrid) this.colorGrid[idx] = 0;
+    if (this.stiffnessGrid) this.stiffnessGrid[idx] = 0;
+    if (this.growthGrid) this.growthGrid[idx] = 0;
+    if (hasGrowth[oldMat]) this.growthCells.delete(idx);
+    if (this.heatGrid) this.heatGrid[idx] = this.ambientTemperature;
+    this.liquidVel[idx] = 0;
+    if (this.velX) {
+      const vx = this.velX, vy = this.velY!, rx = this.velRemX!, ry = this.velRemY!;
+      vx[idx] = 0; vy[idx] = 0; rx[idx] = 0; ry[idx] = 0;
+      this.velCells.delete(idx);
+    }
   }
 
   /**
@@ -976,30 +1639,24 @@ export class PixelEngine {
 
         if (destX < 0) continue;
 
-        // Transfer (not a swap — the path between is solid liquid).
+        // Transfer (not a swap — the path between is solid liquid). Copy the
+        // parcel to the destination, then clear the source. Order matters:
+        // `copyParcel` reads the source's grid/companion state, so the clear
+        // must follow. Levelling zeroes `liquidVel` at both ends (a freshly
+        // deposited surface cell has no committed flow direction), which
+        // `clearLiquidVel` handles at the destination and `clearParcel` at the
+        // source.
         const dIdx = this.getIndex(destX, destY);
-        this.grid[dIdx] = mat;
-        this.grid[idx] = MaterialType.EMPTY;
+        this.copyParcel(idx, dIdx, destX, destY, true);
+        this.clearParcel(idx);
+        if (this.heatGrid) {
+          // The source was just reset to ambient by `clearParcel`; the heat it
+          // vacated is out of equilibrium with its new surroundings, so wake
+          // the thermal chunk there too.
+          this.wakeThermalChunk(x, y);
+        }
         this.updated[dIdx] = 1;
         this.updated[idx] = 1;
-        if (this.colorGrid) {
-          this.colorGrid[dIdx] = this.colorGrid[idx];
-          this.colorGrid[idx] = 0;
-        }
-        if (this.stiffnessGrid) {
-          this.stiffnessGrid[dIdx] = this.stiffnessGrid[idx];
-          this.stiffnessGrid[idx] = 0;
-        }
-        if (this.heatGrid) {
-          // The source cell becomes EMPTY, which has no spawnTemp — so it
-          // returns to ambient rather than to 0, matching what `clear` does.
-          this.heatGrid[dIdx] = this.heatGrid[idx];
-          this.heatGrid[idx] = this.ambientTemperature;
-          this.wakeThermalChunk(x, y);
-          this.wakeThermalChunk(destX, destY);
-        }
-        this.liquidVel[dIdx] = 0;
-        this.liquidVel[idx] = 0;
         this.wakeChunk(x, y);
         this.wakeChunk(destX, destY);
         this.markRenderDirty(x, y);
@@ -1220,6 +1877,18 @@ export class PixelEngine {
             let into: MaterialType | undefined;
             if (def.freezesAt !== undefined && t <= def.freezesAt) into = def.freezesInto;
             else if (def.meltsAt !== undefined && t >= def.meltsAt) into = def.meltsInto;
+
+            // Fragmentation: a ballistic cell (has velocity) below `fragmentsAt`
+            // becomes granular tephra. Velocity is the sole criterion — it
+            // distinguishes pressure-launched ejecta from host-placed cells and
+            // from grounded conduit lava. No airborneness check: a fountain is a
+            // dense stream where each cell has lava below it, so requiring EMPTY
+            // below would prevent fragmentation entirely.
+            if (into === undefined && hasFragmentation[def.id] && t <= def.fragmentsAt!
+                && this.velX !== null && (this.velX[idx] | this.velY![idx])) {
+              into = def.fragmentsInto;
+            }
+
             if (into === undefined) continue;
 
             // A mobile material freezing into an immobile one must be resting
@@ -1242,13 +1911,730 @@ export class PixelEngine {
             // freshly-set rock straight to ambient grey, losing the fade from
             // red-hot that is most of what makes a cooling flow read as one.
             // `setMaterial` does reset it, so this must be written after.
+
+            // Fragmentation preserves momentum: capture velocity before
+            // setMaterial zeroes it, then restore after — the same capture/
+            // restore pattern used for heat below. Only fragmentation does this;
+            // every other phase change (LAVA→ROCK, WATER→ICE) correctly clears
+            // velocity via setMaterial, since the product is at rest.
+            const isFragment = hasFragmentation[def.id] && into === def.fragmentsInto;
+            let fragVx = 0, fragVy = 0, fragRx = 0, fragRy = 0;
+            if (isFragment && this.velX) {
+              fragVx = this.velX[idx]; fragVy = this.velY![idx];
+              fragRx = this.velRemX![idx]; fragRy = this.velRemY![idx];
+            }
+
             this.setMaterial(x, y, into);
             heat[idx] = t;
+
+            // Restore the fragment's inherited momentum. It will move on the
+            // next frame's velocity pass (the heat step is the last pass this
+            // frame, so there is a one-frame delay before the fragment flies —
+            // which reads naturally as the fragment appearing at the vent).
+            if (isFragment && this.velX && (fragVx | fragVy)) {
+              const vx = this.velX, vy = this.velY!, rx = this.velRemX!, ry = this.velRemY!;
+              vx[idx] = fragVx; vy[idx] = fragVy;
+              rx[idx] = fragRx; ry[idx] = fragRy;
+              this.velCells.add(idx);
+            }
             this.wakeThermalChunk(x, y);
           }
         }
       }
     }
+  }
+
+  // ------------------------------------------------------------------ growth
+
+  /**
+   * Allocate {@link growthGrid}. Idempotent.
+   *
+   * Unlike {@link allocHeat} a plain zero-fill is correct: `0` means "no growth
+   * state", which is what every cell that has never grown should read as.
+   */
+  private allocGrowth(): Uint16Array {
+    if (this.growthGrid) return this.growthGrid;
+    return (this.growthGrid = new Uint16Array(this.width * this.height));
+  }
+
+  /**
+   * Allocate the velocity field and its sub-cell remainders. Idempotent.
+   * Zero-fill is correct: `0` means "at rest", which is what every cell that has
+   * never been impulsed should read as.
+   */
+  private allocVelocity(): void {
+    if (this.velX) return;
+    const n = this.width * this.height;
+    this.velX = new Int8Array(n);
+    this.velY = new Int8Array(n);
+    this.velRemX = new Int8Array(n);
+    this.velRemY = new Int8Array(n);
+  }
+
+  /**
+   * Place a growing cell and seed its state.
+   *
+   * For a {@link TipRule} material this is the difference between a tip that
+   * grows and one that sits inert: a tip with zero energy terminates on its
+   * first tick. Spread and aggregate materials need no state, so for those this
+   * is just {@link setMaterial}.
+   *
+   * @param energy  Growth budget, 0–127. Roughly the trunk length in cells.
+   * @param dir     Initial heading as a gravity-relative octant. Default 0 (up,
+   *                which on a planet means radially outward).
+   * @param variant Genome, 0–15. Default: rolled from the engine RNG.
+   */
+  plant(
+    x: number,
+    y: number,
+    mat: MaterialType,
+    opts?: { energy?: number; dir?: Octant; variant?: number },
+  ): void {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
+    this.setMaterial(x, y, mat);
+    const rule = materialDefs[mat].growth;
+    if (rule === undefined || rule.kind !== 'tip') return;
+    const g = this.allocGrowth();
+    const variant = opts?.variant ?? Math.floor(this.random() * 16);
+    g[this.getIndex(x, y)] = packGrowth(opts?.energy ?? 12, opts?.dir ?? 0, 0, variant);
+  }
+
+  /** Growth state at `(x, y)`, or `null` if the cell has none. */
+  getGrowthState(
+    x: number,
+    y: number,
+  ): { energy: number; dir: Octant; gen: number; variant: number } | null {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return null;
+    const g = this.growthGrid;
+    if (!g) return null;
+    const word = g[this.getIndex(x, y)];
+    return word === 0 ? null : unpackGrowth(word);
+  }
+
+  /** Overwrite the growth state at `(x, y)`. Allocates {@link growthGrid}. */
+  setGrowthState(
+    x: number,
+    y: number,
+    s: { energy: number; dir: Octant; gen?: number; variant?: number },
+  ): void {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
+    const g = this.allocGrowth();
+    g[this.getIndex(x, y)] = packGrowth(s.energy, s.dir, s.gen ?? 0, s.variant ?? 0);
+  }
+
+  /**
+   * Rebuild {@link growthCells} from the grid.
+   *
+   * Membership is a pure function of the grid, so this restores it exactly —
+   * which is what a host needs after loading a serialized world. A world
+   * reconstructed this way grows identically to the one it was saved from,
+   * because the candidate set carries no information the grid does not.
+   */
+  rebuildGrowthCells(): void {
+    this.growthCells.clear();
+    const n = this.width * this.height;
+    for (let i = 0; i < n; i++) {
+      if (hasGrowth[this.grid[i]]) this.growthCells.add(i);
+    }
+  }
+
+  /**
+   * Growth events (spawns, advances, transformations) in the last frame.
+   *
+   * Feeds settle detection alongside {@link swapsLastFrame}: a world with a
+   * tree still growing in it is not settled, and a turn-based host waiting on
+   * {@link beginSettle} should keep waiting.
+   */
+  get growthEventsLastFrame(): number {
+    return this._growthEventsThisFrame;
+  }
+
+  /**
+   * The growth pass: spreading, directed tips, and contact aggregation.
+   *
+   * Runs **outside** the checkerboard scan, and that placement is the whole
+   * design. Three facts about the movement core make an in-scan growth branch
+   * unworkable, and one pass fixes all three:
+   *
+   *  1. `runCheckerboardUpdate` skips sleeping chunks. Growth is spontaneous —
+   *     it has no imbalance to be woken by — so a settled world would simply
+   *     stop growing, which is exactly the "place water, walk away, come back
+   *     to a forest" case the feature exists for.
+   *  2. Static materials never reach the scan's interaction block; they are
+   *     rejected at the top by {@link isImmobile}. Every plant is static.
+   *  3. A supported `needsSupport` cell `continue`s before interactions too, so
+   *     anything rooted would never dispatch.
+   *
+   * Out here, cost is proportional to {@link growthCells} — the amount of life
+   * in the world — rather than to grid area, and a world with none pays a
+   * single `size` test per frame.
+   *
+   * The pass iterates a **snapshot sorted by cell index**. The snapshot means a
+   * cell created this tick does not act until the next one, so a whole tree
+   * cannot appear in a single frame. Sorting by index rather than relying on
+   * `Set` insertion order means growth is reproducible from a *serialized
+   * grid*, not merely from an identical run.
+   */
+  private runGrowth(): void {
+    // Before any RNG draw: a world with nothing alive in it must not perturb
+    // the shared random stream, or "opt-in" would not be byte-identical.
+    if (this.growthCells.size === 0) return;
+    if (this.frameCount % this.growthInterval !== 0) return;
+
+    const snapshot = Array.from(this.growthCells);
+    snapshot.sort((a, b) => a - b);
+    this._growthTouched.clear();
+
+    for (let i = 0; i < snapshot.length; i++) {
+      const idx = snapshot[i];
+      const mat = this.grid[idx] as MaterialType;
+      const rule = materialDefs[mat].growth;
+      if (rule === undefined) {
+        // Stale entry: a reaction overwrote this cell with a direct grid write.
+        // See the note on `growthCells` — these can only ever be spurious.
+        this.growthCells.delete(idx);
+        continue;
+      }
+      // A cell another growth cell already wrote to this tick has had its turn.
+      if (this._growthTouched.has(idx)) continue;
+
+      const x = idx % this.width;
+      const y = (idx - x) / this.width;
+
+      let acted = false;
+      if (rule.kind === 'spread') acted = this.stepSpread(idx, x, y, rule);
+      else if (rule.kind === 'tip') acted = this.stepTip(idx, x, y, mat, rule);
+      else acted = this.stepAggregate(idx, x, y, rule);
+
+      if (acted) this._growthEventsThisFrame++;
+    }
+  }
+
+  /**
+   * Isotropic spreading. Returns true if it spawned.
+   *
+   * Every eligibility test is applied at the **target**, which is what actually
+   * bounds a patch: a source-side crowding check leaves the frontier expanding
+   * at the same final extent and only slows the interior down.
+   */
+  private stepSpread(idx: number, x: number, y: number, rule: SpreadRule): boolean {
+    const g = this.growthGrid;
+    const word = g ? g[idx] : 0;
+    let vigour = (word >> GROWTH_VIGOUR_SHIFT) & GROWTH_ENERGY_MASK;
+
+    if (g) {
+      const backoff = word & GROWTH_ENERGY_MASK;
+      if (backoff > 0) {
+        // Re-arm if anything moved nearby. The movement activity set is already
+        // exactly the "something changed in this region" signal, so this costs
+        // one array read instead of a neighbour scan on every setMaterial.
+        const cx = Math.floor(x / this.CHUNK_SIZE);
+        const cy = Math.floor(y / this.CHUNK_SIZE);
+        if (this.activeChunks[cy * this.chunkWidth + cx]) {
+          g[idx] = vigour << GROWTH_VIGOUR_SHIFT;
+        } else {
+          g[idx] = (backoff - 1) | (vigour << GROWTH_VIGOUR_SHIFT);
+          return false;
+        }
+      }
+    }
+
+    // A cell touching what it needs is refreshed to full range; one that isn't
+    // lives off what its parent passed down. At zero it has run out of reach.
+    if (rule.needs !== undefined) {
+      if (this.neighborhoodHasAll(x, y, rule.needs)) vigour = rule.range ?? 1;
+      if (vigour === 0) {
+        this.backOff(idx, vigour);
+        return false;
+      }
+    }
+
+    fillNeighborFrame(x, y, this.gravity, this._growthFrame);
+    const dirs = rule.directions ?? ALL_OCTANTS;
+    const intoMats = rule.intoMaterial;
+    const targets = this._growthTargets;
+    targets.length = 0;
+
+    for (let d = 0; d < dirs.length; d++) {
+      octantOffset(this._growthFrame, dirs[d], this._growthOffset);
+      const tx = x + this._growthOffset.dx;
+      const ty = y + this._growthOffset.dy;
+      if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) continue;
+      const tIdx = this.getIndex(tx, ty);
+      if (this._growthTouched.has(tIdx)) continue;
+      const tMat = this.grid[tIdx];
+      if (intoMats ? !intoMats.includes(tMat) : tMat !== MaterialType.EMPTY) continue;
+      if (rule.tempRange && !this.inTempRange(tIdx, rule.tempRange)) continue;
+      if (rule.needsFooting && !this.hasFooting(tx, ty, rule.into)) continue;
+      if (
+        rule.maxNeighbors !== undefined &&
+        this.countNeighbors(tx, ty, rule.into) > rule.maxNeighbors
+      ) {
+        continue;
+      }
+      targets.push(tIdx);
+    }
+
+    if (targets.length === 0) {
+      this.backOff(idx, vigour);
+      return false;
+    }
+
+    if (this.random() >= rule.chance) return false;
+
+    // Uniform among the eligible, not first-past-the-post: taking the first
+    // eligible target would comb a patch in whichever direction `directions`
+    // happens to list first, which is visible as streaking.
+    const pick =
+      targets.length === 1 ? targets[0] : targets[Math.floor(this.random() * targets.length)];
+    const px = pick % this.width;
+    const py = (pick - px) / this.width;
+    this.setMaterial(px, py, rule.into);
+    this._growthTouched.add(pick);
+    // The child inherits one less reach than its parent had.
+    if (vigour > 1) {
+      this.allocGrowth()[pick] = (vigour - 1) << GROWTH_VIGOUR_SHIFT;
+    }
+    if (rule.becomes !== undefined) this.setMaterial(x, y, rule.becomes);
+    else if (this.growthGrid) this.growthGrid[idx] = vigour << GROWTH_VIGOUR_SHIFT;
+    return true;
+  }
+
+  /** Double a spread cell's wait, preserving its reach. See {@link GROWTH_BACKOFF_MAX}. */
+  private backOff(idx: number, vigour: number): void {
+    const g = this.growthGrid ?? this.allocGrowth();
+    const prev = g[idx] & GROWTH_ENERGY_MASK;
+    const next = Math.min(GROWTH_BACKOFF_MAX, prev === 0 ? 1 : prev * 2);
+    g[idx] = next | (vigour << GROWTH_VIGOUR_SHIFT);
+  }
+
+  /**
+   * Directed growth. Returns true if the tip advanced or terminated.
+   *
+   * The tip advances one cell along its heading, converts the cell it vacated
+   * into {@link TipRule.becomes}, and spends a unit of energy. Out of energy or
+   * out of room, it terminates. **A tip always resolves** — it never simply
+   * waits — which is why a forest converges instead of filling the grid.
+   */
+  private stepTip(
+    idx: number,
+    x: number,
+    y: number,
+    mat: MaterialType,
+    rule: TipRule,
+  ): boolean {
+    const g = this.growthGrid ?? this.allocGrowth();
+    const word = g[idx];
+    const energy = word & GROWTH_ENERGY_MASK;
+    const dir0 = (word >> GROWTH_DIR_SHIFT) & 7;
+    const gen = (word >> GROWTH_GEN_SHIFT) & 3;
+    const variant = (word >> GROWTH_VARIANT_SHIFT) & 15;
+
+    // Outside its temperature band a tip pauses rather than dying: a cold snap
+    // should stall a forest, not kill it.
+    if (rule.tempRange && !this.inTempRange(idx, rule.tempRange)) return false;
+
+    if (energy === 0) {
+      this.terminateTip(x, y, dir0, rule);
+      return true;
+    }
+
+    fillNeighborFrame(x, y, this.gravity, this._growthFrame);
+
+    // Wobble is a deviation for *this step*, not a turn. The base heading is
+    // kept and re-stored below, so a trunk jogs and comes back to its axis. Let
+    // the wobble accumulate instead and the heading random-walks with no
+    // restoring force: measured on a 26-energy tree, one early wobble was
+    // enough to lock the trunk onto a 45° diagonal for its whole life, which
+    // gave a sprawl across the ground rather than a tree.
+    let step = dir0;
+    if (rule.wobble !== undefined && rule.wobble > 0 && this.random() < rule.wobble) {
+      step = (dir0 + (this.random() < 0.5 ? 7 : 1)) & 7;
+    }
+
+    const headings = this._growthHeadings;
+    headings.length = 0;
+    headings.push(step, (step + 7) & 7, (step + 1) & 7);
+    if (rule.preferOpen) this.sortByOpenness(x, y, headings, step);
+
+    const intoMats = rule.intoMaterial;
+    const stepOpen = this.tipCanEnter(x, y, step, intoMats);
+    for (let h = 0; h < headings.length; h++) {
+      const heading = headings[h];
+      octantOffset(this._growthFrame, heading, this._growthOffset);
+      const odx = this._growthOffset.dx;
+      const ody = this._growthOffset.dy;
+      const tx = x + odx;
+      const ty = y + ody;
+      if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) continue;
+      const tIdx = this.getIndex(tx, ty);
+      if (this._growthTouched.has(tIdx)) continue;
+      const tMat = this.grid[tIdx];
+      if (intoMats ? !intoMats.includes(tMat) : tMat !== MaterialType.EMPTY) continue;
+
+      // Only a genuine blockage rewrites the heading. Wobble and `preferOpen`
+      // are decisions about *this step*; letting either of them stick makes the
+      // heading random-walk with no restoring force, and a single early
+      // deviation then owns the rest of the limb — measured before this split,
+      // one wobble on frame 3 sent a 24-energy trunk off at 45° for its entire
+      // life. Growing around a rock, by contrast, should stick, or the tip
+      // butts into the same rock forever.
+      const nextDir = stepOpen ? dir0 : heading;
+
+      // Trunk first, then the tip moves into the target. Order matters:
+      // `setMaterial` clears the growth word, so the state has to be written
+      // after the material, not before.
+      this.setMaterial(x, y, rule.becomes);
+      if (needsSupport[rule.becomes] && odx !== 0 && ody !== 0) {
+        this.braceDiagonal(x, y, odx, ody, rule.becomes);
+      }
+      this.setMaterial(tx, ty, mat);
+      g[tIdx] = packGrowth(energy - 1, nextDir, gen, variant);
+      this._growthTouched.add(tIdx);
+
+      // Branches fork from the node just vacated, so a limb leaves the trunk
+      // rather than the growing point, and off the *base* heading rather than
+      // off a wobble.
+      this.branchFrom(x, y, mat, rule, energy, dir0, gen, variant);
+      if (rule.foliage && this.random() < rule.foliage.chance) {
+        this.scatterFoliage(x, y, rule.foliage.into);
+      }
+      return true;
+    }
+
+    this.terminateTip(x, y, dir0, rule);
+    return true;
+  }
+
+  /** True if a tip at `(x, y)` could step to `heading`. */
+  private tipCanEnter(
+    x: number,
+    y: number,
+    heading: number,
+    intoMats: MaterialType[] | undefined,
+  ): boolean {
+    octantOffset(this._growthFrame, heading, this._growthOffset);
+    const tx = x + this._growthOffset.dx;
+    const ty = y + this._growthOffset.dy;
+    if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) return false;
+    const tIdx = this.getIndex(tx, ty);
+    if (this._growthTouched.has(tIdx)) return false;
+    const tMat = this.grid[tIdx];
+    return intoMats ? intoMats.includes(tMat) : tMat === MaterialType.EMPTY;
+  }
+
+  /**
+   * Fill the corner beside a diagonal step, so a limb is cardinally connected.
+   *
+   * A diagonal chain of trunk cells touches only at the corners, and the
+   * support test {@link MaterialDef.needsSupport} runs is cardinal-only — so a
+   * 45° limb is unsupported along its whole length and collapses as fast as it
+   * is written. Traced on a 24-energy tree: the tip stepped up-right from the
+   * base, and the trunk cell it left behind on the *next* step had empty cells
+   * on all four sides and fell one row on the following frame, every time.
+   *
+   * Bracing fills one of the two corner cells, each of which is cardinally
+   * adjacent to both the cell just vacated and the one the tip is moving into,
+   * so the limb is connected however it turns. This is the same rule pixel art
+   * uses for diagonal lines, and it costs one cell per diagonal step.
+   *
+   * It cannot be conditional on the current cell being unsupported: the cell
+   * that ends up dangling is the one written on the *following* step, which
+   * does not exist yet.
+   */
+  private braceDiagonal(x: number, y: number, dx: number, dy: number, mat: MaterialType): void {
+    // Step out, then up: the lower corner reads as a thicker joint at the fork,
+    // which is where a real limb carries its load.
+    const outX = x + dx;
+    if (
+      outX >= 0 && outX < this.width &&
+      this.grid[this.getIndex(outX, y)] === MaterialType.EMPTY
+    ) {
+      this.setMaterial(outX, y, mat);
+      this._growthTouched.add(this.getIndex(outX, y));
+      return;
+    }
+    const upY = y + dy;
+    if (
+      upY >= 0 && upY < this.height &&
+      this.grid[this.getIndex(x, upY)] === MaterialType.EMPTY
+    ) {
+      this.setMaterial(x, upY, mat);
+      this._growthTouched.add(this.getIndex(x, upY));
+    }
+  }
+
+  /** Convert a spent or blocked tip into its terminal material, with canopy and seed. */
+  private terminateTip(x: number, y: number, dir: number, rule: TipRule): void {
+    this.setMaterial(x, y, rule.terminal);
+
+    const canopy = rule.canopy;
+    if (canopy) {
+      const r = canopy.radius;
+      // Rounded, not the square a Chebyshev radius would give: a crown made of
+      // literal blocks reads as scenery someone stamped, and the corners are
+      // what give it away.
+      const r2 = r * r + r;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          if (dx * dx + dy * dy > r2) continue;
+          const cx = x + dx;
+          const cy = y + dy;
+          if (cx < 0 || cx >= this.width || cy < 0 || cy >= this.height) continue;
+          if (this.grid[this.getIndex(cx, cy)] !== MaterialType.EMPTY) continue;
+          this.setMaterial(cx, cy, canopy.into);
+        }
+      }
+    }
+
+    const seeds = rule.seeds;
+    if (seeds && this.random() < seeds.chance) {
+      octantOffset(this._growthFrame, dir, this._growthOffset);
+      const sx = x + this._growthOffset.dx;
+      const sy = y + this._growthOffset.dy;
+      if (
+        sx >= 0 && sx < this.width && sy >= 0 && sy < this.height &&
+        this.grid[this.getIndex(sx, sy)] === MaterialType.EMPTY
+      ) {
+        this.setMaterial(sx, sy, seeds.into);
+      }
+    }
+  }
+
+  /** Fork one or more branches from the node at `(x, y)`. */
+  private branchFrom(
+    x: number,
+    y: number,
+    mat: MaterialType,
+    rule: TipRule,
+    energy: number,
+    dir: number,
+    gen: number,
+    variant: number,
+  ): void {
+    const turns = rule.branchTurns;
+    if (turns === undefined || turns.length === 0) return;
+    if (gen >= (rule.maxGen ?? 3)) return;
+    if (energy < (rule.branchMinEnergy ?? 4)) return;
+
+    const childEnergy = Math.floor(energy * (rule.branchTaper ?? 0.6));
+    if (childEnergy <= 0) return;
+
+    // The genome masks which turns this individual may take, so one material
+    // yields systematically different silhouettes — a tree that only ever
+    // branches left is a different tree, not just a different roll. A variant
+    // that would disable every available turn is read as "all of them", so no
+    // plant is condemned to grow as a bare stick.
+    const turnMask = (1 << Math.min(4, turns.length)) - 1;
+    let enabled = variant & turnMask;
+    if (enabled === 0) enabled = turnMask;
+
+    for (let t = 0; t < turns.length; t++) {
+      if (t < 4 && (enabled & (1 << t)) === 0) continue;
+      // Regular pinnae (a frond) or stochastic limbs (a tree) — this is the
+      // whole difference between the fern and the tree silhouette.
+      const fires =
+        rule.branchEvery !== undefined
+          ? energy % rule.branchEvery === 0
+          : this.random() < (rule.branchChance ?? 0);
+      if (!fires) continue;
+
+      const heading = (dir + turns[t] + 8) & 7;
+      octantOffset(this._growthFrame, heading, this._growthOffset);
+      const bx = x + this._growthOffset.dx;
+      const by = y + this._growthOffset.dy;
+      if (bx < 0 || bx >= this.width || by < 0 || by >= this.height) continue;
+      const bIdx = this.getIndex(bx, by);
+      if (this._growthTouched.has(bIdx)) continue;
+      if (this.grid[bIdx] !== MaterialType.EMPTY) continue;
+
+      this.setMaterial(bx, by, mat);
+      this.allocGrowth()[bIdx] = packGrowth(childEnergy, heading, gen + 1, variant);
+      this._growthTouched.add(bIdx);
+    }
+  }
+
+  /** Drop a leaf beside a branch node, where one would actually stay put. */
+  private scatterFoliage(x: number, y: number, into: MaterialType): void {
+    const targets = this._growthTargets;
+    targets.length = 0;
+    for (let d = 0; d < 8; d++) {
+      octantOffset(this._growthFrame, d, this._growthOffset);
+      const fx = x + this._growthOffset.dx;
+      const fy = y + this._growthOffset.dy;
+      if (fx < 0 || fx >= this.width || fy < 0 || fy >= this.height) continue;
+      const fIdx = this.getIndex(fx, fy);
+      if (this._growthTouched.has(fIdx)) continue;
+      if (this.grid[fIdx] !== MaterialType.EMPTY) continue;
+      targets.push(fIdx);
+    }
+    if (targets.length === 0) return;
+    const pick =
+      targets.length === 1 ? targets[0] : targets[Math.floor(this.random() * targets.length)];
+    const px = pick % this.width;
+    const py = (pick - px) / this.width;
+    this.setMaterial(px, py, into);
+    this._growthTouched.add(pick);
+  }
+
+  /** Contact transformation: accretion, and germination. Returns true if it fired. */
+  private stepAggregate(idx: number, x: number, y: number, rule: AggregateRule): boolean {
+    if (rule.tempRange && !this.inTempRange(idx, rule.tempRange)) return false;
+    if (!this.neighborhoodHasAny(x, y, rule.contact)) return false;
+    if (this.random() >= rule.chance) return false;
+
+    this.setMaterial(x, y, rule.into);
+    this._growthTouched.add(idx);
+
+    const state = rule.state;
+    if (state) {
+      const g = this.allocGrowth();
+      const variant =
+        state.variant === 'random'
+          ? Math.floor(this.random() * 16)
+          : (state.variant ?? 0);
+      g[idx] = packGrowth(state.energy, state.dir === 'up' ? 0 : state.dir, 0, variant);
+    }
+    return true;
+  }
+
+  /** True if every material in `mats` appears in the 8-neighbourhood of `(x, y)`. */
+  private neighborhoodHasAll(x: number, y: number, mats: MaterialType[]): boolean {
+    for (let m = 0; m < mats.length; m++) {
+      let found = false;
+      for (let dy = -1; dy <= 1 && !found; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= this.width || ny < 0 || ny >= this.height) continue;
+          if (this.grid[this.getIndex(nx, ny)] === mats[m]) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  }
+
+  /** True if any material in `mats` appears in the 8-neighbourhood of `(x, y)`. */
+  private neighborhoodHasAny(x: number, y: number, mats: MaterialType[]): boolean {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= this.width || ny < 0 || ny >= this.height) continue;
+        if (mats.includes(this.grid[this.getIndex(nx, ny)])) return true;
+      }
+    }
+    return false;
+  }
+
+  /** How many of the 8 neighbours of `(x, y)` hold `mat`. */
+  private countNeighbors(x: number, y: number, mat: MaterialType): number {
+    let n = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= this.width || ny < 0 || ny >= this.height) continue;
+        if (this.grid[this.getIndex(nx, ny)] === mat) n++;
+      }
+    }
+    return n;
+  }
+
+  /**
+   * True if `(x, y)` has something under it, gravity-relative.
+   *
+   * Reads `down` from the frame of the cell currently being grown, which is one
+   * step away — close enough at this scale, and it keeps the check to a single
+   * lookup. Off the grid counts as footing, matching {@link getMaterial}'s
+   * out-of-bounds-is-WALL convention, so a lawn does not unravel at the edges.
+   *
+   * `exclude` is what the caller is growing, and it does not count as ground.
+   * Letting a material stand on itself turns "must have something under it"
+   * into no constraint at all after the first cell: grass grew a footing for
+   * its own next cell and went up in one-wide columns instead of sideways.
+   * Excluding it is what keeps ground cover a single layer following terrain.
+   */
+  private hasFooting(x: number, y: number, exclude: MaterialType): boolean {
+    const bx = x + this._growthFrame.down.dx;
+    const by = y + this._growthFrame.down.dy;
+    if (bx < 0 || bx >= this.width || by < 0 || by >= this.height) return true;
+    const below = this.grid[this.getIndex(bx, by)];
+    return below !== MaterialType.EMPTY && below !== exclude;
+  }
+
+  /** True if cell `idx`'s temperature is inside `[min, max]`. */
+  private inTempRange(idx: number, range: [number, number]): boolean {
+    const t = this.heatGrid ? this.heatGrid[idx] : this._ambientTemperature;
+    return t >= range[0] && t <= range[1];
+  }
+
+  /** Empty cells within a two-step probe along `heading`, stopping at the first block. */
+  private openness(x: number, y: number, heading: number): number {
+    octantOffset(this._growthFrame, heading, this._growthOffset);
+    const dx = this._growthOffset.dx;
+    const dy = this._growthOffset.dy;
+    let open = 0;
+    for (let d = 1; d <= 2; d++) {
+      const tx = x + dx * d;
+      const ty = y + dy * d;
+      if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) break;
+      if (this.grid[this.getIndex(tx, ty)] !== MaterialType.EMPTY) break;
+      open++;
+    }
+    return open;
+  }
+
+  /**
+   * Order candidate headings by how much open space lies ahead of each.
+   *
+   * The cheap cellular reduction of space colonization's premise that what
+   * shapes a canopy is competition for room. Ties break toward the current
+   * heading and then by ascending octant — an explicit total order, because
+   * leaving ties to `Array.prototype.sort` would make deterministic growth
+   * depend on the engine's sort implementation.
+   */
+  private sortByOpenness(x: number, y: number, headings: number[], dir: number): void {
+    const n = headings.length;
+    const scores = this._growthScores;
+    scores.length = 0;
+    for (let i = 0; i < n; i++) scores.push(this.openness(x, y, headings[i]));
+
+    // Insertion sort: n is 3, and it keeps the tiebreak explicit and readable.
+    for (let i = 1; i < n; i++) {
+      const h = headings[i];
+      const s = scores[i];
+      let j = i - 1;
+      while (j >= 0 && this.headingBefore(h, s, headings[j], scores[j], dir)) {
+        headings[j + 1] = headings[j];
+        scores[j + 1] = scores[j];
+        j--;
+      }
+      headings[j + 1] = h;
+      scores[j + 1] = s;
+    }
+  }
+
+  /** Strict "a sorts before b" for {@link sortByOpenness}. */
+  private headingBefore(
+    a: number,
+    aScore: number,
+    b: number,
+    bScore: number,
+    dir: number,
+  ): boolean {
+    if (aScore !== bScore) return aScore > bScore;
+    if (a === dir) return b !== dir;
+    if (b === dir) return false;
+    return a < b;
   }
 
   private clearUpdatedInActiveChunks(): void {
@@ -1278,18 +2664,30 @@ export class PixelEngine {
   /**
    * Advance the simulation one frame.
    *
-   * Step order (preserved from the original engine):
+   * Step order:
    *  1. Clear `updated` flags within active chunks; bump frame counter.
-   *  2. Swap active/next chunk buffers.
-   *  3. Run the 2×2 checkerboard update (4 passes, frame-alternating
+   *  2. Swap active/next chunk buffers (movement + thermal).
+   *  3. Drain queued pressure injections. No-op when the queue is empty.
+   *     Runs before falling so the `updated` flags it sets on the path and
+   *     outlet take effect: a freshly extruded cell is not pulled back down
+   *     the conduit this frame.
+   *  4. Run the 2×2 checkerboard update (4 passes, frame-alternating
    *     horizontal scan) — material interactions, gas rising, falling +
    *     liquid flow, all gravity-relative.
-   *  4. Fire deferred explosions (from FGAS ignition, etc.).
-   *  5. Update settle bookkeeping.
+   *  5. Run liquid levelling, then heat (+ internal phase changes), then
+   *     growth. Each acts on where the previous steps left the material.
+   *  6. Fire deferred explosions (from FGAS ignition, etc.).
+   *  7. Update settle bookkeeping.
    */
   update(): void {
     this.clearUpdatedInActiveChunks();
     this._swapsThisFrame = 0;
+    this._growthEventsThisFrame = 0;
+    this._pressureMovesThisFrame = 0;
+    this._pressureCellsVisitedThisFrame = 0;
+    this._blockedInjectionsThisFrame = 0;
+    this._fracturesThisFrame = 0;
+    this._velocityMovesThisFrame = 0;
     this.frameCount++;
     const deferredExplosions: { x: number; y: number }[] = [];
 
@@ -1308,6 +2706,16 @@ export class PixelEngine {
       this.nextThermalChunks.fill(0);
     }
 
+    // Velocity runs before pressure, so a cell impulsed last frame (e.g. at a
+    // pressure outlet in 6B) gets to move before the updated flags are cleared
+    // for this frame. No-op when the active set is empty.
+    this.runVelocityStep();
+
+    // Pressure runs before ordinary falling, so the `updated` flags it sets on
+    // the path and outlet take effect: a freshly extruded cell is not pulled
+    // straight back down the conduit this frame. No-op when the queue is empty.
+    this.runPressureInjections();
+
     this.runCheckerboardUpdate(deferredExplosions);
     // Falling and reactions resolve first; levelling then acts on where they
     // left the liquid, which is the correct physical order.
@@ -1315,6 +2723,9 @@ export class PixelEngine {
     // Heat last, so it acts on where the material actually ended up this
     // frame rather than on where it started. No-op when heat is disabled.
     this.runHeatStep();
+    // Growth after heat, so a temperature-gated rule reads this frame's
+    // temperature rather than last frame's. No-op when nothing is alive.
+    this.runGrowth();
 
     for (const pt of deferredExplosions) {
       this.explode(pt.x, pt.y, 8, 3);
@@ -1322,7 +2733,12 @@ export class PixelEngine {
 
     if (this._settling) {
       this._settleFrameCount++;
-      const gridStable = this._swapsThisFrame < 5;
+      // A world with a tree still growing in it is not settled, even if nothing
+      // is moving. Backoff dormancy is what keeps this from being a trap: a
+      // mature field emits no growth events, so it still reaches a dead stop.
+      const gridStable = this._swapsThisFrame < 5
+        && this._growthEventsThisFrame === 0
+        && this._velocityMovesThisFrame === 0;
       if (gridStable) {
         this._stableFrames++;
       } else {
@@ -1336,6 +2752,970 @@ export class PixelEngine {
         this._settling = false;
       }
     }
+  }
+
+  // --------------------------------------------------------------- velocity (6A)
+  //
+  // Ballistic movement: each frame, a cell with nonzero velocity attempts to
+  // move along its velocity vector under gravity and drag, using a sub-cell
+  // remainder so fractional velocities are not truncated. The pass iterates an
+  // active set (not the grid) and draws no RNG, so a world with no velocity is
+  // byte-for-byte identical to one without the field.
+
+  /**
+   * Advance every velocity-bearing cell one frame: integrate gravity and drag,
+   * accumulate sub-cell remainder, and move the cell along its velocity vector.
+   *
+   * Runs before pressure so that a cell impulsed last frame (e.g. at a pressure
+   * outlet) moves before `clearUpdatedInActiveChunks` resets the processed flags
+   * for this frame. Each velocity-driven swap sets `updated=1` on both cells, so
+   * the checkerboard does not re-gravitate the cell this frame — the same
+   * discipline the pressure pass uses.
+   *
+   * Collision rule (V1): a velocity move that hits a non-displaceable cell stops
+   * dead (velocity → 0). No chain pushing or splash — that is a later extension.
+   */
+  private runVelocityStep(): void {
+    if (this.velCells.size === 0 || !this.velX) return;
+
+    const w = this.width;
+    const h = this.height;
+    const vx = this.velX, vy = this.velY!;
+    const rx = this.velRemX!, ry = this.velRemY!;
+    const grid = this.grid;
+    const updated = this.updated;
+    const drag = this.velocityDrag;
+    const frame = this._frame;
+    const probe = this._probeFrame;
+
+    // Snapshot the active set in ascending-index order. A cell that moves during
+    // the pass lands at a new index; the snapshot prevents re-processing it.
+    const snapshot = Array.from(this.velCells).sort((a, b) => a - b);
+
+    for (const idx of snapshot) {
+      if (grid[idx] === MaterialType.EMPTY) { this.velCells.delete(idx); continue; }
+      // Do NOT skip on `updated`: a velocity cell written by the pressure pass
+      // last frame may still have a stale `updated` flag if its chunk was not
+      // active when the flags were cleared. Velocity is the first pass of the
+      // frame, so it is safe to process these cells — the flag will be set by
+      // the velocity move itself, preventing the checkerboard from re-moving.
+      // (Previously this skipped pressure-outlet cells, preventing fountains.)
+
+      let cx = idx % w;
+      let cy = (idx - cx) / w;
+      let curIdx = idx;
+
+      // --- Gravity integration ---
+      // Add gravity to velocity. Direction comes from the gravity model;
+      // magnitude from magnitudeAt (defaulting to 1.0).
+      fillNeighborFrame(cx, cy, this.gravity, frame);
+      const mag = this._magnitudeAt ? this._magnitudeAt(cx, cy) : 1;
+      const gx = frame.down.dx * mag * VELOCITY_GRAVITY_SCALE;
+      const gy = frame.down.dy * mag * VELOCITY_GRAVITY_SCALE;
+      let cvx = Math.max(-127, Math.min(127, vx[curIdx] + Math.trunc(gx)));
+      let cvy = Math.max(-127, Math.min(127, vy[curIdx] + Math.trunc(gy)));
+
+      // --- Drag ---
+      cvx = Math.trunc(cvx * drag);
+      cvy = Math.trunc(cvy * drag);
+
+      // --- Sub-cell remainder + step count ---
+      rx[curIdx] += cvx;
+      ry[curIdx] += cvy;
+      let stepsX = Math.trunc(rx[curIdx] / VELOCITY_CELL_UNIT);
+      let stepsY = Math.trunc(ry[curIdx] / VELOCITY_CELL_UNIT);
+      rx[curIdx] -= stepsX * VELOCITY_CELL_UNIT;
+      ry[curIdx] -= stepsY * VELOCITY_CELL_UNIT;
+
+      // Clamp step count so a single cell cannot traverse the whole grid.
+      const maxSteps = 4;
+      if (stepsX > maxSteps) stepsX = maxSteps;
+      if (stepsX < -maxSteps) stepsX = -maxSteps;
+      if (stepsY > maxSteps) stepsY = maxSteps;
+      if (stepsY < -maxSteps) stepsY = -maxSteps;
+
+      // --- Bresenham-style multi-cell move ---
+      // Walk the dominant axis one cell at a time, alternating to the minor axis
+      // via error accumulation, so a diagonal velocity produces a diagonal stair.
+      const absX = Math.abs(stepsX);
+      const absY = Math.abs(stepsY);
+      const total = Math.max(absX, absY);
+      const stepX = stepsX === 0 ? 0 : Math.sign(stepsX);
+      const stepY = stepsY === 0 ? 0 : Math.sign(stepsY);
+      let err = absX - absY;
+
+      for (let s = 0; s < total; s++) {
+        // Bresenham error update: step the minor axis when the error crosses zero.
+        err -= absY;
+        let dx = 0, dy = 0;
+        if (err < 0 && absY > 0) {
+          dy = stepY;
+          err += absX;
+        } else {
+          dx = stepX;
+        }
+        // If both axes have steps and they're equal, step diagonally.
+        if (absX > 0 && absY > 0 && err >= 0) { dx = stepX; }
+        if (dx === 0 && dy === 0) break;
+
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx < 0 || nx >= w || ny < 0 || ny >= h) break;
+
+        // Can the parcel move into the target? Allow EMPTY, less-dense material,
+        // OR the same material (a fountain cell punching through a liquid column
+        // of its own kind). The same-material case is what lets a pressure-
+        // launched lava cell rise through the conduit fill above the vent —
+        // without it, the routed lava blocks the fountain. Unlike the checkerboard,
+        // we do NOT check `updated` on the target.
+        const nIdx = ny * w + nx;
+        const nMat = grid[nIdx];
+        const curMat = grid[curIdx];
+        if (nMat === MaterialType.EMPTY
+          || materialDefs[curMat].density > materialDefs[nMat].density
+          || nMat === curMat) {
+          // Perform the swap. This transfers velocity to the target cell and
+          // clears it from the source (via swap's exchange). Both cells are
+          // marked updated.
+          this.swap(cx, cy, nx, ny);
+          curIdx = nIdx;
+          cx = nx; cy = ny;
+          this._velocityMovesThisFrame++;
+        } else {
+          // Collision: stop dead. Zero velocity and break.
+          cvx = 0; cvy = 0;
+          break;
+        }
+        if (updated[curIdx]) break; // already processed this frame
+      }
+
+      // Write back the integrated velocity. If it reached zero, remove from the
+      // active set (and clear the remainder so it starts clean if re-impulsed).
+      vx[curIdx] = cvx;
+      vy[curIdx] = cvy;
+      if (cvx | cvy) {
+        this.velCells.add(curIdx);
+        // Remove the old index from the set if the cell moved.
+        if (curIdx !== idx) this.velCells.delete(idx);
+      } else {
+        this.velCells.delete(curIdx);
+        if (curIdx !== idx) this.velCells.delete(idx);
+        rx[curIdx] = 0; ry[curIdx] = 0;
+      }
+    }
+    void probe;
+  }
+
+  // --------------------------------------------------------------- pressure
+  //
+  // Connected pressure transport: route an injected liquid volume from its
+  // source through a contiguous body of the same liquid to a real boundary
+  // outlet, accounting for gravitational head and path resistance. The design
+  // is documented in docs/plan-pressure.md; this is its Phase 2 (one-shot
+  // lava injection). V1 is lava-only: a material without `pressureResistance`
+  // is rejected before any search starts.
+  //
+  // The router is a bounded Dijkstra search. It draws no RNG, so a world that
+  // never injects is byte-for-byte identical to one without the feature, and a
+  // world that does inject is deterministic from the request stream alone.
+
+  /**
+   * Queue a liquid injection for the next {@link update}. Returns a request id
+   * that correlates with the later {@link InjectionResult}.
+   *
+   * This is a new API style for the engine: existing host methods mutate
+   * immediately, but pressure must drain inside `update` so that processed
+   * flags, chunk wake-up, routing, and ordinary movement share one
+   * deterministic transaction. Requests are drained FIFO in public-call order;
+   * that order is part of the "same seed + same sequence of public calls"
+   * determinism contract. Reversing two competing requests is allowed (and
+   * tested) to reverse their outcome.
+   */
+  injectLiquid(request: LiquidInjection): number {
+    const id = this._nextRequestId++;
+    this._injectionQueue.push({
+      id,
+      req: {
+        x: request.x,
+        y: request.y,
+        material: request.material,
+        amount: Math.max(0, Math.floor(request.amount)),
+        pressure: Math.max(0, request.pressure),
+        temperature: request.temperature,
+        color: request.color,
+      },
+    });
+    return id;
+  }
+
+  /**
+   * Drain and return the injection results accumulated during the last
+   * {@link update}. The returned array is reused; copy it if you need to keep
+   * it across calls.
+   */
+  consumeInjectionResults(): readonly InjectionResult[] {
+    const out = this._injectionResults;
+    this._injectionResults = [];
+    return out;
+  }
+
+  /** Pressure path shifts performed during the most recent {@link update}. */
+  get pressureMovesLastFrame(): number {
+    return this._pressureMovesThisFrame;
+  }
+
+  /** Cells visited by pressure routing during the most recent {@link update}. */
+  get pressureCellsVisitedLastFrame(): number {
+    return this._pressureCellsVisitedThisFrame;
+  }
+
+  /** Injection requests blocked in whole or part during the last update. */
+  get blockedInjectionsLastFrame(): number {
+    return this._blockedInjectionsThisFrame;
+  }
+
+  /** Solid cells fractured by pressure during the last update. */
+  get fracturesLastFrame(): number {
+    return this._fracturesThisFrame;
+  }
+
+  // ----------------------------------------------------------- velocity (6A)
+
+  /**
+   * Set a cell's velocity directly, in fixed-point sub-cell units (see
+   * {@link VELOCITY_CELL_UNIT}). Replaces any existing velocity. Allocates the
+   * velocity field on first use. Values are clamped to ±127 to prevent `Int8`
+   * wraparound. A velocity of zero removes the cell from the active set.
+   */
+  setVelocity(x: number, y: number, vx: number, vy: number): void {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
+    this.allocVelocity();
+    const idx = this.getIndex(x, y);
+    const cx = Math.max(-127, Math.min(127, Math.trunc(vx)));
+    const cy = Math.max(-127, Math.min(127, Math.trunc(vy)));
+    this.velX![idx] = cx;
+    this.velY![idx] = cy;
+    // Remainder is reset — a fresh velocity starts from a clean fractional slate.
+    this.velRemX![idx] = 0;
+    this.velRemY![idx] = 0;
+    if (cx | cy) this.velCells.add(idx);
+    else this.velCells.delete(idx);
+  }
+
+  /**
+   * Add to a cell's existing velocity (impulse = additive delta). Allocates the
+   * velocity field on first use. The result is clamped to ±127. An impulse that
+   * brings velocity to zero removes the cell from the active set.
+   */
+  applyImpulse(x: number, y: number, dvx: number, dvy: number): void {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
+    this.allocVelocity();
+    const idx = this.getIndex(x, y);
+    const cx = Math.max(-127, Math.min(127, this.velX![idx] + Math.trunc(dvx)));
+    const cy = Math.max(-127, Math.min(127, this.velY![idx] + Math.trunc(dvy)));
+    this.velX![idx] = cx;
+    this.velY![idx] = cy;
+    if (cx | cy) this.velCells.add(idx);
+    else { this.velCells.delete(idx); this.velRemX![idx] = 0; this.velRemY![idx] = 0; }
+  }
+
+  /** Read a cell's velocity. Returns `{0, 0}` when the field is unallocated. */
+  getVelocity(x: number, y: number): { vx: number; vy: number } {
+    if (!this.velX || x < 0 || x >= this.width || y < 0 || y >= this.height) return { vx: 0, vy: 0 };
+    const idx = this.getIndex(x, y);
+    return { vx: this.velX[idx], vy: this.velY![idx] };
+  }
+
+  /** Velocity-driven moves performed during the most recent {@link update}. */
+  get velocityMovesLastFrame(): number {
+    return this._velocityMovesThisFrame;
+  }
+
+  /** Cells with nonzero velocity (the active-velocity set size). */
+  get activeVelocityCount(): number {
+    return this.velCells.size;
+  }
+
+  /**
+   * Register a persistent pressure source. Each {@link update} the source
+   * accrues whole-cell volume in `pending` at `rate` and available head at
+   * `pressureRate`, then routes as much pending volume as its head allows
+   * through the connected body. While blocked, both accrue up to their caps;
+   * when an outlet opens the backlog releases as a bounded surge.
+   *
+   * Sources are processed in creation order each frame, which is another
+   * explicit part of the call-sequence determinism contract. Returns an id for
+   * {@link removePressureSource}.
+   *
+   * This is the steady-flow controller the one-shot {@link injectLiquid} is
+   * intentionally awkward as: no host call is needed every frame to maintain
+   * the rate, and pressure accumulated behind a block is not discarded.
+   */
+  addPressureSource(opts: PressureSourceOptions): number {
+    const id = this._nextSourceId++;
+    this._pressureSources.push({
+      id,
+      x: opts.x,
+      y: opts.y,
+      material: opts.material,
+      rate: Math.max(0, opts.rate),
+      pressureRate: Math.max(0, opts.pressureRate),
+      maxPressure: Math.max(0, opts.maxPressure),
+      maxPending: Math.max(0, opts.maxPending),
+      temperature: opts.temperature,
+      outletVelocityEfficiency: Math.max(0, Math.min(1, opts.outletVelocityEfficiency ?? OUTLET_VELOCITY_EFFICIENCY)),
+      pending: 0,
+      pendingRem: 0,
+      availablePressure: 0,
+    });
+    return id;
+  }
+
+  /**
+   * Remove a persistent source. Accrual stops immediately; material already in
+   * the grid is not deleted. A removed id is not reused.
+   */
+  removePressureSource(id: number): void {
+    const i = this._pressureSources.findIndex(s => s.id === id);
+    if (i >= 0) this._pressureSources.splice(i, 1);
+  }
+
+  /**
+   * Read a source's accumulated `pending` volume and available pressure. Returns
+   * `null` if the id is not a live source.
+   */
+  getPressureSourceState(id: number): PressureSourceState | null {
+    const s = this._pressureSources.find(s => s.id === id);
+    if (!s) return null;
+    return {
+      id: s.id, x: s.x, y: s.y, material: s.material,
+      pending: s.pending, availablePressure: s.availablePressure,
+    };
+  }
+
+  /**
+   * Allocate the Dijkstra scratch arrays on first use. Sized to the grid, so a
+   * pressure-free world pays nothing.
+   */
+  private allocPressureScratch(): void {
+    if (this._pressVisited) return;
+    const n = this.width * this.height;
+    this._pressVisited = new Uint32Array(n);
+    this._pressCost = new Float64Array(n);
+    this._pressParent = new Int32Array(n);
+    this._pressHops = new Int32Array(n);
+    // The heap never holds more cells than the visited ceiling, but sizing it
+    // to the grid is simpler and the allocation is one-time.
+    this._pressHeap = new Int32Array(n);
+    this._pressHeapCost = new Float64Array(n);
+  }
+
+  /** Min-heap push. */
+  private _heapPush(idx: number, cost: number): void {
+    const heap = this._pressHeap!;
+    const hCost = this._pressHeapCost!;
+    let i = this._pressHeapSize++;
+    heap[i] = idx;
+    hCost[i] = cost;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (hCost[parent] <= hCost[i]) break;
+      const ti = heap[i]; heap[i] = heap[parent]; heap[parent] = ti;
+      const tc = hCost[i]; hCost[i] = hCost[parent]; hCost[parent] = tc;
+      i = parent;
+    }
+  }
+
+  /** Min-heap pop. Returns the cell index, or -1 if empty. */
+  private _heapPop(): number {
+    const heap = this._pressHeap!;
+    const hCost = this._pressHeapCost!;
+    if (this._pressHeapSize === 0) return -1;
+    const top = heap[0];
+    const size = --this._pressHeapSize;
+    heap[0] = heap[size];
+    hCost[0] = hCost[size];
+    let i = 0;
+    for (;;) {
+      const l = 2 * i + 1, r = 2 * i + 2;
+      let smallest = i;
+      if (l < size && hCost[l] < hCost[smallest]) smallest = l;
+      if (r < size && hCost[r] < hCost[smallest]) smallest = r;
+      if (smallest === i) break;
+      const ti = heap[i]; heap[i] = heap[smallest]; heap[smallest] = ti;
+      const tc = hCost[i]; hCost[i] = hCost[smallest]; hCost[smallest] = tc;
+      i = smallest;
+    }
+    return top;
+  }
+
+  /**
+   * Process every queued injection in FIFO order. Each request's volumes are
+   * routed one at a time against the live grid; a request stops at its first
+   * rejected volume and reports the remainder as blocked.
+   *
+   * Routing draws no RNG — it is a pure function of the grid and the request
+   * — so the only determinism-relevant ordering is the public-call order of
+   * {@link injectLiquid}, which the queue preserves.
+   */
+  private runPressureInjections(): void {
+    if (this._injectionQueue.length === 0 && this._pressureSources.length === 0) return;
+    this.allocPressureScratch();
+
+    // Snapshot the queue: routing does not enqueue further requests, but taking
+    // a stable copy keeps the contract explicit if that ever changes.
+    const queue = this._injectionQueue;
+    this._injectionQueue = [];
+
+    for (const { id, req } of queue) {
+      let accepted = 0;
+      let blocked = 0;
+      let maxCost = 0;
+      let reason: InjectionRejectionReason | undefined;
+
+      // Pre-flight rejections that cost no search.
+      const srcMat = this.getMaterial(req.x, req.y);
+      if (!hasPressure[req.material]) {
+        reason = 'unsupportedMaterial';
+        blocked = req.amount;
+      } else if (this._potentialAt === null) {
+        reason = 'missingPotential';
+        blocked = req.amount;
+      } else if (srcMat !== req.material && srcMat !== MaterialType.EMPTY) {
+        reason = 'incompatibleSource';
+        blocked = req.amount;
+      } else {
+        // Route volumes one at a time. Each accepted shift mutates the grid, so
+        // the next volume searches the new state.
+        let stopped = false;
+        for (let v = 0; v < req.amount && !stopped; v++) {
+          const r = this._routeOneVolume(req);
+          if (r.kind === 'accepted') {
+            accepted++;
+            // One-shot: convert surplus to outlet velocity. No source to deduct
+            // from, so the kinetic head is not reclaimed — the energy comes from
+            // the one-shot budget, not an accumulator.
+            this._applyOutletVelocity(r, req.pressure);
+            if (r.cost > maxCost) maxCost = r.cost;
+          } else {
+            stopped = true;
+            reason = r.reason;
+            blocked = req.amount - v;
+          }
+        }
+      }
+
+      if (blocked > 0) this._blockedInjectionsThisFrame++;
+      this._injectionResults.push({
+        requestId: id,
+        requested: req.amount,
+        accepted,
+        blocked,
+        maxCost,
+        reason,
+      });
+    }
+
+    // Persistent sources, processed in creation order. Each source accrues
+    // volume and pressure, then routes as much pending volume as its head
+    // allows. This is the steady-flow controller the one-shot API is
+    // intentionally awkward as: no host call is needed every frame, and
+    // pressure accumulated behind a block is not discarded.
+    if (this._pressureSources.length > 0) {
+      this._runPressureSources();
+    }
+  }
+
+  /**
+   * Advance every persistent source one frame: accrue, then route. Source
+   * creation order is the processing order, and is part of the call-sequence
+   * determinism contract.
+   */
+  private _runPressureSources(): void {
+    for (const s of this._pressureSources) {
+      // Accrue whole-cell volume, with a fixed-point remainder for rates < 1.
+      s.pendingRem += s.rate;
+      const grown = Math.floor(s.pendingRem);
+      s.pendingRem -= grown;
+      s.pending = Math.min(s.pending + grown, s.maxPending);
+      // Accrue available head, capped. Represents continuous pumping; spent by
+      // successful routes below.
+      s.availablePressure = Math.min(s.availablePressure + s.pressureRate, s.maxPressure);
+
+      if (s.pending <= 0) continue;
+
+      // Pre-flight: unsupported material / missing potential / incompatible
+      // source skip routing but keep the accrued state for next frame.
+      const srcMat = this.getMaterial(s.x, s.y);
+      if (!hasPressure[s.material] || this._potentialAt === null) continue;
+      if (srcMat !== s.material && srcMat !== MaterialType.EMPTY) continue;
+
+      // Route pending volume one cell at a time against the source's
+      // accumulated head. Each accepted volume deducts its path cost from the
+      // available pressure; a rejection stops the source for this frame and
+      // leaves the remaining pending volume + pressure for next frame.
+      let accepted = 0;
+      let maxCost = 0;
+      const req: LiquidInjection = {
+        x: s.x, y: s.y, material: s.material,
+        amount: 1, pressure: s.availablePressure,
+        temperature: s.temperature,
+      };
+      while (s.pending > 0 && s.availablePressure > 0) {
+        req.pressure = s.availablePressure;
+        const r = this._routeOneVolume(req);
+        if (r.kind === 'accepted') {
+          accepted++;
+          s.pending--;
+          // Convert surplus head to outlet velocity (Torricelli), and deduct
+          // both transport cost and kinetic head from the source's available
+          // pressure. This closes the energy double-count: the head that became
+          // velocity is not available to launch the next parcel.
+          const kineticHead = this._applyOutletVelocity(r, s.availablePressure, s.outletVelocityEfficiency);
+          s.availablePressure = Math.max(0, s.availablePressure - r.cost - kineticHead);
+          if (r.cost > maxCost) maxCost = r.cost;
+        } else {
+          // No affordable liquid outlet. Try to fracture a reachable solid
+          // boundary: convert the weakest affordable one to the source material,
+          // consuming pressure equal to its strength. The converted cell opens
+          // a path that routing will find on a subsequent frame (or the next
+          // loop iteration, since the grid has changed). The doc specifies
+          // retry "on the next frame"; in practice the converted cell is
+          // immediately traversable, so the loop re-enters and routes through
+          // it this frame. The per-frame fracture cap bounds the work.
+          const fractured = this._tryFracture(s);
+          if (!fractured) break; // nothing to break; stop for this frame
+        }
+      }
+
+      if (accepted > 0) {
+        this._injectionResults.push({
+          requestId: s.id,
+          requested: accepted,
+          accepted,
+          blocked: 0,
+          maxCost,
+          reason: undefined,
+        });
+      }
+    }
+  }
+
+  /**
+   * Find the weakest affordable solid boundary of the source's connected liquid
+   * body and fracture it: convert the solid to the source material, deduct its
+   * `pressureStrength` from the source's available pressure, and count it
+   * against the per-frame fracture cap. Returns `true` if a cell was fractured.
+   *
+   * The boundary scan is a bounded flood fill from the source, not a Dijkstra —
+   * fracture does not need a cost-optimal path, only reachability. The flood
+   * reuses the pressure scratch arrays' generation stamp so it costs no full
+   * clear.
+   */
+  private _tryFracture(s: PressureSource): boolean {
+    if (this._fracturesThisFrame >= this.fracturePerFrame) return false;
+    if (s.availablePressure <= 0) return false;
+
+    const w = this.width;
+    const h = this.height;
+    const mat = s.material;
+    const gen = ++this._pressGen;
+    const visited = this._pressVisited!;
+    const srcIdx = this.getIndex(s.x, s.y);
+
+    // If the source cell itself is empty, there is no body to flood from.
+    if (this.grid[srcIdx] !== mat) return false;
+
+    // Flood fill the connected liquid body, collecting opted-in solid
+    // boundaries. Track the weakest affordable one (lowest strength that the
+    // available pressure exceeds), breaking ties by lowest cell index for
+    // determinism.
+    let weakestIdx = -1;
+    let weakestStrength = Infinity;
+    const stack = this._pressHeap!; // reuse as a LIFO stack
+    let stackTop = 0;
+    stack[0] = srcIdx;
+    visited[srcIdx] = gen;
+    let visitedCount = 1;
+
+    while (stackTop >= 0) {
+      const cur = stack[stackTop--];
+      const cx = cur % w;
+      const cy = (cur - cx) / w;
+      // Four cardinal neighbours.
+      const nbs: number[] = [];
+      if (cx > 0) nbs.push(cur - 1);
+      if (cx < w - 1) nbs.push(cur + 1);
+      if (cy > 0) nbs.push(cur - w);
+      if (cy < h - 1) nbs.push(cur + w);
+
+      for (const nb of nbs) {
+        const nbMat = this.grid[nb];
+        if (nbMat === mat) {
+          if (visited[nb] !== gen) {
+            visited[nb] = gen;
+            visitedCount++;
+            if (visitedCount > this.pressureVisitLimit) {
+              // Flood exceeded the ceiling: stop expanding, but still fracture
+              // from the boundaries found so far rather than silently aborting.
+              continue;
+            }
+            stack[++stackTop] = nb;
+          }
+        } else if (nbMat !== MaterialType.EMPTY && hasPressureStrength[nbMat]) {
+          // Solid boundary that opted into fracture.
+          const strength = materialDefs[nbMat].pressureStrength!;
+          if (
+            s.availablePressure > strength &&
+            (strength < weakestStrength ||
+              (strength === weakestStrength && nb < weakestIdx))
+          ) {
+            weakestStrength = strength;
+            weakestIdx = nb;
+          }
+        }
+      }
+    }
+
+    if (weakestIdx < 0) return false;
+
+    // Fracture: convert the solid to the source material, opening the conduit.
+    // This conserves mass (the rock becomes part of the flow) rather than
+    // deleting it. The converted cell carries the source temperature if set.
+    const fx = weakestIdx % w;
+    const fy = (weakestIdx - fx) / w;
+    this.setMaterial(fx, fy, mat);
+    if (this.heatGrid && s.temperature !== undefined) {
+      this.heatGrid[weakestIdx] = s.temperature;
+      this.wakeThermalChunk(fx, fy);
+    }
+    // Consume pressure equal to the strength, so a weakened source stops
+    // breaking until it has accumulated more.
+    s.availablePressure = Math.max(0, s.availablePressure - weakestStrength);
+    this._fracturesThisFrame++;
+    this._pressureMovesThisFrame++;
+    return true;
+  }
+
+  /** The first volume into an EMPTY source cell materializes that cell. */
+  private _seedSource(req: LiquidInjection): boolean {
+    const idx = this.getIndex(req.x, req.y);
+    if (this.grid[idx] !== MaterialType.EMPTY) return false;
+    this.setMaterial(req.x, req.y, req.material);
+    // `setMaterial` set the heat to spawnTemp (or ambient); override with the
+    // requested temperature if the host supplied one. Mirrors how `_shiftPath`
+    // seeds the injected parcel at p0.
+    if (this.heatGrid && req.temperature !== undefined) {
+      this.heatGrid[idx] = req.temperature;
+      this.wakeThermalChunk(req.x, req.y);
+    }
+    if (req.color !== undefined) {
+      if (!this.colorGrid) this.colorGrid = new Uint32Array(this.width * this.height);
+      this.colorGrid[idx] = req.color;
+    }
+    this.updated[idx] = 1;
+    this._pressureMovesThisFrame++;
+    return true;
+  }
+
+  /**
+   * Route a single whole-cell volume from the request's source to the cheapest
+   * affordable outlet, or report why it could not. The search is a bounded
+   * Dijkstra over cardinal neighbours.
+   *
+   * @returns `{ kind: 'accepted', cost, outlet, path }` on success, or
+   *          `{ kind: 'rejected', reason }`.
+   */
+  private _routeOneVolume(
+    req: LiquidInjection,
+  ):
+    | { kind: 'accepted'; cost: number; outletIdx: number; path: number[] }
+    | { kind: 'rejected'; reason: InjectionRejectionReason } {
+    const pot = this._potentialAt!;
+    const w = this.width;
+    const h = this.height;
+    const mat = req.material;
+    const resistance = materialDefs[mat].pressureResistance!;
+    const pressure = req.pressure;
+    const gen = ++this._pressGen;
+    const visited = this._pressVisited!;
+    const cost = this._pressCost!;
+    const parent = this._pressParent!;
+    const hops = this._pressHops!;
+    this._pressHeapSize = 0;
+
+    // If the source is empty, the first volume seeds it (an explicit source
+    // creation that costs no route head). Subsequent volumes then route through
+    // the newly seeded body.
+    const srcIdx = this.getIndex(req.x, req.y);
+    if (this.grid[srcIdx] === MaterialType.EMPTY) {
+      this._seedSource(req);
+      return { kind: 'accepted', cost: 0, outletIdx: srcIdx, path: [srcIdx] };
+    }
+
+    // Track the cheapest affordable outlet discovered. An outlet is an EMPTY
+    // cardinal neighbour of a traversed liquid cell; its candidate cost is the
+    // path cost to its parent plus the final edge cost. We evaluate outlets
+    // lazily as cells are settled, which is correct because Dijkstra settles
+    // cells in nondecreasing cost order — the first affordable outlet found at
+    // a given cost tier is globally cheapest up to the tiebreak.
+    let bestOutlet = -1;
+    let bestOutletCost = Infinity;
+    let bestOutletParent = -1;
+    let anyOutletSeen = false; // distinguishes `noOutlet` from `insufficientHead`
+    let searchLimited = false;
+
+    visited[srcIdx] = gen;
+    cost[srcIdx] = 0;
+    parent[srcIdx] = -1;
+    hops[srcIdx] = 0;
+    this._heapPush(srcIdx, 0);
+
+    let visitedCount = 1;
+
+    while (this._pressHeapSize > 0) {
+      const cur = this._heapPop();
+      const curCost = cost[cur];
+
+      // First-push-wins Dijkstra: each cell is pushed at most once per search
+      // (see `if (visited[nb] === gen) continue` below), so there are no stale
+      // heap entries to skip. The first time a cell is reached is via its
+      // cheapest predecessor, because the heap yields cells in cost order.
+
+      // Once the settled cost exceeds the pressure budget, no cheaper outlet
+      // remains reachable (Dijkstra invariant), so stop.
+      if (curCost > pressure) break;
+
+      // Expand the four cardinal neighbours in ascending-index order (-x, +x,
+      // -y, +y) so the tiebreak is a pure function of cell indices.
+      const cx = cur % w;
+      const cy = (cur - cx) / w;
+      const neighbours: number[] = [];
+      if (cx > 0) neighbours.push(cur - 1);
+      if (cx < w - 1) neighbours.push(cur + 1);
+      if (cy > 0) neighbours.push(cur - w);
+      if (cy < h - 1) neighbours.push(cur + w);
+
+      for (const nb of neighbours) {
+        const nbMat = this.grid[nb];
+        const nbx = nb % w;
+        const nby = (nb - nbx) / w;
+
+        if (nbMat === MaterialType.EMPTY) {
+          // Outlet candidate. Candidate cost = path cost to `cur` + final edge.
+          anyOutletSeen = true;
+          const potDiff = Math.max(0, pot(nbx, nby) - pot(cx, cy));
+          const candCost = curCost + potDiff + resistance;
+          if (candCost > pressure) continue; // unaffordable; keep searching
+          if (this._outletBetter(candCost, nb, cur, bestOutletCost, bestOutlet, bestOutletParent)) {
+            bestOutletCost = candCost;
+            bestOutlet = nb;
+            bestOutletParent = cur;
+          }
+          continue;
+        }
+
+        if (nbMat !== mat) continue; // V1 does not route through other liquids
+
+        // Traversable liquid neighbour.
+        if (visited[nb] === gen) continue; // already settled or pending
+        const potDiff = Math.max(0, pot(nbx, nby) - pot(cx, cy));
+        const newCost = curCost + potDiff + resistance;
+        if (newCost > pressure) continue; // beyond budget; don't expand
+        visited[nb] = gen;
+        cost[nb] = newCost;
+        parent[nb] = cur;
+        hops[nb] = hops[cur] + 1;
+        visitedCount++;
+        this._pressureCellsVisitedThisFrame++;
+        if (visitedCount > this.pressureVisitLimit) {
+          searchLimited = true;
+          break;
+        }
+        this._heapPush(nb, newCost);
+      }
+      if (searchLimited) break;
+
+      // Early exit: if the cheapest affordable outlet has been found and the
+      // next cell to settle would cost at least as much, no better outlet can
+      // appear (Dijkstra invariant). The outlet's parent is already settled, so
+      // a cheaper path to it cannot turn up later.
+      if (bestOutlet >= 0 && this._pressHeapSize > 0) {
+        if (this._pressHeapCost![0] >= bestOutletCost) break;
+      }
+    }
+
+    if (searchLimited) {
+      // Never accept a partial candidate: a valid outlet may lie beyond the
+      // ceiling, so report the limit honestly.
+      return { kind: 'rejected', reason: 'searchLimit' };
+    }
+    if (bestOutlet < 0) {
+      // No affordable outlet. `anyOutletSeen` distinguishes the two physical
+      // cases: a sealed body (no EMPTY neighbour anywhere) from one whose
+      // outlets all cost more than the pressure budget.
+      return { kind: 'rejected', reason: anyOutletSeen ? 'insufficientHead' : 'noOutlet' };
+    }
+
+    // Reconstruct the path source -> ... -> bestOutletParent.
+    const path: number[] = [];
+    let node = bestOutletParent;
+    while (node >= 0) {
+      path.push(node);
+      node = parent[node];
+    }
+    path.reverse(); // source first
+
+    this._shiftPath(req, path, bestOutlet);
+    return { kind: 'accepted', cost: bestOutletCost, outletIdx: bestOutlet, path };
+  }
+
+  /**
+   * Tiebreak for outlet selection. Order: lower total cost, then shorter path
+   * (fewer hops to the parent), then lower destination index, then lower
+   * predecessor index. A total order with no dependence on `Math.random`,
+   * frame parity, or sort stability — see docs/plan-pressure.md.
+   */
+  private _outletBetter(
+    candCost: number, candOutlet: number, candParent: number,
+    bestCost: number, bestOutlet: number, bestParent: number,
+  ): boolean {
+    if (candCost !== bestCost) return candCost < bestCost;
+    const candHops = this._pressHops![candParent] + 1;
+    const bestHops = bestParent >= 0 ? this._pressHops![bestParent] + 1 : Infinity;
+    if (candHops !== bestHops) return candHops < bestHops;
+    if (candOutlet !== bestOutlet) return candOutlet < bestOutlet;
+    return candParent < bestParent;
+  }
+
+  /**
+   * Shift parcel state along the path into the outlet and write the injected
+   * parcel at the source. For path `p0..pn = bestOutletParent` and outlet `d`:
+   * copy `pn -> d`, walk backward `p(n-1) -> pn`, …, then write the injected
+   * parcel into `p0`. Material count rises by exactly one.
+   *
+   * `liquidVel` is cleared on every touched cell: a pressure route is not a
+   * surface flow, and a parcel carried up a conduit must not inherit a lateral
+   * preference that was meaningful only in the geometry it left.
+   */
+  /**
+   * Convert surplus pressure head to velocity at the outlet cell (Torricelli's
+   * law: v = √(2gh)·efficiency), writing it via {@link setVelocity}. Returns the
+   * kinetic-energy equivalent in head units, so the caller can deduct it from
+   * the source alongside the route cost — closing the energy double-count.
+   *
+   * Below {@link MIN_OUTLET_SURPLUS} no velocity is written (the effusive case:
+   * the cell just extrudes and falls). The direction is the parent→outlet
+   * cardinal vector, which is the conduit's exit heading.
+   *
+   * @param r         The accepted route result (carries outlet index and path).
+   * @param headBefore The source's available pressure *before* cost deduction.
+   * @returns The kinetic head consumed, or 0 if below threshold.
+   */
+  private _applyOutletVelocity(
+    r: { cost: number; outletIdx: number; path: number[] },
+    headBefore: number,
+    efficiency: number = OUTLET_VELOCITY_EFFICIENCY,
+  ): number {
+    const surplus = headBefore - r.cost;
+    if (surplus < MIN_OUTLET_SURPLUS) return 0;
+
+    // Torricelli: speed in cells/frame = √(2 · surplus) · efficiency.
+    const speedCellsPerFrame = Math.sqrt(2 * surplus) * efficiency;
+    const speedFP = Math.round(speedCellsPerFrame * VELOCITY_CELL_UNIT);
+    if (speedFP === 0) return 0;
+
+    // Direction: parent → outlet (the conduit's exit heading), plus a lateral
+    // spread so the fountain fans outward rather than building a spire. The
+    // spread is deterministic — derived from the cell index via a hash, not from
+    // the global RNG — so it does not perturb fire/growth randomness. The spread
+    // magnitude scales with speed: a faster launch spreads wider.
+    const w = this.width;
+    const path = r.path;
+    const pIdx = path[path.length - 1];
+    const px = pIdx % w, py = (pIdx - px) / w;
+    const ox = r.outletIdx % w, oy = (r.outletIdx - ox) / w;
+    // Base direction along the exit heading.
+    let dvx = (ox - px) * speedFP;
+    let dvy = (oy - py) * speedFP;
+    // Lateral spread: a per-cell deterministic angle in [-spread, +spread].
+    // The hash gives a uniform spread; multiplied by speed so faster = wider.
+    const hash = ((r.outletIdx * 2654435761) >>> 0) / 4294967296; // 0..1
+    const lateral = (hash - 0.5) * 2 * speedFP * OUTLET_LATERAL_SPREAD;
+    // Apply lateral along the gravity-perpendicular axis (left/right of the
+    // exit heading). For a vertical exit (dvx=0, dvy≠0), lateral is horizontal.
+    if (dvx === 0) {
+      dvx = Math.round(lateral);
+    } else {
+      dvy = Math.round(lateral);
+    }
+
+    this.setVelocity(ox, oy, dvx, dvy);
+
+    // Kinetic head = v² / (2g), computed from the TOTAL speed (vertical +
+    // lateral), so the source pays for all the kinetic energy it imparts. The
+    // lateral component is not free energy.
+    const totalSpeedCellsPerFrame = Math.sqrt(dvx * dvx + dvy * dvy) / VELOCITY_CELL_UNIT;
+    return (totalSpeedCellsPerFrame * totalSpeedCellsPerFrame) / 2;
+  }
+
+  private _shiftPath(
+    req: LiquidInjection,
+    path: number[],
+    outletIdx: number,
+  ): void {
+    const n = path.length;
+    // Copy pn -> outlet.
+    const pn = path[n - 1];
+    const outletX = outletIdx % this.width;
+    const outletY = (outletIdx - outletX) / this.width;
+    this.copyParcel(pn, outletIdx, outletX, outletY, true);
+
+    // Walk backward: p(i) -> p(i+1) for i from n-2 down to 0.
+    for (let i = n - 2; i >= 0; i--) {
+      const from = path[i];
+      const to = path[i + 1];
+      const toX = to % this.width;
+      const toY = (to - toX) / this.width;
+      this.copyParcel(from, to, toX, toY, true);
+    }
+
+    // Write the injected parcel into p0. `setMaterial` resets heat to the
+    // material's spawnTemp (or ambient); override with the requested temperature
+    // if the host supplied one.
+    const p0 = path[0];
+    const p0X = p0 % this.width;
+    const p0Y = (p0 - p0X) / this.width;
+    this.setMaterial(p0X, p0Y, req.material);
+    if (this.heatGrid && req.temperature !== undefined) {
+      this.heatGrid[p0] = req.temperature;
+      this.wakeThermalChunk(p0X, p0Y);
+    }
+    if (req.color !== undefined) {
+      if (!this.colorGrid) this.colorGrid = new Uint32Array(this.width * this.height);
+      this.colorGrid[p0] = req.color;
+    }
+    this.liquidVel[p0] = 0;
+
+    // Mark every touched cell updated so the checkerboard pass does not pull the
+    // freshly extruded cell back down the conduit this frame, and wake/dirty
+    // every chunk the path crosses. The outlet is touched in addition to the
+    // path cells.
+    for (const idx of path) {
+      this.updated[idx] = 1;
+      const x = idx % this.width;
+      const y = (idx - x) / this.width;
+      this.wakeChunk(x, y);
+      this.markRenderDirty(x, y);
+    }
+    this.updated[outletIdx] = 1;
+    {
+      const x = outletIdx % this.width;
+      const y = (outletIdx - x) / this.width;
+      this.wakeChunk(x, y);
+      this.markRenderDirty(x, y);
+    }
+    this._pressureMovesThisFrame++;
   }
 
   /**
@@ -1389,9 +3769,11 @@ export class PixelEngine {
               if (this.updated[sourceIdx]) continue;
 
               const mat = this.grid[sourceIdx] as MaterialType;
-              if (mat === MaterialType.EMPTY || mat === MaterialType.WALL || mat === MaterialType.ROCK || mat === MaterialType.ICE) continue;
+              if (mat === MaterialType.EMPTY || isImmobile[mat]) continue;
 
-              if (mat === MaterialType.WOOD) {
+              if (needsSupport[mat]) {
+                // Cardinal only, and deliberately so: a diagonally-braced cell
+                // falls. This was WOOD's private rule before LEAF needed it.
                 const hasSupport =
                   this.isStructural(x, y - 1) ||
                   this.isStructural(x, y + 1) ||
@@ -1833,16 +4215,28 @@ export class PixelEngine {
         if (dirX === 0 && dirY === 0) dirY = -1;
       }
 
-      const scatterDist = radius * 0.5 + this.random() * radius * 1.0;
-      const tx = Math.round(centerX + dirX * scatterDist);
-      const ty = Math.round(centerY + dirY * scatterDist);
-
-      if (tx >= 0 && tx < this.width && ty >= 0 && ty < this.height) {
-        if (this.getMaterial(tx, ty) === MaterialType.EMPTY) {
-          this.setMaterial(tx, ty, particle.mat);
+      // Launch the debris from its origin cell (cleared to EMPTY by the gather
+      // loop above) with a velocity impulse, rather than teleporting it to a
+      // guessed destination. The origin cell borders the cleared blast interior,
+      // so the velocity pass can step it outward over subsequent frames until it
+      // hits uncleared terrain and stops. `force` finally matters: it scales the
+      // impulse magnitude.
+      const originX = centerX + particle.dx;
+      const originY = centerY + particle.dy;
+      if (originX >= 0 && originX < this.width && originY >= 0 && originY < this.height) {
+        if (this.getMaterial(originX, originY) === MaterialType.EMPTY) {
+          this.setMaterial(originX, originY, particle.mat);
           if (particle.color !== undefined) {
             if (!this.colorGrid) this.colorGrid = new Uint32Array(this.width * this.height);
-            this.colorGrid[ty * this.width + tx] = particle.color;
+            this.colorGrid[originY * this.width + originX] = particle.color;
+          }
+          // Velocity impulse: outward direction × force × a small randomised
+          // jitter. Explosion is host-invoked and non-frame-driven, so drawing
+          // from the engine RNG here does not perturb per-frame determinism.
+          const speed = Math.round(force * EXPLOSION_VELOCITY_SCALE * (0.7 + this.random() * 0.6));
+          if (speed > 0) {
+            this.applyImpulse(originX, originY,
+              Math.round(dirX * speed), Math.round(dirY * speed));
           }
         }
       }

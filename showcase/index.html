@@ -46,6 +46,8 @@
             <button class="btn brush sandbox-brush" data-mat="5" type="button">Rock</button>
             <button class="btn brush sandbox-brush" data-mat="7" type="button">Fire</button>
             <button class="btn brush sandbox-brush" data-mat="13" type="button">Ice</button>
+            <button class="btn brush sandbox-brush" data-mat="14" type="button">Grass</button>
+            <button class="btn brush sandbox-brush" data-mat="15" type="button">Seed</button>
             <button class="btn brush sandbox-brush brush-erase" data-mat="0" type="button">⌫ Erase</button>
           </div>
 
@@ -66,7 +68,20 @@
         </div>
 
         <div class="stage">
-          <canvas class="sandbox-canvas" aria-label="Flat falling-sand sandbox"></canvas>
+          <div class="viewctl" role="toolbar" aria-label="View controls">
+            <button class="btn viewctl-zoom viewctl-out" type="button" aria-label="Zoom out">−</button>
+            <span class="viewctl-level" aria-live="off">100%</span>
+            <button class="btn viewctl-zoom viewctl-in" type="button" aria-label="Zoom in">+</button>
+            <button class="btn viewctl-fit" type="button">Fit</button>
+            <button class="btn action viewctl-pan" type="button" aria-pressed="false">✋ Pan</button>
+          </div>
+          <p class="hint viewctl-hint">
+            zoomed in, drag to pan with <span class="kbd">✋</span>,
+            <span class="kbd">space</span>, or the <span class="kbd">middle button</span>
+          </p>
+          <div class="canvas-viewport sandbox-viewport">
+            <canvas class="sandbox-canvas" aria-label="Flat falling-sand sandbox"></canvas>
+          </div>
         </div>
       </section>
 
@@ -95,6 +110,8 @@
             <button class="btn brush planet-brush" data-mat="7" type="button">Fire</button>
             <button class="btn brush planet-brush" data-mat="5" type="button">Rock</button>
             <button class="btn brush planet-brush" data-mat="11" type="button">Wood</button>
+            <button class="btn brush planet-brush" data-mat="14" type="button">Grass</button>
+            <button class="btn brush planet-brush" data-mat="15" type="button">Seed</button>
             <button class="btn brush planet-brush brush-erase" data-mat="0" type="button">⌫ Erase</button>
           </div>
 
@@ -130,13 +147,26 @@
               Effusion: <span class="planet-volcano-effusion-value">1</span>
               <input id="planet-volcano-effusion" class="slider planet-volcano-effusion" type="range" min="1" max="5" step="1" value="1" />
             </label>
-            <label class="slider-label" for="planet-volcano-ash">
-              Ash: <span class="planet-volcano-ash-value">8</span>
-              <input id="planet-volcano-ash" class="slider planet-volcano-ash" type="range" min="1" max="16" step="1" value="8" />
-            </label>
             <label class="slider-label" for="planet-volcano-spread">
               Spread: <span class="planet-volcano-spread-value">0.36</span>
               <input id="planet-volcano-spread" class="slider planet-volcano-spread" type="range" min="0.12" max="0.60" step="0.02" value="0.36" />
+            </label>
+            <!-- Temporary fountain/fragmentation tuning sliders (remove after tuning) -->
+            <label class="slider-label" for="planet-volcano-frate">
+              Fountain Rate: <span class="planet-volcano-frate-value">1</span>
+              <input id="planet-volcano-frate" class="slider planet-volcano-frate" type="range" min="0" max="4" step="0.1" value="1" />
+            </label>
+            <label class="slider-label" for="planet-volcano-fpress">
+              Fountain Pressure: <span class="planet-volcano-fpress-value">100</span>
+              <input id="planet-volcano-fpress" class="slider planet-volcano-fpress" type="range" min="20" max="150" step="5" value="100" />
+            </label>
+            <label class="slider-label" for="planet-volcano-frag">
+              Fragmentation: <span class="planet-volcano-frag-value">0.65</span>
+              <input id="planet-volcano-frag" class="slider planet-volcano-frag" type="range" min="0.30" max="0.80" step="0.05" value="0.65" />
+            </label>
+            <label class="slider-label" for="planet-volcano-tstrength">
+              Tephra Strength: <span class="planet-volcano-tstrength-value">6</span>
+              <input id="planet-volcano-tstrength" class="slider planet-volcano-tstrength" type="range" min="2" max="15" step="1" value="6" />
             </label>
           </div>
 
@@ -164,7 +194,20 @@
         </div>
 
         <div class="stage">
-          <canvas class="planet-canvas" aria-label="Radial-gravity planet"></canvas>
+          <div class="viewctl" role="toolbar" aria-label="View controls">
+            <button class="btn viewctl-zoom viewctl-out" type="button" aria-label="Zoom out">−</button>
+            <span class="viewctl-level" aria-live="off">100%</span>
+            <button class="btn viewctl-zoom viewctl-in" type="button" aria-label="Zoom in">+</button>
+            <button class="btn viewctl-fit" type="button">Fit</button>
+            <button class="btn action viewctl-pan" type="button" aria-pressed="false">✋ Pan</button>
+          </div>
+          <p class="hint viewctl-hint">
+            zoomed in, drag to pan with <span class="kbd">✋</span>,
+            <span class="kbd">space</span>, or the <span class="kbd">middle button</span>
+          </p>
+          <div class="canvas-viewport planet-viewport">
+            <canvas class="planet-canvas" aria-label="Radial-gravity planet"></canvas>
+          </div>
           <!--
             Engine workload, not frame rate: cells scanned per tick is
             deterministic and machine-independent, so it is the figure to size
