@@ -116,8 +116,10 @@ when `PixelEngine.runHeatStep` has already put the entire thermal world to
 sleep. This defeats the engine's thermal chunk optimisation and dominates the
 idle high-resolution cost.
 
-It also eagerly allocates `colorGrid`, adding four bytes per cell before a
-volcano or custom tint needs it.
+It also allocates `colorGrid`, adding four bytes per cell. The allocation is
+lazy via `ensureColorGrid`, but because the planet disc is ROCK (which is in the
+scan set), it lands on the first `syncFromHeat` call — before any volcano or
+custom tint actually needs a tint.
 
 ### 2. Rendering is only partially dirty-aware
 
@@ -152,23 +154,33 @@ be left as an incidental benefit of the optional Worker phase.
 
 `surfaceRadiusAt`, `summitRadius`, and calls through `edificeHeight` default to
 a 60-cell search. At 1000×1000 and the default 60% diameter, the initial volcano
-cap (`capStart`) is 90 cells; `capMax` is 198. The query cannot observe even the
-initial target height, breaking cap checks and dormancy before the higher ceiling
-matters.
+cap (`capStart`) is 90 cells; `capMax` is 165 (`capMax` is
+`min(round(planetRadius·0.55), headroom−2)`; with planetRadius 300 and headroom
+200 that is `min(165, 198)` = 165 — 198 is the `headroom−2` bound, which does not
+bind at 60% diameter). The query cannot observe even the 90-cell initial target
+height, breaking cap checks and dormancy before the higher ceiling matters.
 
 ### 7. Higher resolution currently means a larger world, not the same world in
 greater detail
 
-Several behaviours are expressed in absolute cells:
+Several behaviours are expressed in absolute cells (verified against the code):
 
-- brush radius;
-- cloud radius, water capacity, and rain width;
-- tree energy, branch lengths, and canopy radius;
-- grass resource range;
-- volcano ejecta loft, breach thresholds, recharge headroom, and the absolute
-  three-cell cap on its otherwise ratio-derived conduit width;
-- liquid dispersion and lava yield thickness;
-- particle speed, which is effectively one cell per simulation tick.
+- brush radius (a cell count; default 3);
+- cloud radius (7 cells) and per-cell water capacity (60), though rain *width*
+  is already derived from radius (`max(0.5, r·0.8)`), not fixed;
+- tree energy, branch lengths, and canopy radius (energy 10, canopy radius 2);
+- grass resource range (6 cells);
+- among the volcano parameters, most are already `planetRadius` ratios (chamber
+  radius/depth, cap start/step/maximum; ejecta loft and breach thresholds are
+  host-supplied or in head/pressure units). The genuinely fixed cell counts are
+  the cap on the otherwise ratio-derived conduit half-width (3) and the repose
+  feed's 3-cell short-stop below the surface;
+- liquid dispersion (default 16, though per-engine overridable) and lava yield
+  thickness (material default 3, though the host overrides it per-cell from a
+  temperature curve);
+- particle speed, which is one cell per tick for the gravity/checkerboard core
+  but up to four cells per tick for velocity/ballistic cells (explosions,
+  pressure fountains).
 
 If these remain unchanged, a 1000-cell planet will have much smaller trees,
 clouds, brushes, and flow features than the 220-cell reference scene. That may
@@ -213,11 +225,13 @@ The intended frame flow is:
 6. present at 30 FPS in high-resolution mode, while physics remains at 60 ticks
    per second.
 
-The showcase intentionally pauses simulation while the document is hidden and
-discards hidden elapsed time on resume. It does not attempt wall-clock catch-up.
-This is a deliberate showcase power/CPU policy: backgrounding pauses growth,
-rain, cooling, and eruptions. A future game that promises offline progression
-must implement that separately from this rendering scheduler.
+The showcase should pause simulation while the document is hidden and discard
+hidden elapsed time on resume rather than attempting wall-clock catch-up. No
+visibility handling exists in the showcase today — background tabs are merely
+throttled by the browser — so this is a Phase 3 deliverable, not current
+behaviour. It is the intended showcase power/CPU policy: backgrounding pauses
+growth, rain, cooling, and eruptions. A future game that promises offline
+progression must implement that separately from this rendering scheduler.
 
 ## Implementation phases
 
@@ -274,10 +288,13 @@ repeated with the same deterministic inputs and produce comparable reports.
   - an entirely cold planet does not allocate `colorGrid`;
   - colour `0` falls back to the palette and opaque black remains a valid tint.
 
-The heat engine writes a new stored temperature only when its change exceeds
-`HEAT_EPSILON`; the host styles that stored value after the step. The boundary
-tests pin this relationship so a future change to heat-sleep semantics cannot
-leave a tint or stiffness band one step behind.
+The heat engine stores every computed temperature, but it only wakes a thermal
+chunk and marks a cell render-dirty when the change exceeds `HEAT_EPSILON`; the
+host styles that stored value after the step. The boundary tests must pin this
+wake-threshold relationship specifically — a sub-`HEAT_EPSILON` drift *is*
+stored but does not re-wake the chunk, so it will not be re-synced until the
+next above-threshold wake. The tests guard against a future change to heat-sleep
+semantics silently leaving a tint or stiffness band one step behind.
 
 Acceptance: a settled 1000×1000 planet performs no full-grid host scan and heat
 synchronisation cost is proportional to the hot region rather than world area.
