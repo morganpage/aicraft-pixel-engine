@@ -16,6 +16,7 @@ coverage/
 # Editor / agent working state — not project source.
 .zcode/
 .claude/
+.scratch/
 
 # Secrets — never commit.
 .env

@@ -95,6 +95,14 @@ describe('cone profile @2600', () => {
     // the edifice a flat-topped slab with cliff sides rather than a cone.
     // Measured with both in place the mean flank was 46-64°, against roughly 30°
     // for a real cinder cone.
+    //
+    // The same symptom returned as a tower: with a short ballistic range the
+    // cone's width saturates and further growth goes vertical, producing a 57°
+    // spire. The fix is a higher fountain pressure (wider range) and a capMax
+    // held near the range-limited width. This bound rejects both regressions:
+    // the mesa (cliff sides, no taper) and the tower (vertical spire). A cinder
+    // cone sits near 33°; 45° is a generous ceiling that still fails the 57°
+    // tower while tolerating the single-cycle checkpoint's short, broad cone.
     const e = goldenAt(2600);
     const hs = heightProfile(e, CFG);
     const peak = Math.max(...hs);
@@ -109,6 +117,9 @@ describe('cone profile @2600', () => {
     // old plume-built cone. The key property is that it tapers at all rather
     // than being a uniform-height slab.
     expect(meanFlank).toBeGreaterThan(3); // not perfectly flat
+    // ...but not a tower either: the flank must be shallower than a spire. The
+    // 57° tower regression measured 57°; this bound fails it with margin.
+    expect(meanFlank).toBeLessThan(45); // cone, not a vertical spire
   });
 
   it('keeps a crater without letting it become a chasm', () => {
@@ -393,6 +404,39 @@ describe('the eruption cycle', () => {
       expect(routed.coda ?? 0, `${where}: closing ash fall starved`).toBeGreaterThan(40);
     }
   }, 60_000);
+
+  it('keeps a cone profile through the full cap progression, not a tower', () => {
+    // The tower regression: with a ballistic range shorter than the cap, the
+    // cone's width saturates and every later cell of growth goes vertical. At
+    // the top of the old progression (capMax 44, fountainPressure 100) the cone
+    // was a 42-cell edifice on a 28-cell base — a 57° flank, where a cinder cone
+    // sits near 33°. This runs the whole cap progression the way the showcase
+    // does and checks the *final* flank, which is where the tower appears: the
+    // single-cycle golden trajectory never grows tall enough to expose it.
+    const e = buildVolcanoPlanet(CFG, SIZE);
+    stampVolcano(e, CFG);
+    const rng = makeRng(4242);
+    for (let c = 0; ; c++) {
+      const capHeight = Math.min(CAP_START + c * CAP_STEP, CAP_MAX);
+      if (capHeight > CAP_MAX) break;
+      const opts = buildVolcanoOpts(CFG, { ...DEFAULT_VOLCANO_INPUTS, maxHeight: capHeight });
+      const st = createVolcanoState();
+      const runtime: VolcanoRuntime = { erupting: true, capHeight };
+      let f = 0;
+      while (runtime.erupting && f < 2500) { stepVolcanoFrame(e, CFG, st, rng, opts, runtime); f++; }
+      for (let i = 0; i < 150; i++) stepVolcanoFrame(e, CFG, st, rng, opts, runtime);
+      if (capHeight >= CAP_MAX) break;
+    }
+    const hs = heightProfile(e, CFG);
+    const peak = Math.max(...hs);
+    let halfW = 0;
+    for (let i = 0; i < hs.length; i++) if (hs[i] >= 1) halfW = Math.max(halfW, Math.abs(i - 50));
+    const arcPerDeg = (Math.PI / 180) * R;
+    const flank = (Math.atan(peak / Math.max(1, halfW * arcPerDeg)) * 180) / Math.PI;
+    // Cinder cones 28-38°; 45° fails the 57° tower with margin.
+    expect(flank, `final flank ${flank.toFixed(0)}° should be a cone, not a tower`).toBeLessThan(45);
+    expect(peak, 'cone must actually grow').toBeGreaterThan(10);
+  }, 90_000);
 
   it('settles to a dead stop once the eruption ends', () => {
     // Guards every liquid invariant the engine established: an eruption must not

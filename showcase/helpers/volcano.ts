@@ -155,7 +155,17 @@ export function volcanoGeometryFor(
 
   // Room between the surface and the grid edge, less a 2-cell margin so the
   // summit never renders hard against the boundary.
-  const capMax = Math.max(4, Math.min(Math.round(planetRadius * 0.66), headroom - 2));
+  //
+  // Capped well below the available headroom: the cone's width is bounded by
+  // the ballistic range of the fountain ejecta (which inherit their launch
+  // velocity — see the fragmentation capture/restore in the engine), so width
+  // saturates at roughly that range regardless of how much taller the volcano
+  // grows. Past the saturation point every additional cell of height is
+  // vertical, and the cone steepens into a tower. At 0.66·R the four-cycle
+  // progression produced a 42-cell edifice on a 28-cell base — a 57° flank, a
+  // cinder cone is ~33°. Holding capMax near the range-limited width keeps the
+  // final flank in the 30-38° band. Measured at 0.55·R: 36°.
+  const capMax = Math.max(4, Math.min(Math.round(planetRadius * 0.55), headroom - 2));
 
   return {
     cfg: {
@@ -1555,7 +1565,13 @@ export function buildVolcanoOpts(
 export const DEFAULT_VOLCANO_INPUTS: VolcanoOptsInputs = {
   effusion: 1,
   fountainRate: 1,
-  fountainPressure: 100,
+  // High enough that the fountain's ballistic range clears the cone's eventual
+  // base width. At 100 the range is short, ejecta piles near the vent, and the
+  // cone grows up faster than out — the 57° tower. At 600 the arc reaches the
+  // flanks and tephra piles outboard, dropping the final flank to ~36°. This is
+  // floored to `ascent + 20` in buildVolcanoOpts for small cones, so the value
+  // only bites on a fully-grown one.
+  fountainPressure: 600,
   maxHeight: 20,
 };
 

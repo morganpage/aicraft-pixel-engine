@@ -54,7 +54,7 @@ export const VOLCANO_R = 66;
 /** Cap progression values, matching `volcanoGeometryFor` for R=66. */
 export const VOLCANO_CAP_START = 20;
 export const VOLCANO_CAP_STEP = 8;
-export const VOLCANO_CAP_MAX = 44;
+export const VOLCANO_CAP_MAX = 36;
 
 /** The shipping volcano geometry, reproduced exactly by `volcanoGeometryFor`. */
 export const DEFAULT_VOLCANO_CFG: VolcanoConfig = {
