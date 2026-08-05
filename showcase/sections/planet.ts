@@ -43,6 +43,16 @@ import {
   type Cloud,
   type CloudOptions,
 } from '../helpers/cloud';
+import {
+  createVolcanoEffectsState,
+  stepVolcanoEffects,
+  screenToGrid,
+  effectScale,
+  DEFAULT_EFFECT_OPTS,
+  EFFECTS_SEED,
+  type VolcanoEffectsState,
+  type VolcanoEffectMode,
+} from '../helpers/volcano-effects';
 
 /**
  * Per-tick visual rotation when spinning is on, in radians. ~0.2°/tick at
@@ -217,6 +227,12 @@ export function initPlanet(container: HTMLElement): void {
   const ctx = canvas.getContext('2d')!;
 
   const palette = buildPalette(Materials as Record<number, { color: readonly number[] }>);
+
+  // User preference: when set, the eruption's screen shake is suppressed in both
+  // render and pointer compensation, while the DOM-free effects state stays
+  // identical (so deterministic tests are unaffected). Queried once, live.
+  const reduceMotion = () =>
+    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 
   // --- Resolution + diameter sliders --------------------------------------
   // Read before the world exists, because they are what define it.
@@ -398,18 +414,15 @@ export function initPlanet(container: HTMLElement): void {
     // Screen pixel → grid cell, relative to the planet center.
     const px = ((e.clientX - rect.left) / rect.width) * world.size;
     const py = ((e.clientY - rect.top) / rect.height) * world.size;
-    const dx = px - world.cx;
-    const dy = py - world.cy;
-    // The canvas is visually rotated by spinAngle (whether or not it is still
-    // actively spinning — render() rotates unconditionally by the current
-    // angle). To paint what you actually SEE, always un-rotate the click back
-    // into grid space by the inverse rotation (−spinAngle). At angle 0 this
-    // is a no-op, so it's safe even when the planet has never spun.
-    const cos = Math.cos(-spinAngle);
-    const sin = Math.sin(-spinAngle);
-    const rx = dx * cos - dy * sin;
-    const ry = dx * sin + dy * cos;
-    return { x: Math.floor(world.cx + rx), y: Math.floor(world.cy + ry) };
+    // The canvas renders world pixels under a translate(shake) · rotate(spin)
+    // transform (see render). To land the brush on what you actually SEE, invert
+    // both: undo the shake translation, then un-rotate by -spinAngle about the
+    // center. Shake is suppressed under reduced-motion, and the pure helper is
+    // tested independently under Node. At zero shake/angle this is the identity.
+    const sx = reduceMotion() ? 0 : effectsState.shakeX;
+    const sy = reduceMotion() ? 0 : effectsState.shakeY;
+    const g = screenToGrid(px, py, world.cx, world.cy, spinAngle, sx, sy);
+    return { x: Math.floor(g.x), y: Math.floor(g.y) };
   };
 
   // --- Cloud state --------------------------------------------------------
@@ -497,6 +510,21 @@ export function initPlanet(container: HTMLElement): void {
   let volcanoRng = makeRng(VOLCANO_SEED);
   let volcanoState = createVolcanoState();
 
+  // --- Volcano effects state ---------------------------------------------
+  // The ash plume, vent glow, eruption flash, and screen shake. Host-tracked
+  // entities rendered as a canvas overlay (see helpers/volcano-effects.ts for
+  // why they are not engine materials). Owns its own PRNG so puff counts never
+  // perturb the physical eruption's random stream.
+  let effectsState: VolcanoEffectsState = createVolcanoEffectsState();
+  let effectsRng = makeRng(EFFECTS_SEED);
+  // Bumped on every explicit eruption start so the entry flash + shake retrigger
+  // reliably — even across a pause/resume where no tick separates stop and start.
+  let eruptionEpisode = 0;
+  // The effect mode to use when not erupting: 'paused' (user clicked stop) or
+  // 'dormant' (ran its course / scene reset). Both stop emission; the distinction
+  // lets the plume fade out cleanly in either case.
+  let stoppedEffectMode: VolcanoEffectMode = 'dormant';
+
   /**
    * Read the eruption's tuning fresh each tick, so slider changes apply
    * mid-eruption. The cap has to be read live too — "Erupt again" raises it.
@@ -542,6 +570,7 @@ export function initPlanet(container: HTMLElement): void {
   const goDormant = (): void => {
     removeLiveSource();
     erupting = false;
+    stoppedEffectMode = 'dormant';
     setVolcanoLabel('🌋 Erupt again', false);
     phaseLabel.textContent = 'dormant';
   };
@@ -569,12 +598,21 @@ export function initPlanet(container: HTMLElement): void {
     clouds = [];
     cloudRng = makeRng(CLOUD_SEED);
     lastCloudAt = null;
+    // Effects reset the same way: fresh state, re-seeded RNG, no residual puffs,
+    // glow, flash, or shake. `eruptionEpisode` returns to 0 and the next eruption
+    // bumps it to 1, which differs from the reset `previousEpisode` (-1) so the
+    // opening flash + shake fire on the first eruption of a fresh scene.
+    effectsState = createVolcanoEffectsState();
+    effectsRng = makeRng(EFFECTS_SEED);
+    eruptionEpisode = 0;
+    stoppedEffectMode = 'dormant';
   };
 
   volcanoBtn.addEventListener('click', () => {
     if (erupting) {
       removeLiveSource();
       erupting = false;
+      stoppedEffectMode = 'paused';
       setVolcanoLabel('🌋 Erupt again', false);
       phaseLabel.textContent = 'paused';
       volcanoBtn.blur();
@@ -589,6 +627,9 @@ export function initPlanet(container: HTMLElement): void {
     // Restart the cycle on its explosive phase, so resuming opens with a burst
     // rather than picking up mid-flow.
     volcanoState = createVolcanoState();
+    // A new episode makes the effects helper re-fire the entry flash + shake even
+    // across a pause/resume — see helpers/volcano-effects.ts stepVolcanoEffects.
+    eruptionEpisode++;
     erupting = true;
     setVolcanoLabel('🌋 Erupting', true);
     volcanoBtn.blur();
@@ -706,26 +747,126 @@ export function initPlanet(container: HTMLElement): void {
   //
   // Declared as a function rather than a const arrow because rebuild() above
   // calls it before this point in the body.
+
+  /**
+   * Draw the volcanic atmospheric layer (vent glow, ash puffs, eruption flash).
+   * Called inside the rotation transform so grid-space positions ride the spin;
+   * the caller has already applied any shake translation. Pure: every value is
+   * derived from the effects state (puff fields, normalized age, cached vent) —
+   * no `Math.random()` here, so identical state paints identical pixels.
+   */
+  function drawVolcanoEffects(
+    ctx: CanvasRenderingContext2D,
+    state: VolcanoEffectsState,
+    reducedMotion: boolean,
+  ): void {
+    void reducedMotion; // shake is applied by the caller; this draws only overlays.
+
+    // --- Vent glow: a small warm halo at the live vent, fading with phase. ---
+    if (state.glow > 0.01 && state.vent) {
+      const { x, y } = state.vent;
+      const g = state.glow;
+      const r = 4 * effectScale(world.planetR);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grad.addColorStop(0, `rgba(255, 150, 48, ${0.55 * g})`);
+      grad.addColorStop(0.5, `rgba(220, 80, 24, ${0.3 * g})`);
+      grad.addColorStop(1, 'rgba(180, 40, 10, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- Ash puffs: overlapping translucent clusters built from each puff's
+    // deterministic shapeSeed. Low alpha so overlaps build density naturally;
+    // dark ash lightens toward grey as it disperses; a warm-brown tint near the
+    // base (young puffs) connects the column to tephra. No additive blending. ---
+    const puffs = state.puffs;
+    for (let i = 0; i < puffs.length; i++) {
+      const p = puffs[i];
+      // Deterministic lobe offsets from the per-puff seed — drawing the same
+      // state twice yields identical pixels. A 2-3 lobe cluster reads as a
+      // volumetric body rather than a flat disc.
+      const a = (p.shapeSeed & 0xffff) / 65535;
+      const b = ((p.shapeSeed >>> 16) & 0xffff) / 65535;
+      const lobes = [
+        { dx: 0, dy: 0, r: 1 },
+        { dx: (a - 0.5) * p.radius * 0.9, dy: (b - 0.5) * p.radius * 0.9, r: 0.75 },
+        { dx: (b - 0.5) * p.radius * 0.7, dy: (a - 0.5) * p.radius * 0.7, r: 0.6 },
+      ];
+      const young = p.age < p.lifetime * 0.25;
+      for (let l = 0; l < lobes.length; l++) {
+        const lb = lobes[l];
+        const lx = p.x + lb.dx;
+        const ly = p.y + lb.dy;
+        const lr = p.radius * lb.r;
+        if (lr <= 0) continue;
+        // Warm-brown tint for young puffs near the base; plain grey ash after.
+        const cr = young ? Math.min(255, p.shade + 16) : p.shade;
+        const cg = young ? Math.max(0, p.shade * 0.92) : p.shade * 0.96;
+        const cb = young ? Math.max(0, p.shade * 0.78) : p.shade * 0.9;
+        const coreAlpha = p.opacity * 0.9;
+        const edgeAlpha = p.opacity * 0.25;
+        const grad = ctx.createRadialGradient(lx, ly, 0, lx, ly, lr);
+        grad.addColorStop(0, `rgba(${cr | 0}, ${cg | 0}, ${cb | 0}, ${coreAlpha})`);
+        grad.addColorStop(1, `rgba(${cr | 0}, ${cg | 0}, ${cb | 0}, ${edgeAlpha})`);
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(lx, ly, lr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // --- Eruption flash: a brief warm burst localized at the vent on explosive
+    // entry. Squared falloff so it lasts only a few ticks; not full-screen. ----
+    if (state.flash > 0.01 && state.vent) {
+      const { x, y } = state.vent;
+      const a = state.flash * state.flash;
+      const r = 7 * effectScale(world.planetR);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grad.addColorStop(0, `rgba(255, 224, 150, ${0.6 * a})`);
+      grad.addColorStop(0.5, `rgba(255, 140, 40, ${0.3 * a})`);
+      grad.addColorStop(1, 'rgba(200, 60, 10, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
   function render(): void {
     const { engine, img, off, offCtx, size, cx, cy } = world;
     const dirty = engine.consumeRenderDirtyChunks();
     paintGridInto(img.data, engine.grid, engine.colorGrid, size, size, engine.CHUNK_SIZE, dirty, engine.chunkWidth, engine.chunkHeight, palette);
     offCtx.putImageData(img, 0, 0);
 
-    // Visible canvas: clear, rotate about the planet center, draw the grid.
+    // Visible canvas: clear, then composite the grid and all atmospheric layers
+    // under a single transform stack:
+    //   translate(shake) · translate(c) · rotate(spin) · translate(-c)
+    // The shake translation is applied outermost (screen axes), before the
+    // rotation, so the world jitters as a whole rather than rotating about a
+    // displaced center. It shifts rendered pixels, so toGrid() inverts it first
+    // when mapping a click back to grid space. Suppressed under reduced-motion.
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, size, size);
     ctx.save();
+    const rm = reduceMotion();
+    const shX = rm ? 0 : effectsState.shakeX;
+    const shY = rm ? 0 : effectsState.shakeY;
+    if (shX !== 0 || shY !== 0) ctx.translate(shX, shY);
     ctx.translate(cx, cy);
     ctx.rotate(spinAngle);
     ctx.translate(-cx, -cy);
     ctx.drawImage(off, 0, 0);
 
+    drawVolcanoEffects(ctx, effectsState, rm);
+
     // Clouds are drawn while still inside the rotation transform, so drawing in
     // grid coords makes them ride the visual spin automatically — the same trick
     // that keeps painted material aligned under toGrid()'s un-rotation. Each
     // cloud is a soft white disc faded by its remaining water, so it visibly
-    // thins out as it rains down to nothing.
+    // thins out as it rains down to nothing. Drawn OVER the volcanic plume so
+    // weather reads in front of ash.
     for (let i = 0; i < clouds.length; i++) {
       const c = clouds[i];
       const frac = c.initialWater > 0 ? c.water / c.initialWater : 0;
@@ -771,6 +912,11 @@ export function initPlanet(container: HTMLElement): void {
     // The controller mutates runtime.erupting on completion; the UI label and
     // any presentation-only side effects stay here.
     if (erupting) phaseLabel.textContent = PHASE_LABEL[volcanoState.phase] ?? volcanoState.phase;
+    // Capture the effect mode BEFORE stepVolcanoFrame mutates volcanoState.phase
+    // (it advances phases inside the pre-step). Reading it here aligns the plume
+    // with the phase whose physical work appears this tick, not the next one —
+    // a transition to effusive/repose becomes visible the tick it actually begins.
+    const effectMode: VolcanoEffectMode = erupting ? volcanoState.phase : stoppedEffectMode;
     const runtime: VolcanoRuntime = { erupting, capHeight };
     stepVolcanoFrame(engine, volcanoCfg, volcanoState, volcanoRng, volcanoOpts(), runtime);
     if (erupting && !runtime.erupting) {
@@ -779,6 +925,13 @@ export function initPlanet(container: HTMLElement): void {
       goDormant();
     }
     erupting = runtime.erupting;
+    // Step the atmospheric layer (ash plume, glow, flash, shake). Host-only: it
+    // reads summit geometry from the engine but never writes the sim grids, so
+    // the volcano's golden trajectory stays byte-identical.
+    stepVolcanoEffects(
+      engine, volcanoCfg, effectsState, effectsRng,
+      effectMode, eruptionEpisode, DEFAULT_EFFECT_OPTS,
+    );
     if (clouds.length > 0) clouds = removeDead(clouds);
 
     perfMs += performance.now() - t0;
