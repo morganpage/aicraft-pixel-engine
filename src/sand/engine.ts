@@ -796,6 +796,21 @@ export class PixelEngine {
   private _stableFrames = 0;
 
   private _renderDirtyAll = true;
+  /**
+   * Bulk-stamp mode: when true, {@link setMaterial} writes only the material id
+   * (and clears the optional override grids at the touched cell) and skips all
+   * per-cell wake/dirty/heat/growth/velocity bookkeeping. The work those calls
+   * would have done is recovered once, for the whole stamp, by {@link endBulk}
+   * calling {@link markAllDirty}. This exists so constructing a large world
+   * (e.g. a 1000×1000 planet disc) does not pay ~1M per-cell wake+dirty calls.
+   *
+   * Constraint: a bulk stamp assumes each cell spawns at its material's ambient
+   * temperature. That holds for the ROCK disc; any cell that needs a specific
+   * heat must be set with `setMaterial`/`setHeat` after `endBulk()`. Heat is
+   * corrected on the first step regardless, since `markAllDirty` wakes every
+   * thermal chunk.
+   */
+  private _bulk = false;
 
   private readonly _onExplode: ExplosionHook;
 
@@ -1178,6 +1193,17 @@ export class PixelEngine {
   setMaterial(x: number, y: number, mat: MaterialType): void {
     if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
     const idx = this.getIndex(x, y);
+    // Bulk-stamp fast path: write the material and clear any per-cell override
+    // that a previous world left at this index, but skip all the wake/dirty/
+    // heat/growth/velocity bookkeeping. endBulk() recovers it once for the whole
+    // stamp via markAllDirty(). See _bulk.
+    if (this._bulk) {
+      this.grid[idx] = mat;
+      if (this.colorGrid) this.colorGrid[idx] = 0;
+      if (this.stiffnessGrid) this.stiffnessGrid[idx] = 0;
+      if (this.growthGrid) this.growthGrid[idx] = 0;
+      return;
+    }
     const oldMat = this.grid[idx];
     if (isTerrainSolid(oldMat) || isTerrainSolid(mat)) {
       // v1 has no rigid-body terrain to rebuild, but we keep the semantic
@@ -4606,6 +4632,29 @@ export class PixelEngine {
     this.renderDirtyChunks.fill(1);
     if (this.thermalChunks) this.thermalChunks.fill(1);
     if (this.nextThermalChunks) this.nextThermalChunks.fill(1);
+  }
+
+  /**
+   * Begin a bulk-stamp batch: subsequent {@link setMaterial} calls write only the
+   * material id and skip per-cell wake/dirty bookkeeping. Pair with
+   * {@link endBulk}. Intended for constructing a large world once (e.g. stamping
+   * a planet disc) where the per-cell work would otherwise dominate build cost.
+   * Not re-entrant; calling beginBulk twice without endBulk is a no-op.
+   */
+  beginBulk(): void {
+    this._bulk = true;
+  }
+
+  /**
+   * End a bulk-stamp batch. Wakes every movement and thermal chunk and marks the
+   * whole grid render-dirty once, recovering the work the per-cell calls would
+   * have done — so the first `update()` and `render()` behave as if every cell
+   * had been set with the full bookkeeping. Resets the bulk flag.
+   */
+  endBulk(): void {
+    if (!this._bulk) return;
+    this._bulk = false;
+    this.markAllDirty();
   }
 
   /**

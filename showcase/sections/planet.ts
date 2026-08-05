@@ -106,35 +106,75 @@ interface World {
   scatterR: number;
 }
 
-/** Stamp the planet disc into the engine. */
-function stampPlanet(world: World): void {
+/**
+ * Stamp the planet disc into the engine. Synchronous one-shot variant for the
+ * initial (small, default-size) build where cooperative yielding is unnecessary.
+ * Uses the same bulk path as {@link stampPlanetCooperative}.
+ */
+function stampPlanetSync(world: World): void {
   const { engine, size, cx, cy, planetR } = world;
   const r2 = planetR * planetR;
+  engine.beginBulk();
   for (let y = 0; y < size; y++) {
+    const dy = y - cy;
+    const dy2 = dy * dy;
     for (let x = 0; x < size; x++) {
       const dx = x - cx;
-      const dy = y - cy;
-      if (dx * dx + dy * dy <= r2) {
-        engine.setMaterial(x, y, MaterialType.ROCK);
-      }
+      if (dx * dx + dy2 <= r2) engine.setMaterial(x, y, MaterialType.ROCK);
     }
   }
+  engine.endBulk();
 }
 
 /**
- * Build the world for a given resolution and diameter, and stamp the planet.
+ * Stamp the planet disc into the engine, yielding cooperatively between row
+ * bands so a large world (e.g. 1000×1000) does not block the main thread for
+ * the whole stamp. `shouldYield` is polled after each band; when it returns
+ * true the function awaits a macrotask (letting the browser paint/input).
+ * Returns false if `isCancelled` reported the stamp superseded mid-flight, in
+ * which case the caller must discard the half-built world without swapping it in.
+ */
+async function stampPlanetCooperative(
+  world: World,
+  shouldYield: () => boolean,
+  isCancelled: () => boolean,
+): Promise<boolean> {
+  const { engine, size, cx, cy, planetR } = world;
+  const r2 = planetR * planetR;
+  const BAND_ROWS = 64; // rows per yield slice; ~64k cells at 1000 wide
+  // Bulk-stamp: the disc is a one-time ambient-temperature fill of ROCK. Routing
+  // it through setMaterial's full per-cell bookkeeping would pay ~N wake+dirty
+  // calls; beginBulk/endBulk defers that to a single markAllDirty at the end.
+  engine.beginBulk();
+  for (let y = 0; y < size; y += BAND_ROWS) {
+    if (isCancelled()) { engine.endBulk(); return false; }
+    const yEnd = Math.min(y + BAND_ROWS, size);
+    for (let yy = y; yy < yEnd; yy++) {
+      const dy = yy - cy;
+      const dy2 = dy * dy;
+      for (let x = 0; x < size; x++) {
+        const dx = x - cx;
+        if (dx * dx + dy2 <= r2) engine.setMaterial(x, yy, MaterialType.ROCK);
+      }
+    }
+    if (shouldYield()) await new Promise<void>((r) => setTimeout(r, 0));
+  }
+  engine.endBulk();
+  return true;
+}
+
+/**
+ * Construct the world record for a given resolution and diameter WITHOUT
+ * stamping the disc — engine, offscreen canvas, ImageData, and volcano geometry
+ * only. The caller stamps afterwards (sync or cooperative) so a large world can
+ * yield during the stamp without blocking the main thread.
  *
  * `prev` is reused when the resolution is unchanged: a diameter-only change
  * needs nothing more than a cleared grid and a fresh stamp, so it skips
  * reallocating the engine, the ImageData, and the offscreen canvas. Only a
  * resolution change has to construct a new engine.
- *
- * @param size - grid width/height, in cells
- * @param diameterPct - planet diameter as a percentage of the grid width
- * @param canvas - the visible canvas, resized to match `size`
- * @param prev - the outgoing world, reused when its resolution matches
  */
-function buildWorld(
+function constructWorld(
   size: number,
   diameterPct: number,
   canvas: HTMLCanvasElement,
@@ -197,7 +237,7 @@ function buildWorld(
 
   const geom = volcanoGeometryFor(cx, cy, planetR, headroom);
 
-  const world: World = {
+  return {
     size,
     cx,
     cy,
@@ -214,8 +254,22 @@ function buildWorld(
     // wide planet there is barely any void left to drop material into.
     scatterR: planetR + Math.max(3, Math.min(Math.round(planetR * 0.2), headroom - 2)),
   };
+}
 
-  stampPlanet(world);
+/**
+ * Build the world for a given resolution and diameter, and stamp the planet
+ * synchronously. Used for the initial (small, default-size) build where
+ * cooperative yielding is unnecessary. Rebuilds use {@link rebuildWorld} for the
+ * cooperative path.
+ */
+function buildWorld(
+  size: number,
+  diameterPct: number,
+  canvas: HTMLCanvasElement,
+  prev?: World,
+): World {
+  const world = constructWorld(size, diameterPct, canvas, prev);
+  stampPlanetSync(world);
   return world;
 }
 
@@ -466,6 +520,7 @@ export function initPlanet(container: HTMLElement): void {
 
   canvas.style.touchAction = 'none';
   canvas.addEventListener('pointerdown', (e) => {
+    if (rebuildBusy) return; // a rebuild is mid-flight; ignore world-mutating input
     painting = true;
     canvas.setPointerCapture(e.pointerId);
     const { x, y } = toGrid(e);
@@ -485,6 +540,7 @@ export function initPlanet(container: HTMLElement): void {
   // demonstrate radial settling (the behavior golden from the engine tests,
   // made visible). Alternates sand and water for a stratified look.
   scatterBtn.addEventListener('click', () => {
+    if (rebuildBusy) { scatterBtn.blur(); return; }
     // Spacing is held at ~3 cells rather than at a fixed angular step, so the
     // shell reads the same on a small planet and on a large one.
     const points = Math.max(12, Math.round((2 * Math.PI * world.scatterR) / 3));
@@ -639,8 +695,9 @@ export function initPlanet(container: HTMLElement): void {
   });
 
   clearBtn.addEventListener('click', () => {
+    if (rebuildBusy) { clearBtn.blur(); return; }
     world.engine.clear();
-    stampPlanet(world);
+    stampPlanetSync(world);
     resetScene();
     clearBtn.blur();
   });
@@ -671,8 +728,19 @@ export function initPlanet(container: HTMLElement): void {
   // once per pixel of travel. The label tracks the drag live while the rebuild
   // itself is debounced, which also keeps the sim running smoothly under the
   // dragging thumb instead of stuttering on every intermediate value.
+  //
+  // At high resolution the disc stamp is too large for one synchronous task, so
+  // the rebuild constructs the world, then stamps it cooperatively in row bands
+  // that yield to the browser. A generation counter cancels any in-flight build
+  // the moment a newer rebuild is requested, so a superseded world never flashes
+  // into view and its buffers are simply dropped.
   const REBUILD_DEBOUNCE_MS = 120;
+  /** Per-band construction budget before yielding to the browser, in ms. */
+  const REBUILD_BAND_BUDGET_MS = 8;
   let rebuildTimer: number | undefined;
+  let rebuildGeneration = 0;
+  /** True while a rebuild's stamp is in flight; disables world-mutating input. */
+  let rebuildBusy = false;
 
   const showSliderLabels = (): void => {
     const size = Number(resInput.value);
@@ -682,12 +750,34 @@ export function initPlanet(container: HTMLElement): void {
   };
 
   const rebuild = (): void => {
-    world = buildWorld(Number(resInput.value), Number(diaInput.value), canvas, world);
-    world.engine.ambientTemperature = volcanoParams.ambient;
-    // A new backing store clears the context's settings along with its pixels.
-    ctx.imageSmoothingEnabled = false;
-    resetScene();
-    render();
+    const myGeneration = ++rebuildGeneration;
+    rebuildBusy = true;
+    const size = Number(resInput.value);
+    const pct = Number(diaInput.value);
+    // Construct synchronously (engine allocation + offscreen canvas). This is
+    // the unavoidable constructor cost; the stamp below is the part that yields.
+    const candidate = constructWorld(size, pct, canvas, world);
+    candidate.engine.ambientTemperature = volcanoParams.ambient;
+
+    const isCancelled = (): boolean => myGeneration !== rebuildGeneration;
+    // Yield when this band's stamp work has overrun the budget, keeping each
+    // main-thread task short so zoom/pan/scroll stay responsive during a build.
+    const bandStart = { t: performance.now() };
+    const shouldYield = (): boolean => {
+      const over = performance.now() - bandStart.t >= REBUILD_BAND_BUDGET_MS;
+      if (over) bandStart.t = performance.now();
+      return over;
+    };
+
+    void stampPlanetCooperative(candidate, shouldYield, isCancelled).then((completed) => {
+      rebuildBusy = false;
+      if (!completed) return; // superseded by a newer rebuild; drop the candidate
+      // Atomic swap: only the winning generation installs its world.
+      world = candidate;
+      ctx.imageSmoothingEnabled = false; // a new backing store clears context settings
+      resetScene();
+      forcePresent = true;
+    });
   };
 
   const scheduleRebuild = (): void => {

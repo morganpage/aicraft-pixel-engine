@@ -96,3 +96,81 @@ describe('inactive chunks are not simulated', () => {
     expect(after).toBe(MaterialType.SAND);
   });
 });
+
+describe('bulk-stamp (beginBulk / endBulk)', () => {
+  it('writes materials without per-cell dirty bookkeeping, then markAllDirty on end', () => {
+    const e = makeEngine();
+    // Consume the initial full-dirty so the post-endBulk all-dirty is observable.
+    e.consumeRenderDirtyChunks();
+    e.renderDirtyChunks.fill(0);
+
+    e.beginBulk();
+    e.setMaterial(1, 1, MaterialType.SAND);
+    e.setMaterial(50, 5, MaterialType.ROCK);
+    // Mid-bulk: nothing should be marked dirty yet.
+    let mid = 0;
+    for (let i = 0; i < e.renderDirtyChunks.length; i++) mid += e.renderDirtyChunks[i];
+    expect(mid).toBe(0);
+    // But the materials are written.
+    expect(e.getMaterial(1, 1)).toBe(MaterialType.SAND);
+    expect(e.getMaterial(50, 5)).toBe(MaterialType.ROCK);
+
+    e.endBulk();
+    // Post-endBulk: every chunk is render-dirty (markAllDirty ran).
+    let after = 0;
+    for (let i = 0; i < e.renderDirtyChunks.length; i++) after += e.renderDirtyChunks[i];
+    expect(after).toBe(e.renderDirtyChunks.length);
+  });
+
+  it('clears per-cell override grids (color/stiffness/growth) at touched cells', () => {
+    const e = makeEngine();
+    // Force the optional grids to exist and seed a nonzero override, then verify
+    // a bulk stamp clears it (matching setMaterial's non-bulk clearing semantics).
+    const idx = e.getIndex(1, 1);
+    e.colorGrid = new Uint32Array(e.width * e.height);
+    e.stiffnessGrid = new Uint8Array(e.width * e.height);
+    e.growthGrid = new Uint16Array(e.width * e.height);
+    e.colorGrid[idx] = 0xff112233;
+    e.stiffnessGrid[idx] = 5;
+    e.growthGrid[idx] = 999;
+
+    e.beginBulk();
+    e.setMaterial(1, 1, MaterialType.SAND);
+    e.endBulk();
+
+    expect(e.colorGrid![idx]).toBe(0);
+    expect(e.stiffnessGrid![idx]).toBe(0);
+    expect(e.growthGrid![idx]).toBe(0);
+  });
+
+  it('reaches the same settled state as a non-bulk stamp of the same shape', () => {
+    // Two engines: one stamps a disc via full setMaterial, one via bulk. After a
+    // handful of updates both must converge to the same grid — the bulk path's
+    // markAllDirty recovers the work the per-cell bookkeeping would have done.
+    const stamp = (bulk: boolean): PixelEngine => {
+      const e = new PixelEngine({ width: 64, height: 64, seed: 1, gravity: new FlatGravity() });
+      e.consumeRenderDirtyChunks(); // clear initial full-dirty
+      const cx = 32, cy = 32, r2 = 16 * 16;
+      if (bulk) e.beginBulk();
+      for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+          if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) e.setMaterial(x, y, MaterialType.ROCK);
+        }
+      }
+      if (bulk) e.endBulk();
+      return e;
+    };
+    const a = stamp(false);
+    const b = stamp(true);
+    // Run both a few steps and compare.
+    for (let i = 0; i < 5; i++) { a.update(); b.update(); }
+    for (let i = 0; i < a.grid.length; i++) {
+      expect(b.grid[i]).toBe(a.grid[i]);
+    }
+  });
+
+  it('endBulk is a no-op when not in bulk mode', () => {
+    const e = makeEngine();
+    expect(() => e.endBulk()).not.toThrow();
+  });
+});
