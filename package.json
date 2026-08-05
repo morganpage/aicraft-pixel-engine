@@ -33,7 +33,9 @@
     "showcase:build": "vite build --config showcase/vite.config.ts",
     "showcase:typecheck": "tsc --noEmit --project showcase/tsconfig.json",
     "showcase:test": "vitest run --config showcase/vitest.config.ts",
-    "showcase:test:watch": "vitest --config showcase/vitest.config.ts"
+    "showcase:test:watch": "vitest --config showcase/vitest.config.ts",
+    "showcase:test:scenario": "vitest run --config showcase/vitest.scenario.config.ts",
+    "showcase:test:all": "npm run showcase:test && npm run showcase:test:scenario"
   },
   "devDependencies": {
     "tsx": "4.23.1",

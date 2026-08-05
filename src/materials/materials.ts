@@ -244,8 +244,9 @@ export interface AggregateRule {
  * Density drives displacement: a denser material sinks through a less dense
  * one. Gases have negative density so they rise. Phase flags (`isLiquid`,
  * `isGas`) select which movement rules apply. `flammability` (0–100) gates
- * fire spread; `friction` is exposed for consumers (e.g. a future rigid-body
- * layer) but is not consumed by the v1 displacement core.
+ * fire spread; `decayChance` lets short-lived materials disappear independently
+ * of whether they moved; `friction` is exposed for consumers (e.g. a future
+ * rigid-body layer) but is not consumed by the v1 displacement core.
  */
 export interface MaterialDef {
   id: MaterialType;
@@ -257,6 +258,10 @@ export interface MaterialDef {
   isGas: boolean;
   /** 0–100. Chance per neighbor-touch that fire ignites this material. */
   flammability: number;
+  /** 0–1. Chance per simulation tick that this material becomes EMPTY. */
+  decayChance?: number;
+  /** Leave the simulation when rising beyond the grid instead of treating the boundary as a wall. */
+  escapesAtBoundary?: boolean;
   /** Surface friction (0–1). Exposed for consumers; unused by the v1 core. */
   friction: number;
   /**
@@ -518,7 +523,7 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.ROCK]: { id: MaterialType.ROCK, name: 'Rock', color: [80, 80, 80, 255], density: 100, isLiquid: false, isGas: false, flammability: 0, friction: 0.9, isStatic: true, conductivity: 0.2, emissivity: 0.15, pressureStrength: 15 },
   [MaterialType.STEAM]: { id: MaterialType.STEAM, name: 'Steam', color: [200, 200, 200, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 0.75, conductivity: 0.4, emissivity: 0.05, freezesAt: 0.20, freezesInto: MaterialType.WATER },
   [MaterialType.FIRE]: { id: MaterialType.FIRE, name: 'Fire', color: [255, 150, 0, 255], density: -2, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 1.0, heatSource: true, conductivity: 0.8, emissivity: 0.10 },
-  [MaterialType.SMOKE]: { id: MaterialType.SMOKE, name: 'Smoke', color: [100, 100, 100, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1 },
+  [MaterialType.SMOKE]: { id: MaterialType.SMOKE, name: 'Smoke', color: [100, 100, 100, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, decayChance: 0.02, escapesAtBoundary: true },
   [MaterialType.OIL]: { id: MaterialType.OIL, name: 'Oil', color: [50, 50, 50, 255], density: 4, isLiquid: true, isGas: false, flammability: 100, friction: 0.05 },
   [MaterialType.ACID]: { id: MaterialType.ACID, name: 'Acid', color: [100, 255, 100, 200], density: 6, isLiquid: true, isGas: false, flammability: 0, friction: 0.1 },
   [MaterialType.WOOD]: { id: MaterialType.WOOD, name: 'Wood', color: [139, 69, 19, 255], density: 50, isLiquid: false, isGas: false, flammability: 30, friction: 0.9, needsSupport: true, conductivity: 0.2, emissivity: 0.10 },

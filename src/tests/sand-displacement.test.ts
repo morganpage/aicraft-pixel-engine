@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { PixelEngine } from '../sand';
 import { MaterialType } from '../materials';
-import { FlatGravity } from '../gravity';
+import { FlatGravity, RadialGravity } from '../gravity';
 
 /**
  * Helpers for building a tiny engine and asserting per-cell state.
@@ -80,6 +80,56 @@ describe('falling under flat gravity', () => {
       e.getMaterial(0, 4) === MaterialType.SAND ||
       e.getMaterial(2, 4) === MaterialType.SAND;
     expect(onFloor).toBe(true);
+  });
+});
+
+describe('ephemeral gas decay', () => {
+  it.each([
+    {
+      name: 'flat gravity',
+      gravity: new FlatGravity(),
+      x: 4,
+      y: 4,
+    },
+    {
+      name: 'radial gravity',
+      gravity: new RadialGravity({ centerX: 4, centerY: 4 }),
+      x: 4,
+      y: 2,
+    },
+  ])('lets freely moving smoke expire under $name', ({ gravity, x, y }) => {
+    // Seed 7's first deterministic roll is below SMOKE.decayChance (0.02).
+    // Both cells have an unobstructed gravity-relative rise path, so the old
+    // blocked-only decay rule moved them and could not expire them this tick.
+    const e = new PixelEngine({ width: 9, height: 9, seed: 7, gravity });
+    e.setMaterial(x, y, MaterialType.SMOKE);
+
+    e.update();
+
+    expect(e.getMaterial(x, y)).toBe(MaterialType.EMPTY);
+    let smokeCells = 0;
+    for (const mat of e.grid) if (mat === MaterialType.SMOKE) smokeCells++;
+    expect(smokeCells).toBe(0);
+  });
+
+  it('lets radial smoke rise off every canvas edge instead of sliding along it', () => {
+    const e = new PixelEngine({
+      width: 9,
+      height: 9,
+      seed: 1,
+      gravity: new RadialGravity({ centerX: 4, centerY: 4 }),
+    });
+    const edgeCells = [
+      [4, 0],
+      [8, 4],
+      [4, 8],
+      [0, 4],
+    ] as const;
+    for (const [x, y] of edgeCells) e.setMaterial(x, y, MaterialType.SMOKE);
+
+    e.update();
+
+    for (const mat of e.grid) expect(mat).not.toBe(MaterialType.SMOKE);
   });
 });
 

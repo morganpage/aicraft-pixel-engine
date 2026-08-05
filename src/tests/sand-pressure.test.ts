@@ -863,4 +863,153 @@ describe('pressure: rock fracture (Phase 4)', () => {
     // the phase-change pass never ran.
     expect(sawLavaAtVent).toBe(true);
   });
+
+  // A configured source fractures from a SEPARATE, bounded budget, not its
+  // transport head. This is the safety mechanism: a sealed plug is not exposed
+  // to the source's full transport pressure, so reopening is a deliberate,
+  // rate-limited event rather than a saturated detonation. With a budget that
+  // accrues slower than the plug strength, the source must wait multiple frames
+  // between breaks — the opposite of the legacy path, which charges the full
+  // transport head and can cascade.
+  it('a configured source fractures from a separate, rate-limited budget', () => {
+    const { e, boreX, capY } = cappedConduit(MaterialType.ROCK);
+    e.addPressureSource({
+      x: 2, y: 9, material: MaterialType.LAVA,
+      rate: 1, pressureRate: 30, maxPressure: 100, maxPending: 5, // transport head saturates high
+      // Separate fracture budget: accrues at only 1/frame, cap 20. Rock is 15,
+      // so a break needs ~15 frames of sealed accrual — far slower than the
+      // legacy path, which would fracture the frame the seal forms.
+      fracture: { minSealedFrames: 0, pressureRate: 1, maxPressure: 20 },
+    });
+    // After 5 frames the budget (~5) cannot afford rock (15): no fracture yet.
+    // The legacy path would have broken through on frame 1 (transport head 30).
+    for (let i = 0; i < 5; i++) e.update();
+    expect(e.getMaterial(boreX, capY)).toBe(MaterialType.ROCK);
+    // After enough frames the budget accrues past 15 and the cap fractures.
+    for (let i = 0; i < 30; i++) e.update();
+    expect(e.getMaterial(boreX, capY)).toBe(MaterialType.LAVA);
+  });
+});
+
+/**
+ * Vent-stability invariants (plan-volcano-vent-stability.md, Phase 0).
+ *
+ * These are engine contracts, not showcase tuning. They pin two things the
+ * earlier directional fix did not cover: that a single source fractures at
+ * most ONE cell per update (regardless of the global `fracturePerFrame` cap,
+ * which is meant to bound *multi-source* work), and that pressure fracture
+ * never mutates a solid outside the outward vent path. A sealed source must
+ * drill a narrow channel through a plug, not open several cells in one tick
+ * and not mine sideways through the boundary.
+ */
+describe('pressure: vent-stability invariants', () => {
+  /**
+   * A sealed conduit whose bore is capped by a thick plug of cheap tephra, with
+   * a deep weak tephra canary on the chamber boundary. The thick cheap cap +
+   * saturated pressure + `fracturePerFrame: 4` is exactly the combination that
+   * lets the current `while` loop fracture several plug cells in one update —
+   * the multi-cell burst. Returns the engine and the initial grid (for the
+   * off-front mutation mask) plus key indices.
+   */
+  function thickTephraCapConduit(): {
+    e: PixelEngine;
+    initial: Uint8Array;
+    canaryIdx: number;
+    boreX: number;
+    capTopY: number; // row of the shallowest plug cell
+  } {
+    const w = 5, h = 14;
+    const e = new PixelEngine({
+      width: w, height: h, seed: 1, gravity: new FlatGravity(), fracturePerFrame: 4,
+    });
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) e.setMaterial(x, y, MaterialType.ROCK);
+    const boreX = 2;
+    // Bore rows 4..9, chamber rows 10..12.
+    for (let y = 4; y <= 9; y++) e.setMaterial(boreX, y, MaterialType.LAVA);
+    for (let y = 10; y <= 12; y++) for (let x = boreX - 1; x <= boreX + 1; x++) e.setMaterial(x, y, MaterialType.LAVA);
+    // Three-cell-thick tephra plug at rows 1, 2, 3 (cheap, strength 6).
+    for (let y = 1; y <= 3; y++) e.setMaterial(boreX, y, MaterialType.TEPHRA);
+    // Deep weak tephra canary on the chamber wall (would be mined by an
+    // off-front/global-weakest fracture search).
+    e.setMaterial(0, 10, MaterialType.TEPHRA);
+    const initial = new Uint8Array(e.grid);
+    return { e, initial, canaryIdx: 10 * w + 0, boreX, capTopY: 1 };
+  }
+
+  // Directional selection: a configured source fractures the shallowest
+  // blocker (highest potential), never the globally weakest solid. The fixture
+  // has a deep cheap tephra canary (strength 6) on the chamber wall and a
+  // thicker tephra plug above the bore. Under weakest-affordable the canary
+  // would be carved; under directional selection the shallowest plug cell
+  // outranks it (potential -y at y=1..3 vs -10 at y=10) and the canary
+  // survives. The bounded budget limits the total rate.
+  it('directional selection targets the plug, not a deeper weaker solid', () => {
+    const { e, canaryIdx } = thickTephraCapConduit();
+    e.addPressureSource({
+      x: 2, y: 10, material: MaterialType.LAVA,
+      rate: 1, pressureRate: 30, maxPressure: 100, maxPending: 5,
+      fracture: { minSealedFrames: 6, pressureRate: 1, maxPressure: 20 },
+    });
+    let totalFractures = 0;
+    for (let i = 0; i < 60; i++) {
+      e.update();
+      totalFractures += e.fracturesLastFrame;
+    }
+    // The bounded budget (rate 1, cap 20, 6-frame seal delay) fractures at most
+    // a handful: each break costs 6+ from a budget that accrues at 1/frame.
+    expect(totalFractures).toBeLessThan(15);
+    // The deep tephra canary survives: directional selection never targets it
+    // because the plug cells have higher potential.
+    expect(e.grid[canaryIdx]).toBe(MaterialType.TEPHRA);
+  });
+
+  // One fracture per source per update: a configured source may fracture at
+  // most one cell per update, even when a thick plug requires multiple cells to
+  // clear. The `fracturedThisUpdate` flag enforces this; the global
+  // `fracturePerFrame` bounds work across sources but must not license one
+  // source to open several cells in one tick (the multi-cell burst).
+  it('a configured source fractures at most one cell per update', () => {
+    const { e } = thickTephraCapConduit();
+    e.addPressureSource({
+      x: 2, y: 10, material: MaterialType.LAVA,
+      rate: 1, pressureRate: 30, maxPressure: 100, maxPending: 5,
+      fracture: { minSealedFrames: 0, pressureRate: 30, maxPressure: 100 },
+    });
+    let maxFracturesInOneFrame = 0;
+    for (let i = 0; i < 40; i++) {
+      e.update();
+      if (e.fracturesLastFrame > maxFracturesInOneFrame) maxFracturesInOneFrame = e.fracturesLastFrame;
+    }
+    expect(maxFracturesInOneFrame).toBeLessThanOrEqual(1);
+  });
+
+  // Discharge limit: `maxDischargePerFrame` caps accepted routed parcels per
+  // update independently of stored volume. A source with a large pending
+  // backlog and an open outlet must not dump it all in one frame — it dribbles
+  // at the configured rate.
+  it('maxDischargePerFrame caps accepted discharge per update', () => {
+    const w = 5, h = 12;
+    const e = flat(w, h, 1);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) e.setMaterial(x, y, MaterialType.ROCK);
+    // Open bore with an open outlet at the top.
+    for (let y = 1; y <= 8; y++) e.setMaterial(2, y, MaterialType.LAVA);
+    for (let y = 9; y <= 10; y++) for (let x = 1; x <= 3; x++) e.setMaterial(x, y, MaterialType.LAVA);
+    e.setMaterial(2, 0, MaterialType.EMPTY); // open outlet
+    e.addPressureSource({
+      x: 2, y: 9, material: MaterialType.LAVA,
+      rate: 5, pressureRate: 30, maxPressure: 100, maxPending: 10,
+      maxDischargePerFrame: 2,
+    });
+    // Let the source accumulate a large pending backlog, then open the outlet
+    // and measure max discharge in a single frame.
+    let maxDischarge = 0;
+    for (let i = 0; i < 50; i++) {
+      const before = count(e, MaterialType.LAVA);
+      e.update();
+      const after = count(e, MaterialType.LAVA);
+      const discharge = Math.max(0, after - before);
+      if (discharge > maxDischarge) maxDischarge = discharge;
+    }
+    expect(maxDischarge).toBeLessThanOrEqual(2);
+  });
 });

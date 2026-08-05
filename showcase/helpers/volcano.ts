@@ -317,15 +317,38 @@ export const VENT_TEMP = 0.95;
  * vent and stacks into a spire. The whole behaviour lives in the *gradient*.
  */
 export function stiffnessForTemp(t: number): number {
-  // The floor is 2, never 1. At 1 the criterion can never be met — a single cell
-  // is already one cell thick — so lava would be free to move at any depth and
-  // would thin without limit as it spread. It does exactly that: the flow
-  // fans out into a half-occupied monolayer, and when that finally chills it
-  // locks cell-by-cell into a checkerboard of specks across the whole flank.
-  // A floor of 2 is what stops a sheet thinning past two cells.
-  if (t >= 0.72) return 2; // mobile
-  if (t >= 0.52) return 3;
-  if (t >= 0.38) return 5;
+  // A yield thickness of 1 can never be met — a single cell is already one cell
+  // thick — so it means "free to move at any depth", and a flow held there
+  // thins without limit as it spreads: it fans into a half-occupied monolayer
+  // and chills cell-by-cell into a checkerboard of specks across the flank.
+  //
+  // But a *floor* of 2 is the opposite failure, and it is the one that stopped
+  // this volcano having flows at all. Two cells of depth is more than a vent
+  // can deliver onto a slope: everything the effusive phase erupted stalled the
+  // moment it left the crater, ponded there instead, levelled, and froze as a
+  // flat-topped slab across the summit. Nothing ever ran down the cone.
+  //
+  // The resolution is that the fluid window is *narrow and hot*. Only lava
+  // within a few hundredths of vent temperature is free to move at any depth;
+  // by 0.85 it already needs two cells, and it is losing about 0.08 per frame
+  // while exposed. So a flow leaves the vent as a live stream, runs while it is
+  // genuinely molten, and stiffens into the ordinary depth-gated regime within
+  // a handful of cells — a cooling-limited flow with a blunt stalled front,
+  // which is the behaviour the whole yield term exists to produce. It cannot
+  // thin indefinitely, because the temperature that permits it does not last.
+  // The tiers are set against the engine's measured cooling curve rather than
+  // picked by eye. Lava freezes at 0.30 (`LAVA.freezesAt`). A two-cell-thick
+  // flow — the thinnest body that can move at all once it is past the live
+  // window — falls from vent heat to 0.60 in about 14 frames and to 0.30 in
+  // about 36, so tiering the second step at 0.60 buys a tongue roughly a dozen
+  // cells of travel before it stiffens, and the front then stalls well before
+  // the body has set. Tiering it at 0.72, as it was, left only six: every flow
+  // seized within a couple of cells of the crater and the effusive phase read
+  // as a puddle rather than a flow.
+  if (t >= 0.85) return 1; // live: fresh at the vent, free to run
+  if (t >= 0.60) return 2; // mobile
+  if (t >= 0.45) return 3;
+  if (t >= 0.32) return 5; // just above `LAVA.freezesAt` (0.30)
   return 8; // stiff enough to hold a flow front
 }
 
@@ -427,6 +450,53 @@ export function edificeHeight(engine: PixelEngine, cfg: VolcanoConfig, halfAngle
 /** True once the cone has reached `maxHeight` and the eruption is over. */
 export function isDormant(engine: PixelEngine, cfg: VolcanoConfig, maxHeight: number): boolean {
   return edificeHeight(engine, cfg) >= maxHeight;
+}
+
+/**
+ * Radius the conduit is maintained to while the volcano is erupting — the point
+ * at which the bore opens to the sky, wherever that currently is.
+ *
+ * A real conduit rises through the edifice it has built; only a dead one ends at
+ * the old ground level. So the maintained top has to track the volcano's growth,
+ * and the question is what to track it against.
+ *
+ * Not the original `planetRadius`: within a few tens of frames the mouth is
+ * buried under the volcano's own fallout and the source has to *fracture* its
+ * way out, which is what built a tower instead of a cone.
+ *
+ * Not {@link surfaceRadiusAt} along the vent axis either, and not
+ * {@link edificeHeight}: both count the lava column the source is *actively
+ * pushing up the bore* as ground, so the maintained top chases its own magma
+ * outward and the vent grows a spire.
+ *
+ * What is stable is the geometry itself. Walk the authored bore outward from
+ * the chamber and stop at the first ring that is entirely open air — that ring
+ * is above the mouth by construction, however tall the cone has become, and it
+ * cannot be pushed outward by anything the source does, because a ring the
+ * source has filled is no longer empty and a ring it has not is where the vent
+ * ends. Debris that lands in the bore extends the walk by exactly as much as it
+ * buries the vent.
+ *
+ * @returns the outermost bore radius still worth maintaining.
+ */
+export function ventTopRadius(engine: PixelEngine, cfg: VolcanoConfig): number {
+  const chamberR = cfg.planetRadius - cfg.chamberDepth;
+  // Bounded by the grid: the bore can never be maintained past the point where
+  // its own lanes leave the world.
+  const limit = cfg.planetRadius + Math.max(engine.width, engine.height);
+  let top = chamberR;
+  for (let r = chamberR; r <= limit; r++) {
+    const hw = boreHalfWidth(cfg, r);
+    let solid = false;
+    for (let w = -hw; w <= hw && !solid; w++) {
+      const p = borePos(cfg, r, w);
+      if (p.x < 0 || p.x >= engine.width || p.y < 0 || p.y >= engine.height) return top;
+      if (engine.getMaterial(p.x, p.y) !== MaterialType.EMPTY) solid = true;
+    }
+    if (!solid) return top;
+    top = r;
+  }
+  return top;
 }
 
 /**
@@ -545,14 +615,34 @@ export interface PressureOptions {
   pressureRate: number;
   /** Cap on available head. Bounds how hard a blocked source can push. */
   maxPressure: number;
+  /**
+   * Fraction of surplus head the effusive source converts to launch velocity.
+   * `0` makes it a pure extrusion — see {@link buildVolcanoOpts}.
+   */
+  outletVelocityEfficiency?: number;
   /** Cap on accrued whole-cell volume. Bounds the surge when an outlet opens. */
   maxPending: number;
+  /** Per-update cap on routed parcels — the effusive discharge rate. */
+  maxDischargePerFrame?: number;
   /**
    * Stop the source once the edifice reaches this height above the original
    * surface, in cells. Nothing removes material, so an uncapped vent keeps
    * feeding a cone that runs off the grid.
    */
   maxHeight: number;
+  /**
+   * Vent anchor for corridor-gated routing, shared by both explosive and
+   * effusive sources. When set, pressure routing only exits through EMPTY cells
+   * within `corridorRadius` of the anchor, so summit lava cannot become
+   * additional pressure outlets during either phase.
+   */
+  ventAnchor?: { cx: number; cy: number; angle: number; corridorRadius: number };
+  /**
+   * Fracture tuning for the effusive source, shared defaults with the explosive
+   * source. When set, effusive fracture uses the same sealed-frame delay, separate
+   * budget, and corridor-constrained directional selection as the explosive source.
+   */
+  fracture?: { minSealedFrames: number; pressureRate: number; maxPressure: number };
   /**
    * Source tuning for the explosive-phase lava fountain. When present, the
    * explosive phase creates a high-pressure source alongside `emitPlume` so
@@ -567,6 +657,34 @@ export interface PressureOptions {
     maxPending: number;
     /** Fraction of surplus head converted to launch speed. Default 0.7. */
     outletVelocityEfficiency?: number;
+    /**
+     * Lateral fan of the fountain, as a fraction of launch speed — the arc the
+     * ejecta is thrown across. This is what decides whether the explosive phase
+     * builds a cone or a spike: a narrow jet drops everything back down the
+     * throat, while a wide arc lands tephra out on the flanks where it piles at
+     * its angle of repose. The engine default (0.25 ≈ ±14°) is a plumbing
+     * outlet's spread, not a volcano's.
+     */
+    outletLateralSpread?: number;
+    /**
+     * Per-update discharge cap (routed parcels). Bounds the catch-up tick when
+     * a plug clears so the fountain dribbles back to its steady rate rather
+     * than dumping its whole backlog in one frame. Derived from the Fountain
+     * Rate slider so the control stays monotonic.
+     */
+    maxDischargePerFrame?: number;
+    /**
+     * Fracture tuning for the explosive source. A separate, slow, bounded
+     * pressure budget that gates vent reopening on a deliberate timescale, so a
+     * sealed plug is not exposed to full transport head the instant it forms.
+     */
+    fracture?: { minSealedFrames: number; pressureRate: number; maxPressure: number };
+    /**
+     * Vent anchor for corridor-gated routing. When set, pressure routing only
+     * exits through EMPTY cells within `corridorRadius` of the anchor, so
+     * laterally spreading summit lava cannot become additional pressure outlets.
+     */
+    ventAnchor?: { cx: number; cy: number; angle: number; corridorRadius: number };
   };
 }
 
@@ -832,7 +950,11 @@ export function syncFromHeat(engine: PixelEngine): number {
  *
  * @returns how many cells were recharged.
  */
-export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): number {
+export function rechargeReservoir(
+  engine: PixelEngine,
+  cfg: VolcanoConfig,
+  phase?: EruptionPhase,
+): number {
   let n = 0;
 
   /**
@@ -876,40 +998,108 @@ export function rechargeReservoir(engine: PixelEngine, cfg: VolcanoConfig): numb
   };
 
   /**
-   * Feed a bore cell — heat only, never remelt. The bore must stay molten so the
-   * pressure source can route through it the instant effusion starts, but frozen
-   * ROCK cells are left for the engine's fracture to break. This is the
-   * difference between routine thermal maintenance (keeping a conduit alive) and
-   * a genuinely blocked vent (a cap the engine must fracture).
+   * Feed a bore cell — keep it molten, remelting frozen ROCK. The bore must stay
+   * molten so the pressure source can route through it immediately when an
+   * eruption starts. Frozen ROCK cells (which form during dormancy) are remelted
+   * back to magma.
+   *
+   * `open` selects the two regimes the throat has. While the volcano is
+   * erupting the throat is *continuously resupplied from below*, so nothing
+   * buried in it is allowed to set and fallback debris that has dropped into it
+   * is assimilated. While it is in repose there is no supply, so the exposure
+   * guard applies and the mouth is free to crust over. That crust is the repose
+   * cap the next episode has to break, and it is the only thing fracture should
+   * ever have to open.
+   *
+   * The exposure guard stays on in *both* regimes for TEPHRA. A grain sitting
+   * on the open crater floor is part of the cone's granular deposit, not part
+   * of the plumbing, and remelting it feeds the loop that turns a cinder cone
+   * into a lava tower: fallout lands, is remelted, is pushed back up the bore,
+   * and sets as immobile ROCK, which cannot slump. Measured with the guard off,
+   * one cycle remelted 470 tephra cells against the 394 it fragmented — the
+   * cone was being consumed faster than it was being built.
    */
-  const feedBore = (x: number, y: number): void => {
-    if (engine.getMaterial(x, y) !== MaterialType.LAVA) return;
+  const feedBore = (x: number, y: number, open: boolean, ascentFrac: number): void => {
+    const m = engine.getMaterial(x, y);
+    const feedable =
+      m === MaterialType.LAVA || m === MaterialType.ROCK || (open && m === MaterialType.TEPHRA);
+    if (!feedable) return;
     if (
-      engine.getMaterial(x, y - 1) === MaterialType.EMPTY ||
-      engine.getMaterial(x, y + 1) === MaterialType.EMPTY ||
-      engine.getMaterial(x - 1, y) === MaterialType.EMPTY ||
-      engine.getMaterial(x + 1, y) === MaterialType.EMPTY
+      (!open || m === MaterialType.TEPHRA) && (
+        engine.getMaterial(x, y - 1) === MaterialType.EMPTY ||
+        engine.getMaterial(x, y + 1) === MaterialType.EMPTY ||
+        engine.getMaterial(x - 1, y) === MaterialType.EMPTY ||
+        engine.getMaterial(x + 1, y) === MaterialType.EMPTY
+      )
     ) return;
-    const t = reservoirTemp(x, y);
-    if (engine.getHeat(x, y) < t) engine.setHeat(x, y, t);
-    setStiffness(engine, x, y, stiffnessForTemp(t));
+    // Temperature ramps along the bore, from chamber heat at the bottom to vent
+    // heat at the mouth, rather than holding the whole column at the reservoir
+    // value.
+    //
+    // This is what makes {@link VENT_TEMP} reach the surface at all. A pressure
+    // route does not carry the injected parcel to the outlet — `_shiftPath`
+    // shifts the whole column by one and the parcel that *emerges* is the one
+    // that was already at the top. So the source's `temperature` only ever sets
+    // the deepest cell, and everything that erupts leaves the vent at whatever
+    // the conduit was being held at. Held flat at chamber heat, that is 0.75,
+    // which is already two stiffness tiers into the depth-gated regime — the
+    // lava arrived at the crater half-set and could not run anywhere.
+    //
+    // The gradient is also the right physics: the freshest, least-degassed
+    // magma is at the top of an active column, and it is what the incandescence
+    // ramp's bright end is for.
+    const t = reservoirTemp(x, y) + (VENT_TEMP - MAGMA_TEMP) * Math.max(0, Math.min(1, ascentFrac));
+    if (m === MaterialType.LAVA) {
+      if (engine.getHeat(x, y) < t) engine.setHeat(x, y, t);
+      setStiffness(engine, x, y, stiffnessForTemp(t));
+    } else {
+      // Remelt frozen ROCK (or buried fallback tephra) back to magma so the
+      // conduit stays open. Without this the bore freezes solid and the next
+      // eruption cannot route magma to the surface.
+      setMagma(engine, x, y, t);
+    }
     n++;
   };
 
   const chamberR = cfg.planetRadius - cfg.chamberDepth;
 
-  // The bore: heat-only (never remelt). This keeps the conduit's existing lava
-  // molten so the pressure source can route through it immediately when an
-  // effusive episode starts, without the bore freezing solid during the long
-  // explosive phase. Frozen ROCK cells are left untouched — the engine's
-  // fracture handles genuinely blocked vents. The feed stops short of the
-  // surface so the vent cap is allowed to crust (the exposure guard sees to
-  // that).
-  for (let r = chamberR; r <= cfg.planetRadius - 3; r++) {
+  // The bore.
+  //
+  // Feed depth is phase-aware, and while erupting it **tracks the edifice**
+  // rather than stopping at the original planet radius. That is the difference
+  // between a volcano and a chimney.
+  //
+  // A conduit maintained only up to `planetRadius` is buried by the volcano's
+  // own first deposits: within a few tens of frames the mouth is under fallback
+  // tephra and frozen spatter that nothing re-melts, and the source's only way
+  // out is to *fracture* its way through. Fracture opens one cell per frame
+  // along the steepest potential gradient, which is straight up — so the magma
+  // tunnels vertically through its own pile, every subsequent parcel lands on
+  // top of that tunnel, and the edifice grows as a straight-sided tower. When
+  // fracture is free to pick a weaker neighbour instead (unfractured tephra on
+  // the flanks is strength 6 against rock's 15) it breaks out sideways as well,
+  // which is where the extra vents came from. Both are the same bug: the vent
+  // was never maintained, so the pressure source had to excavate one.
+  //
+  // Extending the maintained bore to the rim keeps a single central vent open
+  // at the summit for as long as the eruption lasts. It is bounded by the
+  // authored bore footprint — three to five cells across — so it can only ever
+  // keep the conduit clear, never eat into the cone around it. Fracture goes
+  // back to being what it was meant for: breaking the repose cap.
+  //
+  // During repose (or when no phase is given) the feed stops 3 cells short of
+  // the original surface, as before, so a genuine cap can form and hold.
+  const erupting = phase === 'explosive' || phase === 'effusive';
+  const feedLimit = erupting ? ventTopRadius(engine, cfg) : cfg.planetRadius - 3;
+  const span = Math.max(1, feedLimit - chamberR);
+  for (let r = chamberR; r <= feedLimit; r++) {
     const hw = boreHalfWidth(cfg, r);
+    // Ramp the last third of the ascent, so only the shallow column carries
+    // vent heat and the bulk of the conduit stays at reservoir temperature.
+    const frac = Math.max(0, ((r - chamberR) / span - 0.66) / 0.34);
     for (let w = -hw; w <= hw; w++) {
       const p = borePos(cfg, r, w);
-      feedBore(p.x, p.y);
+      feedBore(p.x, p.y, erupting, frac);
     }
   }
 
@@ -1100,7 +1290,7 @@ export interface PhaseDurations {
  * volume to stay connected and thick while it runs, where a slow trickle chills
  * between cells and stipples the flank instead of streaming down it.
  */
-export const DEFAULT_PHASES: PhaseDurations = { explosive: 300, effusive: 40, repose: 150 };
+export const DEFAULT_PHASES: PhaseDurations = { explosive: 300, effusive: 90, repose: 150 };
 
 export function createVolcanoState(): VolcanoState {
   // Open explosively: a real eruption clears its throat with ash and tephra
@@ -1118,6 +1308,158 @@ export interface VolcanoStepOptions {
   assimilateRate: number;
   phases?: PhaseDurations;
 }
+
+/**
+ * Inputs to {@link buildVolcanoOpts} that vary at runtime (sliders) or per
+ * cycle. Everything else about the eruption is a fixed property of the volcano
+ * model and lives inside the factory, so the showcase and the headless test
+ * harness construct identical options from the same code path.
+ */
+export interface VolcanoOptsInputs {
+  /** Cells of magma supplied per frame (Effusion slider, 1–5). */
+  effusion: number;
+  /** Fountain Rate slider (0–4). Controls parcel density up to the cap. */
+  fountainRate: number;
+  /** Fountain Pressure slider (20–150). Becomes the explosive source's head. */
+  fountainPressure: number;
+  /**
+   * Current edifice height cap, in cells. The showcase starts at `capStart` and
+   * raises it by `capStep` each cycle up to `capMax`; a fixed scenario passes
+   * `capStart` for the first-cycle behaviour it pins.
+   */
+  maxHeight: number;
+}
+
+/**
+ * Construct the showcase's eruption tuning from a small set of inputs.
+ *
+ * This is the single source of truth shared by the browser showcase
+ * (`sections/planet.ts`) and the headless test harness
+ * (`helpers/volcano-scenario.ts`). The harness passes the production slider
+ * defaults so the golden trajectory tests the volcano users actually run;
+ * the showcase passes its live slider values. Keeping both callers on one
+ * factory is what prevents the scenario and the shipped behaviour from
+ * silently diverging (they did before — different fountain pressure, parcel
+ * cap, and an explosive-only vent anchor instead of the shared parent one).
+ *
+ * The vent anchor is set at the parent (`opts.pressure.ventAnchor`) so it
+ * applies to both phases; `stepVolcanoPre` falls back to it for the explosive
+ * source when no nested override is present.
+ */
+export function buildVolcanoOpts(
+  cfg: VolcanoConfig,
+  inputs: VolcanoOptsInputs,
+): VolcanoStepOptions {
+  // Head a parcel spends just getting from the chamber feed to the vent, in
+  // head units. Routing cost is the gravitational climb (one unit per cell of
+  // radius, on radial gravity) plus the conduit's own flow resistance
+  // (`LAVA.pressureResistance` per traversed cell), so it grows one-for-one
+  // with the edifice the magma has to climb through.
+  //
+  // Both sources have to be dimensioned against this rather than against a
+  // constant. A fixed 60 was enough to reach the original surface and *not
+  // enough to reach the top of the cone the volcano builds* — past about 25
+  // cells of growth the effusive phase silently stopped producing anything at
+  // all, and the fountain faded as the cone grew because the same slider
+  // position bought less and less surplus at the vent.
+  const ascent = Math.ceil((cfg.chamberDepth + inputs.maxHeight + cfg.chamberRadius) * 1.2);
+  return {
+    pressure: {
+      // Effusive ascent: the engine routes this from the chamber feed through
+      // the connected conduit to a real outlet.
+      effusion: inputs.effusion,
+      // Enough head to reach the summit of a fully-grown cone, times the number
+      // of parcels the Effusion slider asks for per frame.
+      //
+      // The multiplier is what makes that slider mean anything. Every accepted
+      // route deducts its own cost from the source's head, so a budget sized for
+      // one ascent affords exactly one parcel per frame however high the rate is
+      // set — measured, Effusion 5 discharged at the same one cell per frame as
+      // Effusion 1, and the surface lava sat at a steady ~115 cells because the
+      // flows were freezing exactly as fast as they were being fed. A flow needs
+      // to arrive faster than it chills to travel at all: lava is a Bingham
+      // fluid here (`stiffnessForTemp`), so a tongue advances only where it is
+      // at least two cells thick, and a one-cell-per-frame trickle never is.
+      //
+      // Refilled in full every frame, because a magma chamber's overpressure is
+      // not something the vent exhausts — what limits an eruption's discharge is
+      // how fast the conduit can pass magma, which is `maxDischargePerFrame`.
+      pressureRate: ascent * Math.max(1, inputs.effusion) + 12,
+      maxPressure: ascent * Math.max(1, inputs.effusion) + 12,
+      maxPending: 5,
+      // Discharge is the slider, not a side effect of the head budget.
+      maxDischargePerFrame: Math.max(1, Math.round(inputs.effusion)),
+      // Effusion extrudes; it does not fountain. Surplus head at the vent is
+      // left as head instead of being converted to launch velocity, so lava
+      // wells out of the crater and runs downslope under gravity — which is
+      // the whole point of the phase, and what the yield-strength term exists
+      // to shape. Without this the effusive source's surplus (which has to be
+      // generous, or it cannot climb the cone at all) launches every parcel
+      // ballistically and the flows never form.
+      outletVelocityEfficiency: 0,
+      // Just above the cone's cap: more headroom and lava stops running down
+      // the cone and starts building a level slab on top of it.
+      maxHeight: inputs.maxHeight + 2,
+      // Shared vent anchor: both explosive and effusive routing exit only
+      // through a narrow corridor (radius 3 ≈ conduit half-width + 1) around
+      // the vent, so laterally spreading summit lava cannot become extra vents.
+      // Shared vent axis: both explosive and effusive routing exit only through
+      // cells within corridorRadius of the vent axis (the line from center
+      // through the vent angle). The axis extends to any height, so the corridor
+      // tracks cone growth — unlike a fixed surface point that gets buried.
+      ventAnchor: { cx: cfg.centerX, cy: cfg.centerY, angle: cfg.ventAngle, corridorRadius: 3 },
+      // Shared fracture config for the effusive source: faster reopening than
+      // the explosive source since effusion is only 40 frames — a 24-frame delay
+      // would consume the entire phase. A short delay (6 frames) + moderate
+      // accrual (3 head/frame, cap 18) clears a frozen plug within the effusive
+      // window while still using corridor-constrained directional selection.
+      fracture: { minSealedFrames: 6, pressureRate: 3, maxPressure: 18 },
+      // Explosive-phase fountain: high pressure so surplus at the vent converts
+      // to ballistic velocity (Torricelli). Fragmented fountain parcels build
+      // the tephra cone and leave a few visible hot bombs in the arc.
+      explosive: {
+        rate: inputs.fountainRate,
+        // Floored at the ascent plus a working surplus, so the Fountain Pressure
+        // slider keeps meaning the same thing at every cone height instead of
+        // being eaten by the climb as the volcano grows.
+        pressureRate: Math.max(10, inputs.fountainPressure, ascent + 20),
+        maxPressure: Math.max(inputs.fountainPressure, ascent + 20),
+        // The parcel cap tracks the Fountain Rate slider's ceiling (4). One
+        // parcel per frame keeps a focused tephra jet; multiple same-frame
+        // routes widen it into a spray. The cap bounds that widening so a
+        // maxed fountain is dense but not a broad fan.
+        maxPending: 4,
+        // The launch arc. Roughly ±35°, matching the Spread the host-side plume
+        // used to fire across, so ballistic fallout lands out on the flanks and
+        // piles into a cone instead of dropping back into the crater.
+        outletLateralSpread: 0.7,
+        // Discharge cap: when a plug clears, the fountain returns to its steady
+        // rate rather than dumping the whole backlog in one frame.
+        maxDischargePerFrame: Math.max(1, Math.ceil(inputs.fountainRate)),
+        // Fracture via a separate budget: the sealed vent reopens through the
+        // plug (highest-potential cell), never mining cone-flank tephra sideways.
+        fracture: { minSealedFrames: 24, pressureRate: 1, maxPressure: 18 },
+      },
+    },
+    // Tephra is lighter than lava and stays above surface flows. A slow cleanup
+    // rate still remelts the occasional grain trapped deep in the plumbing
+    // without erasing the cone-building exterior deposit.
+    assimilateRate: 0.03,
+  };
+}
+
+/**
+ * The production slider defaults — the volcano a user sees on first load.
+ *
+ * `maxHeight` defaults to `capStart` (20), the first-cycle cap; the showcase
+ * raises it per cycle, a fixed scenario leaves it at the first-cycle value.
+ */
+export const DEFAULT_VOLCANO_INPUTS: VolcanoOptsInputs = {
+  effusion: 1,
+  fountainRate: 1,
+  fountainPressure: 100,
+  maxHeight: 20,
+};
 
 /**
  * The chamber feed cell — where the engine pressure source injects magma.
@@ -1165,6 +1507,14 @@ export function stepVolcanoPre(
         maxPending: opts.pressure.explosive.maxPending,
         temperature: MAGMA_TEMP,
         outletVelocityEfficiency: opts.pressure.explosive.outletVelocityEfficiency,
+        outletLateralSpread: opts.pressure.explosive.outletLateralSpread,
+        maxDischargePerFrame: opts.pressure.explosive.maxDischargePerFrame,
+        fracture: opts.pressure.explosive.fracture,
+        // The explosive source uses its own nested vent anchor when set, else
+        // falls back to the shared `opts.pressure.ventAnchor` documented as
+        // applying to both phases. Without this fallback the production
+        // explosive phase — which only sets the parent anchor — runs unanchored.
+        ventAnchor: opts.pressure.explosive.ventAnchor ?? opts.pressure.ventAnchor,
       });
     }
     // Height cap applies to the explosive source too.
@@ -1186,7 +1536,16 @@ export function stepVolcanoPre(
         pressureRate: opts.pressure.pressureRate,
         maxPressure: opts.pressure.maxPressure,
         maxPending: opts.pressure.maxPending,
-        temperature: MAGMA_TEMP,
+        // Vent temperature, not chamber temperature. A parcel written at the
+        // chamber feed is the coldest thing in the conduit by the time it
+        // reaches the summit, and a flow that leaves the vent already partway
+        // to its yield threshold stalls within a cell or two of the crater
+        // instead of running down the flank.
+        temperature: VENT_TEMP,
+        outletVelocityEfficiency: opts.pressure.outletVelocityEfficiency,
+        maxDischargePerFrame: opts.pressure.maxDischargePerFrame,
+        ventAnchor: opts.pressure.ventAnchor,
+        fracture: opts.pressure.fracture,
       });
     }
     // The height cap is a host concern: the engine has no concept of an
@@ -1253,11 +1612,119 @@ export function stepVolcanoPost(
   opts: VolcanoStepOptions,
 ): void {
   // Every phase, repose included: the chamber is molten between eruptions too,
-  // and left unfed it would set solid and end the volcano permanently. Chamber-
-  // only now — the bore is the engine's to keep clear or plug.
-  void state; // symmetric with stepVolcanoPre; no longer read after bore remelt was removed
-  rechargeReservoir(engine, cfg);
+  // and left unfed it would set solid and end the volcano permanently. The bore
+  // feed depth is phase-aware: during an active eruption the feed reaches one
+  // cell below the surface so the throat below the vent stays molten; during
+  // repose it stops short so a cap can form.
+  rechargeReservoir(engine, cfg, state.phase);
   assimilateTephra(engine, rng, { rate: opts.assimilateRate });
+}
+
+/**
+ * Mutable per-eruption runtime state shared between the host and the controller.
+ *
+ * `erupting` is the active/dormant flag the browser loop branches on; the
+ * controller flips it to `false` when the eruption completes. `capHeight` is
+ * the current edifice-height cap (it grows cycle by cycle in the showcase).
+ * Both are mutated by {@link stepVolcanoFrame}, so a caller that wants the
+ * browser's exact per-frame behaviour just holds one of these and calls the
+ * controller once per frame.
+ */
+export interface VolcanoRuntime {
+  /** False once the eruption has run its course (phaseFrame === -1 or dormant). */
+  erupting: boolean;
+  /** Current edifice-height cap, in cells. Grows cycle by cycle up to `capMax`. */
+  capHeight: number;
+}
+
+/**
+ * The pure simulation core of one showcase frame — the volcano equivalent of
+ * `engine.update()`.
+ *
+ * This is the **single source of truth** for the per-frame sequence, shared by
+ * the browser loop (`sections/planet.ts`) and the headless test harness
+ * (`helpers/volcano-scenario.ts`). It reproduces the browser's active/dormant
+ * transition exactly:
+ *
+ * - **Active:** `stepVolcanoPre → engine.update() → stepVolcanoPost`, then a
+ *   completion check. The eruption completes when its cycle finishes
+ *   (`state.phaseFrame < 0`), at which point the live pressure source is removed
+ *   and `runtime.erupting` goes false. Reaching the height cap does *not* end
+ *   the eruption — it only stops the source, inside `stepVolcanoPre`.
+ * - **Dormant:** `rechargeReservoir(..., 'repose')` then `engine.update()`. The
+ *   chamber and buried conduit are maintained at repose depth so a restart can
+ *   route magma; only the shallow cap (top ~3 cells) is allowed to freeze.
+ * - **Every frame, active or dormant:** {@link syncFromHeat}, because the engine
+ *   keeps cooling and freezing cells during dormancy and a freeze clears a
+ *   cell's colour, so flows that set while the volcano is quiet still need
+ *   repainting.
+ *
+ * Cloud stepping, perf bookkeeping, spin, and rendering are presentation-only
+ * and stay in the browser loop. Extracting this controller is what keeps the
+ * golden test trajectory byte-identical to what a user sees: previously the
+ * harness ran the active sequence forever, so every post-completion checkpoint
+ * differed from the production loop by hundreds of cells.
+ */
+export function stepVolcanoFrame(
+  engine: PixelEngine,
+  cfg: VolcanoConfig,
+  state: VolcanoState,
+  rng: () => number,
+  opts: VolcanoStepOptions,
+  runtime: VolcanoRuntime,
+): void {
+  if (runtime.erupting) {
+    stepVolcanoPre(engine, cfg, state, rng, opts);
+    engine.update();
+    stepVolcanoPost(engine, cfg, state, rng, opts);
+    // The eruption cycle runs once: explosive → effusive → repose → done.
+    // `phaseFrame === -1` signals completion (set by stepVolcanoPre).
+    //
+    // Reaching the height cap is *not* completion. It only means the edifice has
+    // grown as far as this episode is allowed to grow it, which `stepVolcanoPre`
+    // already handles by removing the live source. Ending the whole eruption
+    // there cost every episode after the first its effusive phase: the cap trips
+    // partway through the explosive phase, so the volcano went straight from
+    // erupting ash to dormant and the lava flows — the thing the effusive phase
+    // exists to show — were only ever visible on a fresh planet. Let the cycle
+    // finish; a capped eruption simply has nothing left to add.
+    if (state.phaseFrame < 0) {
+      if (state.sourceId !== null) {
+        engine.removePressureSource(state.sourceId);
+        state.sourceId = null;
+      }
+      runtime.erupting = false;
+    }
+  } else {
+    // Dormant: maintain the plumbing so a restart can route magma — but only
+    // if a volcano has actually been stamped. Before the first click there is
+    // no conduit, and running the bore geometry on bare bedrock would carve a
+    // magma channel into a planet that has no volcano.
+    const feed = chamberFeed(cfg);
+    if (engine.getMaterial(feed.x, feed.y) === MaterialType.LAVA
+      || engine.getMaterial(feed.x, feed.y) === MaterialType.ROCK) {
+      // Heuristic: the chamber feed is ROCK (bedrock) even before stamping, so
+      // distinguish "stamped then frozen" from "never stamped" by checking
+      // whether any LAVA exists near the chamber center. A stamped volcano
+      // always leaves at least some lava in the chamber blob.
+      const chamberR = cfg.planetRadius - cfg.chamberDepth;
+      let hasLava = false;
+      for (let dy = -3; dy <= 3 && !hasLava; dy++) {
+        for (let dx = -3; dx <= 3 && !hasLava; dx++) {
+          const ux = Math.cos(cfg.ventAngle), uy = Math.sin(cfg.ventAngle);
+          const x = Math.round(cfg.centerX + ux * chamberR + dx);
+          const y = Math.round(cfg.centerY + uy * chamberR + dy);
+          if (engine.getMaterial(x, y) === MaterialType.LAVA) hasLava = true;
+        }
+      }
+      if (hasLava) {
+        rechargeReservoir(engine, cfg, 'repose');
+      }
+    }
+    engine.update();
+  }
+  // Every frame, erupting or not: repaint temperature-derived colour/stiffness.
+  syncFromHeat(engine);
 }
 
 /**

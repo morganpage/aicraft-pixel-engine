@@ -271,11 +271,18 @@ export const OUTLET_VELOCITY_EFFICIENCY = 0.7;
 
 /**
  * Lateral spread fraction for outlet velocity. Each launched parcel gets a
- * deterministic lateral component (perpendicular to the exit heading) equal to
+ * deterministic lateral component (perpendicular to the launch axis) equal to
  * this fraction of its launch speed, so a fountain fans outward rather than
  * building a one-cell-wide spire. 0.25 means the lateral component is up to
  * 25% of the vertical — enough to build a cone, not so much that ejecta flies
  * sideways.
+ *
+ * The spread has to vary *per launch*, not per outlet cell. It used to be a
+ * pure hash of the outlet index, which is stable while a vent holds its
+ * position — so every parcel out of a steady vent got the same offset, flew
+ * the same trajectory, and landed in the same cell. That is a jet, not a
+ * fountain, and it builds a spire whatever the spread fraction is set to.
+ * The frame counter is mixed in so consecutive parcels sample the arc.
  */
 export const OUTLET_LATERAL_SPREAD = 0.25;
 
@@ -391,6 +398,52 @@ export interface PressureSourceOptions {
    * the effusive source.
    */
   outletVelocityEfficiency?: number;
+  /**
+   * Lateral fan of the outlet launch, as a fraction of launch speed. Default
+   * {@link OUTLET_LATERAL_SPREAD} (0.25). This is the half-angle of the jet in
+   * tangent form: 0.25 fans roughly ±14°, 1.0 roughly ±45°. A volcanic fountain
+   * wants a wide arc so its ejecta lands spread across the flanks and piles
+   * into a cone; a plain pressure outlet wants the narrow default.
+   */
+  outletLateralSpread?: number;
+  /**
+   * Per-update cap on accepted discharge (routed parcels). Once hit, the
+   * source stops processing and leaves the rest of `pending` queued for later
+   * frames. This bounds the catch-up tick when a plug clears independently of
+   * the stored volume (`maxPending`), so a reopened vent dribbles at its
+   * configured flow rate rather than dumping its whole backlog in one frame.
+   * Absent means unbounded (the legacy behavior).
+   */
+  maxDischargePerFrame?: number;
+  /**
+   * Fracture configuration. When set, fracture is gated on a sealed interval
+   * and a pressure budget that is *separate* from transport head, so a freshly
+   * sealed plug is not immediately exposed to full transport pressure and
+   * reopening happens on a visible, deliberate timescale rather than the same
+   * frame the seal forms. Absent means the legacy behavior: any genuine
+   * `noOutlet` may fracture immediately, charged from the transport budget.
+   */
+  fracture?: PressureSourceFractureOptions;
+  /**
+   * A persistent vent axis and corridor radius. When set, pressure routing only
+   * accepts EMPTY outlets whose perpendicular distance from the vent axis (the
+   * line from center through the vent angle) is within `corridorRadius` cells.
+   * This prevents summit lava that has spread laterally from becoming additional
+   * pressure-fed vents, while allowing the corridor to track cone growth — the
+   * axis extends to any height, unlike a fixed surface point that gets buried.
+   * Absent means any EMPTY neighbour of the connected body is a valid outlet.
+   */
+  ventAnchor?: { cx: number; cy: number; angle: number; corridorRadius: number };
+}
+
+/** Fracture tuning for a {@link PressureSourceOptions.fracture}. */
+export interface PressureSourceFractureOptions {
+  /** Consecutive `noOutlet` frames required before a fracture may be attempted. */
+  minSealedFrames: number;
+  /** Hydraulic head accrued per frame while the source is sealed. */
+  pressureRate: number;
+  /** Cap on accrued fracture head. Sit just above the strongest plug to clear. */
+  maxPressure: number;
 }
 
 /** Readable snapshot of a persistent source's accumulated state. */
@@ -422,12 +475,26 @@ interface PressureSource {
   maxPending: number;
   temperature: number | undefined;
   outletVelocityEfficiency: number;
+  /** Lateral fan of the outlet launch, as a fraction of launch speed. */
+  outletLateralSpread: number;
+  /** Per-update cap on accepted discharge; `Infinity` when unset. */
+  maxDischargePerFrame: number;
+  /** Fracture tuning; `null` means the legacy immediate-from-transport path. */
+  fracture: PressureSourceFractureOptions | null;
+  /** Vent axis for corridor-gated routing; `null` means any outlet is valid. */
+  ventAnchor: { cx: number; cy: number; angle: number; corridorRadius: number } | null;
   /** Accrued whole-cell volumes waiting for an outlet. */
   pending: number;
   /** Fractional volume remainder, for rates < 1. */
   pendingRem: number;
   /** Available hydraulic head, accrued while blocked. */
   availablePressure: number;
+  /** Consecutive `noOutlet` frames. Reset to 0 by any accepted route. */
+  sealedFrames: number;
+  /** Fracture head, accrued only while sealed and separate from transport. */
+  fracturePressure: number;
+  /** Grid index of the last fractured cell, for front-continuity. -1 = none. */
+  fractureFront: number;
 }
 
 /** Construction options for {@link PixelEngine}. */
@@ -1339,8 +1406,33 @@ export class PixelEngine {
    *  - the target is in bounds,
    *  - neither cell was already processed this frame,
    *  - the target isn't an immovable WALL,
-   *  - and the mover is denser than whatever is at the target (or the
+   *  - the target isn't a *solid* deposit the mover is a fluid of, and
+   *  - the mover is denser than whatever is at the target (or the
    *    target is empty).
+   *
+   * ## Why a fluid cannot swim into a solid
+   *
+   * Density alone decides which of two things sinks past the other, and for two
+   * fluids, or a grain settling through a fluid, that is the whole of the
+   * physics: sand sinks through water because it is denser, and the same
+   * comparison keeps a light grain resting on a heavy melt.
+   *
+   * It is the wrong question to ask about a fluid meeting a *packed solid
+   * deposit*, because the deposit's grains are in contact with each other and
+   * bear load — the fluid has nowhere to displace them to. Tephra is the case
+   * that exposes this. It has to be lighter than lava (density 7 against 8) so
+   * fresh ejecta rests on a melt instead of sinking through it and draining
+   * back into the reservoir. Read as a pure density comparison, that also says
+   * lava may sink through a *cinder cone*, and it does: measured, every drop of
+   * an effusive episode swam down into the flank it was poured onto and froze
+   * inside it, converting the granular cone to solid rock from the inside — 791
+   * cells of rock against 116 of tephra — instead of running down the outside
+   * of it. There were no lava flows on the cone because the lava was never on
+   * the cone.
+   *
+   * A liquid or gas may therefore displace only another fluid, or empty space.
+   * Grains settling through fluids are unaffected (the mover is the solid
+   * there), and so is every fluid-fluid pair.
    */
   canDisplace(x: number, y: number, targetX: number, targetY: number): boolean {
     if (targetX < 0 || targetX >= this.width || targetY < 0 || targetY >= this.height) return false;
@@ -1359,6 +1451,9 @@ export class PixelEngine {
 
     const moverDef = materialDefs[mover];
     const targetDef = materialDefs[target];
+    if ((moverDef.isLiquid || moverDef.isGas) && !targetDef.isLiquid && !targetDef.isGas) {
+      return false;
+    }
     return moverDef.density > targetDef.density;
   }
 
@@ -1784,7 +1879,21 @@ export class PixelEngine {
                 // seam rather than a stall. Waking unconditionally would let
                 // any active chunk re-wake its neighbours forever, and they it,
                 // so a fully equilibrated world would never go quiet.
-                if (q > HEAT_EPSILON || q < -HEAT_EPSILON) this.wakeThermalChunk(nx, ny);
+                //
+                // *This* chunk has to be kept awake alongside it, or the lag
+                // never resolves: nothing was transferred, so nothing in this
+                // chunk changed, so it sleeps — and next frame the roles swap
+                // and the neighbour wakes it back for the same untransferred
+                // flux. That is a livelock, not a lag. It reports as a small
+                // fixed set of chunks alternating forever with the temperature
+                // field completely static, which is exactly what a world with
+                // any lasting warm patch straddling a chunk boundary settles
+                // into: measured on the volcano, 3 and 5 chunks trading places
+                // for 2000 frames after the last cell had stopped moving.
+                if (q > HEAT_EPSILON || q < -HEAT_EPSILON) {
+                  this.wakeThermalChunk(nx, ny);
+                  this.wakeThermalChunk(x, y);
+                }
                 continue;
               }
 
@@ -1844,13 +1953,21 @@ export class PixelEngine {
             if (t > 1) t = 1;
             else if (t < 0) t = 0;
 
-            // Below the epsilon the cell is treated as settled: the write is
-            // skipped so the chunk can sleep. Without this, diffusion's
-            // asymptotic tail keeps every chunk awake and every chunk
-            // render-dirty forever.
+            // Always write; wake only above the epsilon.
+            //
+            // The epsilon is what lets diffusion's asymptotic tail go quiet:
+            // without it every chunk stays awake and render-dirty forever. But
+            // it gates *waking*, not the result. Skipping the write as well
+            // silently discards the flux pass 2 already took out of this cell's
+            // neighbours, so heat stops being conserved exactly where the
+            // gradient is shallowest — and a pair of cells across a chunk seam
+            // can then sit in a permanent cycle, one losing more than the
+            // epsilon each frame and the other never receiving it, with the
+            // world otherwise completely dead. Writing the value costs one
+            // store and settles the tail properly.
+            heat[idx] = t;
             const change = t - before;
             if (change > HEAT_EPSILON || change < -HEAT_EPSILON) {
-              heat[idx] = t;
               this.wakeThermalChunk(x, y);
               this.markRenderDirty(x, y);
             }
@@ -3064,9 +3181,16 @@ export class PixelEngine {
       maxPending: Math.max(0, opts.maxPending),
       temperature: opts.temperature,
       outletVelocityEfficiency: Math.max(0, Math.min(1, opts.outletVelocityEfficiency ?? OUTLET_VELOCITY_EFFICIENCY)),
+      outletLateralSpread: Math.max(0, opts.outletLateralSpread ?? OUTLET_LATERAL_SPREAD),
+      maxDischargePerFrame: opts.maxDischargePerFrame ?? Infinity,
+      fracture: opts.fracture ?? null,
+      ventAnchor: opts.ventAnchor ?? null,
       pending: 0,
       pendingRem: 0,
       availablePressure: 0,
+      sealedFrames: 0,
+      fracturePressure: 0,
+      fractureFront: -1,
     });
     return id;
   }
@@ -3256,35 +3380,56 @@ export class PixelEngine {
       // leaves the remaining pending volume + pressure for next frame.
       let accepted = 0;
       let maxCost = 0;
+      let fracturedThisUpdate = false;
       const req: LiquidInjection = {
         x: s.x, y: s.y, material: s.material,
         amount: 1, pressure: s.availablePressure,
         temperature: s.temperature,
       };
-      while (s.pending > 0 && s.availablePressure > 0) {
+      const configured = s.fracture !== null;
+      while (s.pending > 0 && s.availablePressure > 0 && accepted < s.maxDischargePerFrame) {
         req.pressure = s.availablePressure;
-        const r = this._routeOneVolume(req);
+        const r = this._routeOneVolume(req, s.ventAnchor);
         if (r.kind === 'accepted') {
           accepted++;
           s.pending--;
-          // Convert surplus head to outlet velocity (Torricelli), and deduct
-          // both transport cost and kinetic head from the source's available
-          // pressure. This closes the energy double-count: the head that became
-          // velocity is not available to launch the next parcel.
-          const kineticHead = this._applyOutletVelocity(r, s.availablePressure, s.outletVelocityEfficiency);
+          // An accepted route proves the body is not sealed: reset the sealed
+          // interval AND the fracture overpressure. A reopened vent starts a
+          // fresh pressure buildup from zero — the plan's visible seal-then-
+          // buildup-then-reopen cycle requires this.
+          s.sealedFrames = 0;
+          s.fracturePressure = 0;
+          s.fractureFront = -1;
+          const kineticHead = this._applyOutletVelocity(
+            r, s.availablePressure, s.outletVelocityEfficiency, s.outletLateralSpread);
           s.availablePressure = Math.max(0, s.availablePressure - r.cost - kineticHead);
           if (r.cost > maxCost) maxCost = r.cost;
-        } else {
-          // No affordable liquid outlet. Try to fracture a reachable solid
-          // boundary: convert the weakest affordable one to the source material,
-          // consuming pressure equal to its strength. The converted cell opens
-          // a path that routing will find on a subsequent frame (or the next
-          // loop iteration, since the grid has changed). The doc specifies
-          // retry "on the next frame"; in practice the converted cell is
-          // immediately traversable, so the loop re-enters and routes through
-          // it this frame. The per-frame fracture cap bounds the work.
+        } else if (configured && r.kind === 'rejected' && r.reason === 'noOutlet') {
+          // Configured source: only a genuine seal (no liquid outlet anywhere)
+          // may trigger fracture. `insufficientHead` means an outlet exists but
+          // is too costly; `searchLimit` is indeterminate. Only `noOutlet`
+          // proves the body is sealed.
+          s.sealedFrames++;
+          s.fracturePressure = Math.min(
+            s.fracturePressure + s.fracture!.pressureRate, s.fracture!.maxPressure);
+          // One fracture per source per update. After a successful fracture,
+          // STOP processing this source until the next update (plan invariant 8):
+          // the opened cell must not be routed through in the same tick. The
+          // global `fracturePerFrame` still bounds work across sources.
+          if (fracturedThisUpdate) break;
           const fractured = this._tryFracture(s);
-          if (!fractured) break; // nothing to break; stop for this frame
+          if (fractured) { fracturedThisUpdate = true; break; }
+          break;
+        } else if (configured) {
+          // Configured source, non-seal rejection: accumulate and retry.
+          break;
+        } else {
+          // Legacy source: the original behavior. Try to fracture on any
+          // rejection and keep looping (the converted cell is immediately
+          // traversable, so the loop re-enters and routes through it this
+          // frame). The per-frame fracture cap bounds the work.
+          const fractured = this._tryFracture(s);
+          if (!fractured) break;
         }
       }
 
@@ -3302,19 +3447,37 @@ export class PixelEngine {
   }
 
   /**
-   * Find the weakest affordable solid boundary of the source's connected liquid
-   * body and fracture it: convert the solid to the source material, deduct its
-   * `pressureStrength` from the source's available pressure, and count it
-   * against the per-frame fracture cap. Returns `true` if a cell was fractured.
+   * Fracture a breakable solid boundary of the source's connected liquid body,
+   * converting it to the source material and charging the pressure budget.
+   * Returns `true` if a cell was fractured.
    *
-   * The boundary scan is a bounded flood fill from the source, not a Dijkstra —
-   * fracture does not need a cost-optimal path, only reachability. The flood
-   * reuses the pressure scratch arrays' generation stamp so it costs no full
-   * clear.
+   * Selection depends on the source:
+   *  - Configured (`fracture` set): the HIGHEST-POTENTIAL boundary solid — the
+   *    innermost cell of the plug capping the conduit. Gravity potential (`-y`
+   *    flat, `distance` radial) increases outward, so this is the shallowest
+   *    blocker, not the weakest solid. Clearing it marches the magma outward
+   *    one cell per frame rather than excavating sideways through cone tephra
+   *    or chamber walls. Affordability is checked against ONLY this target; if
+   *    it is too strong the source waits rather than carving around it.
+   *  - Legacy (no `fracture`): the weakest affordable solid, the original
+   *    behavior — unchanged.
+   *
+   * The boundary scan is a bounded flood fill from the source, not a Dijkstra
+   * — fracture needs only reachability. The flood reuses the pressure scratch
+   * arrays' generation stamp so it costs no full clear. At most one cell
+   * fractures per call; the caller enforces one call per source per update.
    */
   private _tryFracture(s: PressureSource): boolean {
     if (this._fracturesThisFrame >= this.fracturePerFrame) return false;
-    if (s.availablePressure <= 0) return false;
+
+    // Sealed-interval gate: a freshly sealed plug is not immediately exposed to
+    // fracture. The source must be sealed for a visible interval before any
+    // solid is broken, so reopening reads as a deliberate event. Legacy sources
+    // (no `fracture` config) have no delay and charge the transport budget.
+    const fcfg = s.fracture;
+    const budget = fcfg ? s.fracturePressure : s.availablePressure;
+    if (fcfg && s.sealedFrames < fcfg.minSealedFrames) return false;
+    if (budget <= 0) return false;
 
     const w = this.width;
     const h = this.height;
@@ -3326,12 +3489,23 @@ export class PixelEngine {
     // If the source cell itself is empty, there is no body to flood from.
     if (this.grid[srcIdx] !== mat) return false;
 
-    // Flood fill the connected liquid body, collecting opted-in solid
-    // boundaries. Track the weakest affordable one (lowest strength that the
-    // available pressure exceeds), breaking ties by lowest cell index for
-    // determinism.
-    let weakestIdx = -1;
-    let weakestStrength = Infinity;
+    const pot = this._potentialAt;
+    const directional = fcfg !== null && pot !== null;
+    let targetIdx = -1;
+    let targetStrength = Infinity;
+    let targetPot = -Infinity;
+
+    // Flood fill the connected liquid body, collecting boundary solids.
+    //  - Configured source (the volcano): pick the HIGHEST-POTENTIAL boundary
+    //    solid (closest to the surface) — the innermost cell of the plug capping
+    //    the conduit. On radial gravity potential = distance from center, so the
+    //    plug outranks any cone-flank tephra the body has touched; on flat
+    //    gravity potential = -y, so the shallow cap outranks a deep canary.
+    //    Affordability is checked against ONLY that target; if it is too strong
+    //    the source waits rather than carving sideways through a weaker deeper
+    //    solid. This is what stops a sealed vent from mining the cone.
+    //  - Legacy source (no `fracture` config): weakest-affordable, the original
+    //    behavior, byte-identical.
     const stack = this._pressHeap!; // reuse as a LIFO stack
     let stackTop = 0;
     stack[0] = srcIdx;
@@ -3362,36 +3536,101 @@ export class PixelEngine {
             }
             stack[++stackTop] = nb;
           }
-        } else if (nbMat !== MaterialType.EMPTY && hasPressureStrength[nbMat]) {
-          // Solid boundary that opted into fracture.
-          const strength = materialDefs[nbMat].pressureStrength!;
-          if (
-            s.availablePressure > strength &&
-            (strength < weakestStrength ||
-              (strength === weakestStrength && nb < weakestIdx))
-          ) {
-            weakestStrength = strength;
-            weakestIdx = nb;
+        } else if (nbMat !== MaterialType.EMPTY) {
+          if (directional) {
+            // Configured: inspect ALL non-empty solids (including unbreakable
+            // ones like WALL), select the foremost (highest-potential), then
+            // check breakability AFTER. This makes an unbreakable foremost cap
+            // stall the source instead of being invisible and letting fracture
+            // fall through to breakable solids behind/beside it.
+            // When a vent anchor is set, restrict fracture to the corridor so
+            // the source cannot start a breakout away from the vent mouth.
+            if (s.ventAnchor) {
+              const nbx0 = nb % w;
+              const nby0 = (nb - nbx0) / w;
+              const dpx = nbx0 - s.ventAnchor.cx;
+              const dpy = nby0 - s.ventAnchor.cy;
+              const ux0 = Math.cos(s.ventAnchor.angle);
+              const uy0 = Math.sin(s.ventAnchor.angle);
+              const perp = Math.abs(-uy0 * dpx + ux0 * dpy);
+              if (perp > s.ventAnchor.corridorRadius) continue;
+            }
+            const strength = materialDefs[nbMat].pressureStrength ?? Infinity;
+            const nbx = nb % w;
+            const nby = (nb - nbx) / w;
+            const p = pot!(nbx, nby);
+            // Front-continuity tiebreak: when a fracture front exists and this
+            // candidate is a cardinal neighbor of it, give it a small potential
+            // bonus so the fracture continues from the front rather than hopping
+            // to a parallel lane at the same potential.
+            const isFrontNeighbor = s.fractureFront >= 0 && (
+              nb === s.fractureFront - 1 || nb === s.fractureFront + 1 ||
+              nb === s.fractureFront - w || nb === s.fractureFront + w
+            );
+            const effectivePot = isFrontNeighbor ? p + 0.5 : p;
+            if (
+              effectivePot > targetPot ||
+              (effectivePot === targetPot && strength < targetStrength) ||
+              (effectivePot === targetPot && strength === targetStrength && nb < targetIdx)
+            ) {
+              targetPot = p;
+              targetStrength = strength;
+              targetIdx = nb;
+            }
+          } else if (hasPressureStrength[nbMat]) {
+            // Legacy: weakest affordable breakable solid; ties by lowest index.
+            const strength = materialDefs[nbMat].pressureStrength!;
+            if (
+              budget > strength &&
+              (strength < targetStrength ||
+                (strength === targetStrength && nb < targetIdx))
+            ) {
+              targetStrength = strength;
+              targetIdx = nb;
+            }
           }
         }
       }
     }
 
-    if (weakestIdx < 0) return false;
+    if (targetIdx < 0) return false;
+    // The selected target (shallowest blocker for configured sources, weakest
+    // affordable for legacy) is currently too strong for the accumulated budget:
+    // wait. For configured sources this is the afford-or-wait guarantee — never
+    // carve around the plug through a weaker, deeper solid.
+    if (budget <= targetStrength) return false;
 
     // Fracture: convert the solid to the source material, opening the conduit.
     // This conserves mass (the rock becomes part of the flow) rather than
     // deleting it. The converted cell carries the source temperature if set.
-    const fx = weakestIdx % w;
-    const fy = (weakestIdx - fx) / w;
+    const fx = targetIdx % w;
+    const fy = (targetIdx - fx) / w;
     this.setMaterial(fx, fy, mat);
     if (this.heatGrid && s.temperature !== undefined) {
-      this.heatGrid[weakestIdx] = s.temperature;
+      this.heatGrid[targetIdx] = s.temperature;
       this.wakeThermalChunk(fx, fy);
     }
-    // Consume pressure equal to the strength, so a weakened source stops
-    // breaking until it has accumulated more.
-    s.availablePressure = Math.max(0, s.availablePressure - weakestStrength);
+    // Consume pressure equal to the strength. For configured sources this comes
+    // from the separate fracture budget, not transport head, so a single break
+    // does not drain the source's ability to keep routing once the plug clears.
+    if (fcfg) s.fracturePressure = Math.max(0, s.fracturePressure - targetStrength);
+    else s.availablePressure = Math.max(0, s.availablePressure - targetStrength);
+    // Remember the fractured cell so the next sealed frame continues from here
+    // (front-continuity) instead of rescanning the entire magma boundary.
+    if (fcfg) {
+      // If the fractured cell is now adjacent to EMPTY, the plug has broken
+      // through to open air — the seal is cleared. Reset the front so the next
+      // sealed frame (if any) does a fresh full-boundary flood rather than
+      // continuing to tunnel outward through surface rock.
+      const tx = targetIdx % w;
+      const ty = (targetIdx - tx) / w;
+      const reachedAir =
+        (ty > 0 && this.grid[targetIdx - w] === MaterialType.EMPTY) ||
+        (ty < h - 1 && this.grid[targetIdx + w] === MaterialType.EMPTY) ||
+        (tx > 0 && this.grid[targetIdx - 1] === MaterialType.EMPTY) ||
+        (tx < w - 1 && this.grid[targetIdx + 1] === MaterialType.EMPTY);
+      s.fractureFront = reachedAir ? -1 : targetIdx;
+    }
     this._fracturesThisFrame++;
     this._pressureMovesThisFrame++;
     return true;
@@ -3428,6 +3667,7 @@ export class PixelEngine {
    */
   private _routeOneVolume(
     req: LiquidInjection,
+    ventAnchor?: { cx: number; cy: number; angle: number; corridorRadius: number } | null,
   ):
     | { kind: 'accepted'; cost: number; outletIdx: number; path: number[] }
     | { kind: 'rejected'; reason: InjectionRejectionReason } {
@@ -3502,7 +3742,22 @@ export class PixelEngine {
         const nby = (nb - nbx) / w;
 
         if (nbMat === MaterialType.EMPTY) {
-          // Outlet candidate. Candidate cost = path cost to `cur` + final edge.
+          // Outlet candidate. When a vent anchor is set (the volcano), only
+          // accept outlets within the corridor radius — summit lava that has
+          // spread laterally must not become additional pressure-fed vents.
+          if (ventAnchor) {
+            // Perpendicular distance from the vent axis (the line from center
+            // through the vent angle). This tracks cone growth — the axis
+            // extends to any height, unlike a fixed surface point.
+            const dpx = nbx - ventAnchor.cx;
+            const dpy = nby - ventAnchor.cy;
+            const ux = Math.cos(ventAnchor.angle);
+            const uy = Math.sin(ventAnchor.angle);
+            // Perpendicular component = dot product with the axis perpendicular.
+            const perp = Math.abs(-uy * dpx + ux * dpy);
+            if (perp > ventAnchor.corridorRadius) continue;
+          }
+          // Candidate cost = path cost to `cur` + final edge.
           anyOutletSeen = true;
           const potDiff = Math.max(0, pot(nbx, nby) - pot(cx, cy));
           const candCost = curCost + potDiff + resistance;
@@ -3605,17 +3860,30 @@ export class PixelEngine {
    * the source alongside the route cost — closing the energy double-count.
    *
    * Below {@link MIN_OUTLET_SURPLUS} no velocity is written (the effusive case:
-   * the cell just extrudes and falls). The direction is the parent→outlet
-   * cardinal vector, which is the conduit's exit heading.
+   * the cell just extrudes and falls).
+   *
+   * The launch axis is the local **up** direction — the reverse of
+   * {@link GravityModel.gravityAt} at the outlet — not the parent→outlet step.
+   * The exit heading reads like the natural choice, but it is quantized to four
+   * cardinal directions by the router, and which one it lands on depends on
+   * which face of the vent happened to be open that frame. On a volcano that
+   * put roughly a fifth of all parcels on a *horizontal* launch at full fountain
+   * speed, firing lava out of the side of the cone. Gravity is continuous and
+   * always points along the conduit a vent actually sits in, so it gives a
+   * stable jet that fans about the vertical instead.
    *
    * @param r         The accepted route result (carries outlet index and path).
    * @param headBefore The source's available pressure *before* cost deduction.
+   * @param efficiency Fraction of surplus head converted to launch speed.
+   * @param lateralSpread Lateral fraction of launch speed; see
+   *   {@link OUTLET_LATERAL_SPREAD}.
    * @returns The kinetic head consumed, or 0 if below threshold.
    */
   private _applyOutletVelocity(
     r: { cost: number; outletIdx: number; path: number[] },
     headBefore: number,
     efficiency: number = OUTLET_VELOCITY_EFFICIENCY,
+    lateralSpread: number = OUTLET_LATERAL_SPREAD,
   ): number {
     const surplus = headBefore - r.cost;
     if (surplus < MIN_OUTLET_SURPLUS) return 0;
@@ -3625,30 +3893,31 @@ export class PixelEngine {
     const speedFP = Math.round(speedCellsPerFrame * VELOCITY_CELL_UNIT);
     if (speedFP === 0) return 0;
 
-    // Direction: parent → outlet (the conduit's exit heading), plus a lateral
-    // spread so the fountain fans outward rather than building a spire. The
-    // spread is deterministic — derived from the cell index via a hash, not from
-    // the global RNG — so it does not perturb fire/growth randomness. The spread
-    // magnitude scales with speed: a faster launch spreads wider.
     const w = this.width;
-    const path = r.path;
-    const pIdx = path[path.length - 1];
-    const px = pIdx % w, py = (pIdx - px) / w;
     const ox = r.outletIdx % w, oy = (r.outletIdx - ox) / w;
-    // Base direction along the exit heading.
-    let dvx = (ox - px) * speedFP;
-    let dvy = (oy - py) * speedFP;
-    // Lateral spread: a per-cell deterministic angle in [-spread, +spread].
-    // The hash gives a uniform spread; multiplied by speed so faster = wider.
-    const hash = ((r.outletIdx * 2654435761) >>> 0) / 4294967296; // 0..1
-    const lateral = (hash - 0.5) * 2 * speedFP * OUTLET_LATERAL_SPREAD;
-    // Apply lateral along the gravity-perpendicular axis (left/right of the
-    // exit heading). For a vertical exit (dvx=0, dvy≠0), lateral is horizontal.
-    if (dvx === 0) {
-      dvx = Math.round(lateral);
-    } else {
-      dvy = Math.round(lateral);
-    }
+
+    // Launch axis: local up, i.e. against gravity at the outlet.
+    const g = this.gravity.gravityAt(ox, oy);
+    const glen = Math.hypot(g.x, g.y) || 1;
+    const ux = -g.x / glen, uy = -g.y / glen;
+
+    // Lateral spread, perpendicular to the launch axis. Deterministic — hashed
+    // from the outlet index and the frame counter rather than drawn from the
+    // global RNG, so it does not perturb fire/growth randomness — but it varies
+    // per launch, which is what makes a steady vent throw a fan instead of
+    // retracing one trajectory.
+    const hash =
+      (Math.imul(r.outletIdx ^ Math.imul(this.frameCount + 1, 0x9e3779b1), 2654435761) >>> 0) /
+      4294967296; // 0..1
+    const lateral = (hash - 0.5) * 2 * lateralSpread;
+
+    // Rotate the axis by the lateral fraction, then renormalize so the spread
+    // redirects the launch rather than adding free speed to it.
+    const dirX = ux - uy * lateral;
+    const dirY = uy + ux * lateral;
+    const dlen = Math.hypot(dirX, dirY) || 1;
+    const dvx = Math.round((dirX / dlen) * speedFP);
+    const dvy = Math.round((dirY / dlen) * speedFP);
 
     this.setVelocity(ox, oy, dvx, dvy);
 
@@ -3817,9 +4086,40 @@ export class PixelEngine {
 
               // --- Gas rising (gravity-relative: "up" = -down) ---
               if (def.isGas) {
+                const riseX = x - dDX;
+                const riseY = y - dDY;
+                // Ephemeral decay. Rolled *before* movement so a gas cell can
+                // expire even when its gravity-relative rise path is wide open:
+                // the old rule only attempted decay once every route was blocked,
+                // so freely rising smoke could never vanish on the tick it was
+                // rolled to. The chance is a per-material property so gases can
+                // opt into their own decay rate.
+                if (def.decayChance !== undefined && this.random() < def.decayChance) {
+                  this.grid[sourceIdx] = MaterialType.EMPTY;
+                  this.updated[sourceIdx] = 1;
+                  this.wakeChunk(x, y);
+                  this.markRenderDirty(x, y);
+                  continue;
+                }
+                // The rest of the engine intentionally treats out-of-bounds
+                // as a solid wall so sand and liquids stay inside the world.
+                // Gases that opt into an open boundary instead continue their
+                // outward rise off-grid and leave the simulation. Check this
+                // before lateral fallbacks; otherwise radial smoke slides along
+                // the square canvas edge and forms a visible rim.
+                if (
+                  def.escapesAtBoundary &&
+                  (riseX < 0 || riseX >= this.width || riseY < 0 || riseY >= this.height)
+                ) {
+                  this.grid[sourceIdx] = MaterialType.EMPTY;
+                  this.updated[sourceIdx] = 1;
+                  this.wakeChunk(x, y);
+                  this.markRenderDirty(x, y);
+                  continue;
+                }
                 // Rise straight up.
-                if (this.canDisplace(x, y, x - dDX, y - dDY)) {
-                  this.swap(x, y, x - dDX, y - dDY);
+                if (this.canDisplace(x, y, riseX, riseY)) {
+                  this.swap(x, y, riseX, riseY);
                 } else {
                   // Try rising diagonally: "up-diagonals" = (-down) + left/right.
                   const upLeftX = lDX - dDX;
@@ -3847,16 +4147,6 @@ export class PixelEngine {
                       this.swap(x, y, x + lDX, y + lDY);
                     } else if (flowRight) {
                       this.swap(x, y, x + rDX, y + rDY);
-                    } else if (mat === MaterialType.STEAM && this.random() < 0.05) {
-                      this.grid[sourceIdx] = MaterialType.EMPTY;
-                      this.updated[sourceIdx] = 1;
-                      this.wakeChunk(x, y);
-                      this.markRenderDirty(x, y);
-                    } else if (mat === MaterialType.SMOKE && this.random() < 0.02) {
-                      this.grid[sourceIdx] = MaterialType.EMPTY;
-                      this.updated[sourceIdx] = 1;
-                      this.wakeChunk(x, y);
-                      this.markRenderDirty(x, y);
                     }
                   }
                 }

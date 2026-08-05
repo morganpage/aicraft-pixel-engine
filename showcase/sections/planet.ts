@@ -25,15 +25,14 @@ import { paintGridInto, buildPalette } from '../helpers/renderer';
 import { attachViewport } from '../helpers/viewport';
 import {
   stampVolcano,
-  stepVolcanoPre,
-  stepVolcanoPost,
-  syncFromHeat,
   createVolcanoState,
-  isDormant,
   makeRng,
   volcanoGeometryFor,
+  buildVolcanoOpts,
+  stepVolcanoFrame,
   type VolcanoConfig,
   type VolcanoStepOptions,
+  type VolcanoRuntime,
 } from '../helpers/volcano';
 import {
   placeCloud,
@@ -502,44 +501,15 @@ export function initPlanet(container: HTMLElement): void {
    * Read the eruption's tuning fresh each tick, so slider changes apply
    * mid-eruption. The cap has to be read live too — "Erupt again" raises it.
    */
-  const volcanoOpts = (): VolcanoStepOptions => ({
-    pressure: {
-      // effusion: cells of magma supplied per frame (slider). The engine routes
-      // this from the chamber feed through the connected conduit to a real
-      // outlet — no host advection or destination painting.
+  const volcanoOpts = (): VolcanoStepOptions =>
+    buildVolcanoOpts(world.volcanoCfg, {
       effusion: volcanoParams.effusion,
-      // High enough to route through the full ~26-cell conduit immediately when
-      // effusion starts, and to fracture frozen bore cells (ROCK strength 15)
-      // within a few frames. The bore freezes between episodes; the source
-      // fractures it back open at the start of each effusive phase.
-      pressureRate: 35,
-      maxPressure: 60,
-      maxPending: 5,
-      // Only just above the cone's cap. More headroom than this and lava stops
-      // running down the cone and starts building a level slab on top of it.
-      maxHeight: capHeight + 2,
-      // Explosive-phase fountain: high pressure so surplus at the vent converts
-      // to ballistic velocity (Torricelli, 6B). Fragmented fountain parcels
-      // build the tephra cone and leave a few visible hot bombs in the arc.
-      explosive: {
-        rate: volcanoParams.fountainRate,
-        pressureRate: Math.max(10, volcanoParams.fountainPressure),
-        maxPressure: volcanoParams.fountainPressure,
-        // The parcel cap tracks the Fountain Rate slider's ceiling (4). One
-        // parcel per frame keeps a focused tephra jet; multiple same-frame
-        // routes see the first parcel as still-liquid (fragmentation runs
-        // later), branch through its lateral boundaries, and widen the jet
-        // into a spray. The cap bounds that widening so a maxed-out fountain
-        // is dense but not a broad fan, and `rate` is what actually controls
-        // density up to it.
-        maxPending: 4,
-      },
-    },
-    // Tephra is lighter than lava and stays above surface flows. A slow cleanup
-    // rate still remelts the occasional grain trapped deep in the plumbing
-    // without erasing the cone-building exterior deposit.
-    assimilateRate: 0.03,
-  });
+      fountainRate: volcanoParams.fountainRate,
+      fountainPressure: volcanoParams.fountainPressure,
+      // The cap grows cycle by cycle (capStart → +capStep → … → capMax); the
+      // first cycle of a fresh planet starts at capStart.
+      maxHeight: capHeight,
+    });
 
   const PHASE_LABEL: Record<string, string> = {
     explosive: 'explosive — ash & tephra',
@@ -795,22 +765,20 @@ export function initPlanet(container: HTMLElement): void {
       const copts = cloudOpts();
       for (let i = 0; i < clouds.length; i++) stepCloud(engine, clouds[i], copts, cloudRng);
     }
-    if (erupting) {
-      const opts = volcanoOpts();
-      stepVolcanoPre(engine, volcanoCfg, volcanoState, volcanoRng, opts);
-      engine.update();
-      stepVolcanoPost(engine, volcanoCfg, volcanoState, volcanoRng, opts);
-      phaseLabel.textContent = PHASE_LABEL[volcanoState.phase] ?? volcanoState.phase;
-      // The eruption cycle runs once: explosive → effusive → repose → done.
-      // phaseFrame === -1 signals completion (set by stepVolcanoPre).
-      if (volcanoState.phaseFrame < 0 || isDormant(engine, volcanoCfg, capHeight)) goDormant();
-    } else {
-      engine.update();
+    // The volcano's pure per-frame core (active/dormant branch + dormancy
+    // transition + appearance sync) is shared with the headless test harness via
+    // stepVolcanoFrame, so the browser and the golden trajectory stay identical.
+    // The controller mutates runtime.erupting on completion; the UI label and
+    // any presentation-only side effects stay here.
+    if (erupting) phaseLabel.textContent = PHASE_LABEL[volcanoState.phase] ?? volcanoState.phase;
+    const runtime: VolcanoRuntime = { erupting, capHeight };
+    stepVolcanoFrame(engine, volcanoCfg, volcanoState, volcanoRng, volcanoOpts(), runtime);
+    if (erupting && !runtime.erupting) {
+      // The controller just completed the eruption. goDormant handles the
+      // presentation side (label); the source removal is already done inside.
+      goDormant();
     }
-    // Every frame, erupting or not: the engine keeps cooling and freezing cells
-    // during a dormant spell, and a freeze clears the cell's colour, so flows
-    // that set while the volcano is quiet need repainting too.
-    syncFromHeat(engine);
+    erupting = runtime.erupting;
     if (clouds.length > 0) clouds = removeDead(clouds);
 
     perfMs += performance.now() - t0;

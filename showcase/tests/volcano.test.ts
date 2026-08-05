@@ -4,133 +4,54 @@ import { MaterialType, Materials } from '../../src/materials';
 import { RadialGravity, FlatGravity } from '../../src/gravity';
 import {
   stampVolcano,
-  emitPlume,
   syncFromHeat,
   remeltConduit,
   rechargeReservoir,
-  assimilateTephra,
   craterLowPoint,
-  createVolcanoState,
-  stepVolcanoPre,
-  stepVolcanoPost,
+  assimilateTephra,
   stiffnessForTemp,
   summitRadius,
-  edificeHeight,
   surfaceRadiusAt,
   makeRng,
   volcanoGeometryFor,
+  MAGMA_TEMP,
   TEMP_RAMP,
   TEMP_STEPS,
   TEPHRA_RAMP,
   TEPHRA_STEPS,
-  MAGMA_TEMP,
-  type VolcanoConfig,
-  type VolcanoStepOptions,
 } from '../helpers/volcano';
+import {
+  DEFAULT_VOLCANO_CFG as CFG,
+  VOLCANO_SIZE as SIZE,
+  VOLCANO_CX as CX,
+  VOLCANO_CY as CY,
+  VOLCANO_R as R,
+  buildVolcanoPlanet,
+  countMaterial,
+} from '../helpers/volcano-scenario';
 
 /**
- * Tests for the host-side volcano.
+ * Fast volcano contracts.
  *
  * The behaviours pinned here are the ones that were each, at some point, the
  * reason the volcano did not look like a volcano: magma has to visibly ascend
  * and emerge at the vent, a flow has to run down the flank and *stop*, and the
  * cone has to be built by tephra rather than by ponded lava.
+ *
+ * This file holds only tiny-grid and pure-function tests — each runs in
+ * milliseconds. The slow, multi-thousand-frame scenarios that exercise the same
+ * code on the full 220×220 shipping planet live in `volcano.scenario.test.ts`,
+ * which is excluded from the default `showcase:test` run.
  */
 
 // The showcase's own geometry (SIZE 220, planetRadius = floor(220 * 0.3)).
-// Shape assertions below are only meaningful against the configuration that
-// actually ships: the same angular spread on a smaller planet subtends a
-// narrower cone, so a shrunken test planet quietly measures a steeper volcano
-// than anyone will ever see.
-const SIZE = 220, CX = 110, CY = 110, R = 66;
-
-const CFG: VolcanoConfig = {
-  centerX: CX, centerY: CY, planetRadius: R,
-  ventAngle: -Math.PI / 2,
-  conduitHalfWidth: 1, chamberRadius: 8, chamberDepth: 26,
-};
+// Shape assertions are only meaningful against the configuration that actually
+// ships: the same angular spread on a smaller planet subtends a narrower cone,
+// so a shrunken test planet quietly measures a steeper volcano than anyone will
+// ever see.
 
 /** Showcase defaults. */
-const OPTS: VolcanoStepOptions = {
-  pressure: { effusion: 1, pressureRate: 35, maxPressure: 60, maxPending: 5, maxHeight: 22, explosive: { rate: 1, pressureRate: 80, maxPressure: 100, maxPending: 1 } },
-  // Match the showcase: slow enough that fresh fallout survives its brief
-  // transit through surface lava, while persistent embedded grains still melt.
-  assimilateRate: 0.03,
-};
-
-function buildPlanet(): PixelEngine {
-  const e = new PixelEngine({
-    width: SIZE, height: SIZE, seed: 1,
-    gravity: new RadialGravity({ centerX: CX, centerY: CY }),
-    // The volcano runs on the engine's heat field now: lava is born hot, cools
-    // by exposure, and freezes to rock without the host doing anything.
-    enableHeat: true,
-    // Match the showcase: enough fractures/frame to reopen a frozen bore.
-    fracturePerFrame: 4,
-  });
-  for (let y = 0; y < SIZE; y++) {
-    for (let x = 0; x < SIZE; x++) {
-      const dx = x - CX, dy = y - CY;
-      if (dx * dx + dy * dy <= R * R) e.setMaterial(x, y, MaterialType.ROCK);
-    }
-  }
-  return e;
-}
-
-const count = (e: PixelEngine, m: MaterialType): number => {
-  let n = 0;
-  for (let i = 0; i < e.grid.length; i++) if (e.grid[i] === m) n++;
-  return n;
-};
-
-/** Material deposited beyond the planet's original surface. */
-const countOutside = (e: PixelEngine, m: MaterialType): number => {
-  let n = 0;
-  for (let y = 0; y < SIZE; y++) {
-    for (let x = 0; x < SIZE; x++) {
-      if (Math.hypot(x - CX, y - CY) > R && e.getMaterial(x, y) === m) n++;
-    }
-  }
-  return n;
-};
-
-/** Run a full eruption with the showcase defaults. */
-function erupt(frames: number, seed = 4242): PixelEngine {
-  const e = buildPlanet();
-  stampVolcano(e, CFG);
-  const st = createVolcanoState();
-  const rng = makeRng(seed);
-  for (let f = 0; f < frames; f++) {
-    stepVolcanoPre(e, CFG, st, rng, OPTS);
-    e.update();
-    stepVolcanoPost(e, CFG, st, rng, OPTS);
-    syncFromHeat(e); // every frame, as the showcase does
-  }
-  return e;
-}
-
-/** Material outside the original surface — i.e. newly built land. */
-function edifice(e: PixelEngine): { cells: number; height: number; halfWidth: number; spreadDeg: number } {
-  let cells = 0, height = 0, spreadDeg = 0;
-  const profile = new Map<number, number>();
-  for (let y = 0; y < SIZE; y++) {
-    for (let x = 0; x < SIZE; x++) {
-      const dx = x - CX, dy = y - CY;
-      const d = Math.hypot(dx, dy);
-      if (d <= R) continue;
-      const m = e.getMaterial(x, y);
-      if (m !== MaterialType.ROCK && m !== MaterialType.TEPHRA && m !== MaterialType.LAVA) continue;
-      cells++;
-      height = Math.max(height, d - R);
-      const deg = Math.round(((Math.atan2(dy, dx) * 180) / Math.PI + 90 + 540) % 360 - 180);
-      spreadDeg = Math.max(spreadDeg, Math.abs(deg));
-      profile.set(deg, Math.max(profile.get(deg) ?? 0, d - R));
-    }
-  }
-  const spanDeg = [...profile.entries()].filter(([, h]) => h >= 1).map(([a]) => Math.abs(a));
-  const halfWidth = (spanDeg.length ? Math.max(...spanDeg) : 0) * (Math.PI / 180) * R;
-  return { cells, height, halfWidth, spreadDeg };
-}
+const buildPlanet = (): PixelEngine => buildVolcanoPlanet(CFG, SIZE);
 
 describe('temperature and appearance', () => {
   // The ramp used to be a *storage format*: temperature was quantized into 48
@@ -208,14 +129,24 @@ describe('temperature and appearance', () => {
     expect(whenCool).toBeGreaterThan(whenHot);
   });
 
-  it('stiffens lava monotonically as it cools, never below 2', () => {
-    // The floor of 2 is load-bearing: at 1 the yield criterion can never be met,
-    // so lava would thin without limit into a half-occupied monolayer and freeze
-    // as a checkerboard of specks.
+  it('stiffens lava monotonically as it cools, and only vent-fresh lava is free', () => {
+    // A yield thickness of 1 means "free to move at any depth" — the criterion
+    // can never be met by a single cell — so held there a flow thins without
+    // limit into a half-occupied monolayer and freezes as a checkerboard of
+    // specks. It is confined to a narrow window at the top of the range, which
+    // in practice is the vent and a cell or two beyond it: an exposed film
+    // loses roughly 0.08 per frame, so nothing stays above 0.85 for long.
+    //
+    // The window has to exist at all, though. With a floor of 2, a flow needed
+    // two cells of depth before it could move *anywhere*, which is more than a
+    // vent delivers onto a slope: the effusive phase ponded at the summit and
+    // froze as a flat slab instead of running down the cone.
     let prev = 0;
     for (let t = 1; t >= 0; t -= 0.05) {
       const s = stiffnessForTemp(t);
-      expect(s).toBeGreaterThanOrEqual(2);
+      expect(s).toBeGreaterThanOrEqual(1);
+      expect(s, `t=${t.toFixed(2)} must be depth-gated below vent heat`)
+        .toBeGreaterThanOrEqual(t >= 0.85 ? 1 : 2);
       expect(s).toBeGreaterThanOrEqual(prev);
       prev = s;
     }
@@ -277,37 +208,13 @@ describe('conduit and vent', () => {
       rate: 1, pressureRate: 35, maxPressure: 60, maxPending: 5,
       temperature: MAGMA_TEMP,
     });
-    const before = count(e, MaterialType.LAVA);
+    const before = countMaterial(e, MaterialType.LAVA);
     for (let f = 0; f < 80; f++) { e.update(); rechargeReservoir(e, CFG); }
     // Magma reached the surface through the connected conduit. Some may have
     // fragmented to TEPHRA during flight, so count both products together.
-    expect(count(e, MaterialType.LAVA) + count(e, MaterialType.TEPHRA)).toBeGreaterThan(before);
+    expect(countMaterial(e, MaterialType.LAVA) + countMaterial(e, MaterialType.TEPHRA)).toBeGreaterThan(before);
     expect(summitRadius(e, CFG)).toBeGreaterThan(R);
   });
-
-  it('the explosive phase produces a pressure-launched lava fountain', () => {
-    // The explosive phase creates a high-pressure source. Surplus head at the
-    // vent converts to ballistic velocity (Torricelli), so magma launches from
-    // the vent as a fountain. Some of it fragments to TEPHRA during flight. The
-    // proof is that granular ejecta appears above the planet surface during
-    // the explosive phase — it could only get there via ballistic flight +
-    // fragmentation.
-    const e = buildPlanet();
-    stampVolcano(e, CFG);
-    const st = createVolcanoState();
-    const rng = makeRng(7);
-    let sawTephraAboveSurface = false;
-    for (let f = 0; f < 200; f++) {
-      stepVolcanoPre(e, CFG, st, rng, OPTS);
-      if (st.phaseFrame < 0) break;
-      e.update();
-      stepVolcanoPost(e, CFG, st, rng, OPTS);
-      syncFromHeat(e);
-      // Check for TEPHRA above the planet surface (outside the original radius).
-      if (count(e, MaterialType.TEPHRA) > 0) { sawTephraAboveSurface = true; break; }
-    }
-    expect(sawTephraAboveSurface).toBe(true);
-  }, 20_000);
 
   it('spills onto the lowest ground in the crater, not the highest', () => {
     // This is what stops the volcano building a one-cell spire: a lone cell on a
@@ -332,26 +239,6 @@ describe('conduit and vent', () => {
     const spot = craterLowPoint(e, CFG, 0.10, makeRng(1));
     expect(spot.radius).toBeLessThan(raised);
   });
-
-  it('does not let fallout choke the conduit', () => {
-    // Tephra normally floats on lava, but a ballistic grain can still enter the
-    // open vent and reach the plumbing.
-    // The old `remeltConduit` cleared the bore spotless every frame; the engine
-    // pressure source now keeps the conduit *functional* (magma routes through
-    // it) without necessarily removing every grain. The property that matters is
-    // that the bore is mostly lava and the volcano is not choked, not spotlessness.
-    const e = erupt(1200);
-    let lava = 0, tephra = 0;
-    for (let r = R - CFG.chamberDepth - CFG.chamberRadius; r <= R; r++) {
-      for (let w = -CFG.conduitHalfWidth; w <= CFG.conduitHalfWidth; w++) {
-        const m = e.getMaterial(Math.round(CX + w), Math.round(CY - r));
-        if (m === MaterialType.LAVA) lava++;
-        else if (m === MaterialType.TEPHRA) tephra++;
-      }
-    }
-    expect(tephra).toBeLessThan(8); // not choked — a few grains, not a plug
-    expect(lava).toBeGreaterThan(20);
-  }, 20_000);
 
   it('remeltConduit clears the chamber halo without eating bedrock', () => {
     // A fixed reclaim region, re-applied identically each frame, can only ever
@@ -428,95 +315,9 @@ describe('cooling', () => {
     for (let i = 1; i < temps.length; i++) maxJump = Math.max(maxJump, Math.abs(temps[i] - temps[i - 1]));
     expect(maxJump).toBeLessThan(0.2);
   });
-
-  it('does not leave frozen ejecta hanging in mid-air', () => {
-    // Ejecta is spawned in mid-air and the engine has no velocity, so a cell in
-    // flight is a lone airborne cell -- maximum exposure by the cooling rule,
-    // and therefore the likeliest thing to freeze before it has landed. Frozen
-    // lava is ROCK, a static solid that never falls, so it would hang in the
-    // sky. The guard for this is now the engine's, applied for every host.
-    const e = erupt(900);
-    const solid = (m: MaterialType): boolean =>
-      m === MaterialType.ROCK || m === MaterialType.TEPHRA || m === MaterialType.LAVA;
-    let specks = 0;
-    for (let y = 0; y < SIZE; y++) {
-      for (let x = 0; x < SIZE; x++) {
-        if (Math.hypot(x - CX, y - CY) <= R) continue;
-        if (e.getMaterial(x, y) !== MaterialType.ROCK) continue;
-        let neighbours = 0;
-        for (const [ox, oy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]] as const) {
-          if (solid(e.getMaterial(x + ox, y + oy))) neighbours++;
-        }
-        if (neighbours === 0) specks++;
-      }
-    }
-    expect(specks).toBeLessThanOrEqual(3);
-  }, 20_000);
 });
 
 describe('cone profile', () => {
-  /** Height above the original surface at each whole degree from the vent. */
-  function heightProfile(e: PixelEngine): number[] {
-    const hs: number[] = [];
-    for (let d = -50; d <= 50; d++) hs.push(surfaceRadiusAt(e, CFG, CFG.ventAngle + (d * Math.PI) / 180, 80) - R);
-    return hs;
-  }
-
-  it('has flanks that slope like a cone, not walls like a mesa', () => {
-    // The regression this whole profile section exists for. Two bugs each made
-    // the edifice a flat-topped slab with cliff sides rather than a cone:
-    //
-    //  1. `emitPlume` launched every cell at the radius of the summit *on the
-    //     vent axis*, whatever angle it was aimed at. A cell aimed out on the
-    //     flank was therefore spawned far above its local ground, so the arc
-    //     simply filled to a uniform radius and ended in a wall at ±spread.
-    //     Widening the spread made it worse — a wider slab, not a broader cone.
-    //  2. Fallout was spread evenly across the arc, so the deposit grew at the
-    //     same rate everywhere and had no reason to taper.
-    //
-    // Measured with both in place the mean flank was 46-64°, against roughly 30°
-    // for a real cinder cone.
-    const e = erupt(2600);
-    const hs = heightProfile(e);
-    const peak = Math.max(...hs);
-    const pi = hs.indexOf(peak);
-    let zi = pi;
-    while (zi < hs.length - 1 && hs[zi] > 0) zi++;
-    const arcPerDeg = (Math.PI / 180) * R;
-    const meanFlank = (Math.atan(peak / Math.max(1, (zi - pi) * arcPerDeg)) * 180) / Math.PI;
-
-    expect(peak).toBeGreaterThan(3); // single-cycle cone is smaller than the old multi-cycle one
-    // The physics-driven cone (fragmented fountain ejecta) is flatter than the
-    // old plume-built cone. The key property is that it tapers at all rather
-    // than being a uniform-height slab.
-    expect(meanFlank).toBeGreaterThan(3); // not perfectly flat
-  }, 30_000);
-
-  it('keeps a crater without letting it become a chasm', () => {
-    // The fountain's ballistic ejecta naturally concentrates near the vent
-    // (material launched straight up falls back close) while material launched
-    // at an angle lands further out — producing a ring deposit with a crater.
-    const e = erupt(2600);
-    const hs = heightProfile(e);
-    const peak = Math.max(...hs);
-    const axis = hs[50]; // the vent axis
-    const crater = peak - axis;
-    // A single-cycle cone may have a smaller crater; the key property is that
-    // the rim is higher than the axis (there IS a depression at the vent).
-    if (peak > 2) {
-      expect(crater).toBeGreaterThanOrEqual(0);
-      expect(crater).toBeLessThan(peak * 0.85); // not a chasm
-    }
-  }, 30_000);
-
-  it('caps growth on the highest point, not the vent axis', () => {
-    // Once there is a crater the vent axis is the *lowest* point of the summit,
-    // so a cap watching it never trips and the rim grows without bound —
-    // measured, a cap of 20 let the rim reach 40 and keep climbing.
-    const e = erupt(2600);
-    expect(edificeHeight(e, CFG)).toBeLessThanOrEqual(OPTS.pressure.maxHeight + 6);
-  }, 30_000);
-
   it('surfaceRadiusAt steps over single-cell pinholes in the disc', () => {
     // A circle rasterized onto a square grid leaves one-cell gaps along some
     // rays. Stopping at the first of them reports bare planet in the middle of a
@@ -532,94 +333,6 @@ describe('cone profile', () => {
   });
 });
 
-describe('the eruption as a whole', () => {
-  it('runs explosive → effusive → repose once, then stops', () => {
-    // The eruption cycle runs a single pass: explosive builds the tephra cone,
-    // effusive sends lava flows down the flanks, repose lets everything crust
-    // over. Then it stops — no looping. The host can restart with another click.
-    const e = buildPlanet();
-    stampVolcano(e, CFG);
-    const st = createVolcanoState();
-    const rng = makeRng(1);
-    const seen: string[] = [];
-    expect(st.phase).toBe('explosive'); // opens with a burst
-    for (let f = 0; f < 1400; f++) {
-      if (seen[seen.length - 1] !== st.phase) seen.push(st.phase);
-      stepVolcanoPre(e, CFG, st, rng, OPTS);
-      if (st.phaseFrame < 0) break; // eruption complete
-      e.update();
-      stepVolcanoPost(e, CFG, st, rng, OPTS);
-    }
-    expect(seen).toEqual(['explosive', 'effusive', 'repose']);
-    expect(st.cycle).toBe(1);
-    expect(st.phaseFrame).toBe(-1); // signaled complete
-  }, 20_000);
-
-  it('builds a steep cone, not a flat shield or a mesa', () => {
-    // Shape regression. The cone's taper comes from granular tephra (fragmented
-    // lava) piling at its angle of repose; lava ponds level out and freeze with
-    // cliff edges, so a lava-built edifice is a flat-topped mesa.
-    const e = erupt(2400);
-    const built = edifice(e);
-    // The granular layer must remain visible after the full eruption. A high
-    // assimilation rate used to melt every exterior grain after it briefly sank
-    // into a surface flow, leaving a lava/rock mound despite producing tephra in
-    // flight.
-    const exteriorTephra = countOutside(e, MaterialType.TEPHRA);
-    const exteriorLavaAndRock =
-      countOutside(e, MaterialType.LAVA) + countOutside(e, MaterialType.ROCK);
-    expect(exteriorTephra).toBeGreaterThan(10);
-    // Composition is the regression: the old SAND product sank through lava and
-    // remelted, so a visually plausible mound could still be almost entirely
-    // LAVA + ROCK. The explosive phase must leave a genuinely granular cone.
-    expect(exteriorTephra).toBeGreaterThan(exteriorLavaAndRock);
-    expect(built.height).toBeGreaterThan(3); // single-cycle cone is smaller
-    // Slope = half-width : height. The physics-driven cone is wider/flatter
-    // than the old plume-built one; the key property is that it's bounded.
-    expect(built.halfWidth / built.height).toBeLessThan(9.0);
-    // The cap must actually bound the growth.
-    expect(built.height).toBeLessThan(OPTS.pressure.maxHeight + 10);
-  }, 30_000);
-
-  it('runs lava down the flanks without drowning the planet', () => {
-    // The behaviour the whole yield-strength term exists for: a flow that
-    // travels a bounded distance downslope and stops. Too little and the lava
-    // never leaves the crater; too much and it wraps the planet as an ocean.
-    const e = erupt(2400);
-    const built = edifice(e);
-    // Lava reached beyond the summit...
-    expect(built.spreadDeg).toBeGreaterThan(4); // single-cycle: smaller spread
-    // ...but nothing like the 180° an unbounded liquid reached.
-    expect(built.spreadDeg).toBeLessThan(110);
-    // And the edifice is mostly solid, not a molten blob.
-    const lava = countOutside(e, MaterialType.LAVA);
-    expect(lava).toBeLessThan(built.cells * 1.2); // single-cycle: more lava proportionally
-  }, 30_000);
-
-  it('settles to a dead stop once the eruption ends', () => {
-    // Guards every liquid invariant the engine established: an eruption must not
-    // leave the world churning forever.
-    const e = buildPlanet();
-    stampVolcano(e, CFG);
-    const st = createVolcanoState();
-    const rng = makeRng(5);
-    for (let f = 0; f < 800; f++) {
-      stepVolcanoPre(e, CFG, st, rng, OPTS);
-      e.update();
-      stepVolcanoPost(e, CFG, st, rng, OPTS);
-    }
-    // Tap off: the engine keeps cooling the remaining flows so they set.
-    for (let f = 0; f < 1500; f++) e.update();
-    for (let f = 0; f < 400; f++) e.update();
-    expect(e.swapsLastFrame).toBe(0);
-  }, 30_000);
-
-  it('is deterministic for a given seed', () => {
-    const run = (): Uint8Array => Uint8Array.from(erupt(400, 11).grid);
-    expect(run()).toEqual(run());
-  }, 20_000);
-});
-
 describe('tephra assimilation', () => {
   it('melts embedded tephra into lava and clears its tint', () => {
     const flat = new PixelEngine({ width: 12, height: 12, seed: 1, gravity: new FlatGravity() });
@@ -631,9 +344,9 @@ describe('tephra assimilation', () => {
     if (!flat.colorGrid) flat.colorGrid = new Uint32Array(12 * 12);
     flat.colorGrid[6 * 12 + 6] = 0xff242428; // dark basalt tint, nonzero
 
-    const before = count(flat, MaterialType.LAVA) + count(flat, MaterialType.TEPHRA);
+    const before = countMaterial(flat, MaterialType.LAVA) + countMaterial(flat, MaterialType.TEPHRA);
     assimilateTephra(flat, makeRng(1), { rate: 1 });
-    const after = count(flat, MaterialType.LAVA) + count(flat, MaterialType.TEPHRA);
+    const after = countMaterial(flat, MaterialType.LAVA) + countMaterial(flat, MaterialType.TEPHRA);
 
     expect(flat.getMaterial(6, 6)).toBe(MaterialType.LAVA);
     expect(after).toBe(before); // 1:1 conserved
@@ -655,40 +368,6 @@ describe('tephra assimilation', () => {
     expect(flat.getMaterial(6, 6)).toBe(MaterialType.TEPHRA);
     expect(flat.getMaterial(6, 7)).toBe(MaterialType.TEPHRA);
   });
-
-  it('does not collapse the cone', () => {
-    // End-to-end guard for the runaway the threshold prevents.
-    const e = erupt(2400);
-    expect(countOutside(e, MaterialType.TEPHRA)).toBeGreaterThan(10);
-    const built = edifice(e);
-    if (built.height > 1) {
-      expect(built.halfWidth / built.height).toBeLessThan(9.0);
-    }
-  }, 30_000);
-});
-
-describe('the explosive plume', () => {
-  it('leaves a crater inside the rim it builds', () => {
-    // A cinder cone has a crater because material thrown straight up falls back
-    // down the throat, while material thrown at an angle lands clear and stays.
-    // Without the rim the plume fills its own crater and the effusive phase has
-    // no basin to pond in.
-    const e = buildPlanet();
-    stampVolcano(e, CFG);
-    const rng = makeRng(9);
-    // emitPlume is no longer in the eruption cycle but still exists as a function.
-    // This test pins its standalone behaviour: rim-biased fallout produces a crater.
-    const plumeOpts = { perFrame: 8, spread: 0.36, loft: 5, lavaFraction: 0.05, maxHeight: 20, rimBias: 0.55 };
-    for (let f = 0; f < 600; f++) {
-      emitPlume(e, CFG, rng, plumeOpts);
-      e.update();
-      remeltConduit(e, CFG);
-    }
-    const axis = surfaceRadiusAt(e, CFG, CFG.ventAngle);
-    const rimL = surfaceRadiusAt(e, CFG, CFG.ventAngle - plumeOpts.spread * 0.8);
-    const rimR = surfaceRadiusAt(e, CFG, CFG.ventAngle + plumeOpts.spread * 0.8);
-    expect(Math.max(rimL, rimR)).toBeGreaterThan(axis);
-  }, 20_000);
 });
 
 describe('geometry derived from the planet radius', () => {

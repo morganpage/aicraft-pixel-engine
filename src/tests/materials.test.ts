@@ -92,6 +92,16 @@ describe('materials table', () => {
     expect(Materials[MaterialType.WATER].flammability).toBe(0);
   });
 
+  it('per-tick decay chances are probabilities and smoke opts in', () => {
+    for (const def of materialDefs) {
+      if (def.decayChance === undefined) continue;
+      expect(def.decayChance, `${def.name} decay chance`).toBeGreaterThanOrEqual(0);
+      expect(def.decayChance, `${def.name} decay chance`).toBeLessThanOrEqual(1);
+    }
+    expect(Materials[MaterialType.SMOKE].decayChance).toBe(0.02);
+    expect(Materials[MaterialType.SMOKE].escapesAtBoundary).toBe(true);
+  });
+
   it('isTerrainSolid flags exactly WALL/ROCK/WOOD/ICE', () => {
     expect([...TERRAIN_SOLIDS].sort((a, b) => a - b)).toEqual(
       [MaterialType.WALL, MaterialType.ROCK, MaterialType.WOOD, MaterialType.ICE].sort((a, b) => a - b),
