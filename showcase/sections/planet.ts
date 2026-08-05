@@ -33,6 +33,7 @@ import {
   type VolcanoConfig,
   type VolcanoStepOptions,
   type VolcanoRuntime,
+  type VolcanoTimings,
 } from '../helpers/volcano';
 import {
   placeCloud,
@@ -706,10 +707,32 @@ export function initPlanet(container: HTMLElement): void {
   // It is an upper bound rather than an exact count: every cell of an active
   // chunk is counted, including the air ones that cost only a branch, and edge
   // chunks count whole even where the grid ends partway through them.
-  let perfTicks = 0;
-  let perfMs = 0;
-  let perfCells = 0;
-  let perfSwaps = 0;
+  // Per-window perf accumulators. Each bucket sums the cost of one stage of the
+  // frame so a bottleneck can be attributed to its cause rather than read as a
+  // single opaque "slow" number. The split exists specifically so a frame that
+  // reports zero engine work can still expose a render-side cost — the failure
+  // mode the resolution ceiling is most likely to hit first.
+  let perfTicks = 0;          // physics steps this window
+  let perfRenderedFrames = 0; // rendered frames this window (may differ under throttle)
+  // Sub-stage costs, summed across the window:
+  let perfHostPreMs = 0;      // cloud stepping + volcano pre/post (host-owned sim)
+  let perfUpdateMs = 0;       // engine.update()
+  let perfHeatSyncMs = 0;     // host heat-driven colour/stiffness sync
+  let perfPackMs = 0;         // CPU colour packing into the ImageData
+  let perfUploadMs = 0;       // offscreen putImageData
+  let perfComposeMs = 0;      // visible-canvas clear + transform + drawImage + overlays
+  let perfTotalMs = 0;        // whole frame, render() included
+  let perfCells = 0;          // engine active-chunk cell count (workload proxy)
+  let perfSwaps = 0;          // engine swaps (movement workload proxy)
+  let perfDirtyChunks = 0;    // render-dirty chunk count (upload workload proxy)
+  let perfUploadCalls = 0;    // putImageData calls
+  let perfUploadBytes = 0;    // bytes pushed by putImageData
+  // Per-frame buckets filled in by render(); moved into the window sums by the
+  // loop after render() returns. Held outside render() so the loop's total-frame
+  // bracket can include the render cost without re-entrant timing.
+  const renderTimings = { packMs: 0, uploadMs: 0, composeMs: 0, dirtyChunks: 0, uploadCalls: 0, uploadBytes: 0 };
+  // Volcano sub-step timings, filled by stepVolcanoFrame via the runtime.
+  const volcanoTimings: VolcanoTimings = { preMs: 0, updateMs: 0, postMs: 0, heatSyncMs: 0 };
 
   /**
    * Cells the engine scanned on the tick that just ran.
@@ -727,17 +750,45 @@ export function initPlanet(container: HTMLElement): void {
   };
 
   const reportPerf = (): void => {
+    const budget = 1000 / FPS; // 16.7 ms per physics tick
+    // Per-tick (physics) averages — engine + host sim cost, the original metric.
     const cells = Math.round(perfCells / perfTicks);
     const swaps = Math.round(perfSwaps / perfTicks);
-    const ms = perfMs / perfTicks;
-    const budget = 1000 / FPS;
+    const updateMs = perfUpdateMs / perfTicks;
+    const hostPreMs = perfHostPreMs / perfTicks;
+    const heatSyncMs = perfHeatSyncMs / perfTicks;
+    const dirtyChunks = Math.round(perfDirtyChunks / perfTicks);
+    // Per-rendered-frame averages — presentation cost. Uses renderedFrames, not
+    // ticks, since a throttled high-resolution mode renders fewer frames than it
+    // simulates. Total frame time is the number to size the ceiling against: it
+    // includes render(), so a settled planet that still redraws shows up here.
+    const rf = perfRenderedFrames || 1;
+    const totalMs = perfTotalMs / rf;
+    const packMs = perfPackMs / rf;
+    const uploadMs = perfUploadMs / rf;
+    const composeMs = perfComposeMs / rf;
+    const upCalls = Math.round(perfUploadCalls / rf);
+    const upKiB = perfUploadBytes / rf / 1024;
     perfValue.textContent =
-      `${cells.toLocaleString()} cells/tick · ${swaps.toLocaleString()} swaps · ` +
-      `${ms.toFixed(2)} ms (${Math.round((ms / budget) * 100)}% of the ${budget.toFixed(1)} ms budget)`;
+      `${totalMs.toFixed(2)} ms/frame (${Math.round((totalMs / budget) * 100)}% of ${budget.toFixed(0)}ms) · ` +
+      `${cells.toLocaleString()} cells · ${swaps.toLocaleString()} swaps · ${dirtyChunks} dirty · ` +
+      `${upCalls}↑ ${upKiB.toFixed(0)}KiB · ` +
+      `sim ${hostPreMs.toFixed(2)}+${updateMs.toFixed(2)}+${heatSyncMs.toFixed(2)} · ` +
+      `gfx ${packMs.toFixed(2)}+${uploadMs.toFixed(2)}+${composeMs.toFixed(2)}`;
     perfTicks = 0;
-    perfMs = 0;
+    perfRenderedFrames = 0;
+    perfHostPreMs = 0;
+    perfUpdateMs = 0;
+    perfHeatSyncMs = 0;
+    perfPackMs = 0;
+    perfUploadMs = 0;
+    perfComposeMs = 0;
+    perfTotalMs = 0;
     perfCells = 0;
     perfSwaps = 0;
+    perfDirtyChunks = 0;
+    perfUploadCalls = 0;
+    perfUploadBytes = 0;
   };
 
   // --- Render + fixed-step loop -------------------------------------------
@@ -837,8 +888,30 @@ export function initPlanet(container: HTMLElement): void {
   function render(): void {
     const { engine, img, off, offCtx, size, cx, cy } = world;
     const dirty = engine.consumeRenderDirtyChunks();
+    // Count dirty chunks for the workload readout (the proxy for how much of the
+    // planet actually changed this frame). Summed into the window below.
+    let dirtyCount = 0;
+    for (let i = 0; i < dirty.length; i++) dirtyCount += dirty[i];
+    renderTimings.dirtyChunks = dirtyCount;
+
+    let tPack = performance.now();
     paintGridInto(img.data, engine.grid, engine.colorGrid, size, size, engine.CHUNK_SIZE, dirty, engine.chunkWidth, engine.chunkHeight, palette);
-    offCtx.putImageData(img, 0, 0);
+    renderTimings.packMs = performance.now() - tPack;
+
+    // Base-image upload: only when something actually changed. (Phase 2 will
+    // narrow this to dirty runs; for now a full-image putImageData, but skipped
+    // entirely on a clean frame so a settled planet's upload reads zero.)
+    renderTimings.uploadCalls = 0;
+    renderTimings.uploadBytes = 0;
+    if (dirtyCount > 0) {
+      let tUp = performance.now();
+      offCtx.putImageData(img, 0, 0);
+      renderTimings.uploadMs = performance.now() - tUp;
+      renderTimings.uploadCalls = 1;
+      renderTimings.uploadBytes = img.data.length;
+    } else {
+      renderTimings.uploadMs = 0;
+    }
 
     // Visible canvas: clear, then composite the grid and all atmospheric layers
     // under a single transform stack:
@@ -847,6 +920,7 @@ export function initPlanet(container: HTMLElement): void {
     // rotation, so the world jitters as a whole rather than rotating about a
     // displaced center. It shifts rendered pixels, so toGrid() inverts it first
     // when mapping a click back to grid space. Suppressed under reduced-motion.
+    const tCompose = performance.now();
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, size, size);
     ctx.save();
@@ -889,13 +963,19 @@ export function initPlanet(container: HTMLElement): void {
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.fillRect(cx - 0.5, cy - 4, 1, 9);
     ctx.fillRect(cx - 4, cy - 0.5, 9, 1);
+    renderTimings.composeMs = performance.now() - tCompose;
   }
 
   render();
 
   window.setInterval(() => {
     const { engine, volcanoCfg } = world;
-    const t0 = performance.now();
+    // Total frame time brackets EVERYTHING, including render(), so a settled
+    // planet that still pays a render cost shows up here rather than reading as
+    // a misleading 0 ms. (The previous bracket closed before render(), hiding
+    // the very cost the resolution ceiling is most likely to expose.)
+    const tFrame = performance.now();
+    const tHost = performance.now();
 
     // The eruption straddles the engine step: emission has to land before it so
     // new cells move on the frame they appear, while cooling and plumbing
@@ -917,7 +997,9 @@ export function initPlanet(container: HTMLElement): void {
     // with the phase whose physical work appears this tick, not the next one —
     // a transition to effusive/repose becomes visible the tick it actually begins.
     const effectMode: VolcanoEffectMode = erupting ? volcanoState.phase : stoppedEffectMode;
-    const runtime: VolcanoRuntime = { erupting, capHeight };
+    // Reset the per-frame volcano sub-step buckets; stepVolcanoFrame fills them.
+    volcanoTimings.preMs = volcanoTimings.updateMs = volcanoTimings.postMs = volcanoTimings.heatSyncMs = 0;
+    const runtime: VolcanoRuntime = { erupting, capHeight, timings: volcanoTimings };
     stepVolcanoFrame(engine, volcanoCfg, volcanoState, volcanoRng, volcanoOpts(), runtime);
     if (erupting && !runtime.erupting) {
       // The controller just completed the eruption. goDormant handles the
@@ -934,12 +1016,28 @@ export function initPlanet(container: HTMLElement): void {
     );
     if (clouds.length > 0) clouds = removeDead(clouds);
 
-    perfMs += performance.now() - t0;
+    // Attribute host-sim cost: pre/post (and cloud stepping above) vs engine
+    // update vs heat sync. The volcano timings split pre/update/post/heat; the
+    // cloud stepping and effects work fold into the host-pre bucket.
+    const hostMs = performance.now() - tHost;
+    perfHostPreMs += hostMs - volcanoTimings.updateMs - volcanoTimings.heatSyncMs;
+    perfUpdateMs += volcanoTimings.updateMs;
+    perfHeatSyncMs += volcanoTimings.heatSyncMs;
     perfCells += cellsScanned();
     perfSwaps += engine.swapsLastFrame;
-    if (++perfTicks >= PERF_WINDOW) reportPerf();
 
     if (spinning) spinAngle += SPIN_PER_TICK;
     render();
+
+    // Render sub-buckets were filled by render(); fold them into the window.
+    perfPackMs += renderTimings.packMs;
+    perfUploadMs += renderTimings.uploadMs;
+    perfComposeMs += renderTimings.composeMs;
+    perfDirtyChunks += renderTimings.dirtyChunks;
+    perfUploadCalls += renderTimings.uploadCalls;
+    perfUploadBytes += renderTimings.uploadBytes;
+    perfTotalMs += performance.now() - tFrame;
+    perfRenderedFrames++;
+    if (++perfTicks >= PERF_WINDOW) reportPerf();
   }, 1000 / FPS);
 }

@@ -1754,6 +1754,29 @@ export interface VolcanoRuntime {
   erupting: boolean;
   /** Current edifice-height cap, in cells. Grows cycle by cycle up to `capMax`. */
   capHeight: number;
+  /**
+   * Optional per-frame instrumentation receiver. When present, each phase of the
+   * step is timed in milliseconds and reported here so the host can attribute
+   * frame cost to the volcano's pre/update/post/heat-sync sub-steps. Left
+   * untouched when absent, so headless callers pay nothing.
+   */
+  timings?: VolcanoTimings;
+}
+
+/**
+ * Per-frame millisecond cost of the four `stepVolcanoFrame` sub-steps. The host
+ * accumulates these over a window and reports them alongside the engine/render
+ * timings; a settled planet reports ~0 across the board.
+ */
+export interface VolcanoTimings {
+  /** `stepVolcanoPre` (or dormant `rechargeReservoir`) cost, in ms. */
+  preMs: number;
+  /** `engine.update()` cost, in ms. */
+  updateMs: number;
+  /** `stepVolcanoPost` cost, in ms (0 on dormant frames). */
+  postMs: number;
+  /** `syncFromHeat` cost, in ms. */
+  heatSyncMs: number;
 }
 
 /**
@@ -1792,10 +1815,17 @@ export function stepVolcanoFrame(
   opts: VolcanoStepOptions,
   runtime: VolcanoRuntime,
 ): void {
+  const time = runtime.timings;
+  const tPre = time ? performance.now() : 0;
   if (runtime.erupting) {
     stepVolcanoPre(engine, cfg, state, rng, opts);
+    if (time) time.preMs = performance.now() - tPre;
+    const tUpd = time ? performance.now() : 0;
     engine.update();
+    if (time) time.updateMs = performance.now() - tUpd;
+    const tPost = time ? performance.now() : 0;
     stepVolcanoPost(engine, cfg, state, rng, opts);
+    if (time) time.postMs = performance.now() - tPost;
     // The eruption cycle runs once: explosive → effusive → repose → done.
     // `phaseFrame === -1` signals completion (set by stepVolcanoPre).
     //
@@ -1840,10 +1870,19 @@ export function stepVolcanoFrame(
         rechargeReservoir(engine, cfg, 'repose');
       }
     }
+    if (time) time.preMs = performance.now() - tPre;
+    const tUpd = time ? performance.now() : 0;
     engine.update();
+    if (time) time.updateMs = performance.now() - tUpd;
   }
   // Every frame, erupting or not: repaint temperature-derived colour/stiffness.
+  const tHeat = time ? performance.now() : 0;
   syncFromHeat(engine);
+  if (time) {
+    time.heatSyncMs = performance.now() - tHeat;
+    // Dormant frames never call stepVolcanoPost; keep the bucket honest.
+    if (!runtime.erupting) time.postMs = 0;
+  }
 }
 
 /**
