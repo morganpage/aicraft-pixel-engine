@@ -1255,10 +1255,49 @@ export interface VolcanoState {
   cycle: number;
   /**
    * Angular offset of this episode's rim breach from the vent axis, in radians.
-   * Re-chosen when an effusive episode begins, so successive flows come out on
-   * different sides and drape the cone unevenly the way real ones do.
+   * Intended to make successive flows come out on different sides and drape the
+   * cone unevenly the way real ones do.
+   *
+   * **Still unused, and two plausible implementations were measured and
+   * rejected.** Recorded here so they are not retried:
+   *
+   *  - *Offsetting the vent corridor.* Gating which EMPTY cells may be outlets
+   *    does nothing while the vent is open. Routing picks the cheapest outlet it
+   *    can reach, and that is the top of the bore whatever the corridor permits;
+   *    measured over four episodes, offsetting the corridor by up to 5 cells
+   *    moved the mean outlet by less than one and not reliably in the intended
+   *    direction.
+   *  - *Narrowing the mouth to one side*, by withholding the vent feed from the
+   *    far lanes so they crust over. This does move the outlet, but the mouth is
+   *    only three to five cells wide, so the most it can offer is about two
+   *    cells — far less than the width of the flank it is supposed to choose
+   *    between.
+   *
+   * The reason both fall short is that the outlet is not what decides which
+   * flank a flow runs down. Lava emerges at the summit and then descends
+   * whichever side of the rim is *lowest*, which is set by where the preceding
+   * fallout happened to pile — see {@link craterLowPoint}, which finds exactly
+   * that point and is likewise unused. Steering the flows means steering the
+   * conduit's upper section (a real breakout path through the edifice, offset
+   * near the top and re-melted per episode), not the vent's exit cell.
+   *
+   * Worth knowing before spending effort here: the flows are not in fact locked
+   * to one flank. Measured per episode, new exterior rock alternated
+   * right/left/right/left across four eruptions on its own, because the rim's
+   * low point moves as the cone is reshaped.
    */
   breach: number;
+  /**
+   * True once effusion has run, so the next explosive phase is the closing ash
+   * fall rather than the opening one. See {@link PhaseDurations.coda}.
+   */
+  closing: boolean;
+  /**
+   * Edifice height when this episode began, in cells. Recorded on the first
+   * frame and used to divide the episode's growth allowance between its phases
+   * — see {@link phaseCeiling}.
+   */
+  startHeight: number;
   /**
    * Engine pressure source id for the active effusive episode, or `null` when
    * no source is live. Created when effusion begins, removed when it ends — the
@@ -1273,6 +1312,24 @@ export interface PhaseDurations {
   effusive: number;
   explosive: number;
   repose: number;
+  /**
+   * Frames of closing ash fall — a second, shorter explosive pulse between
+   * effusion and repose.
+   *
+   * An eruption that *ends* on lava leaves its last flow as the last material
+   * placed, and nothing comes after it. That flow's front stalls where it
+   * chilled, thickens as the supply behind keeps arriving, and freezes into a
+   * blunt two- or three-cell wall — which is the right behaviour for a yield-
+   * stress fluid and reads as a cliff on the flank, because `ROCK` is static
+   * and nothing ever relaxes it. During the opening explosive phase fallout was
+   * continuously draping the flanks and burying exactly those edges; the coda
+   * gives the last flows the same treatment.
+   *
+   * It is also how a stratovolcano is actually built. Alternating episodes are
+   * what interleave lava tongues with granular strata, and that interleaving is
+   * the whole reason the cone is steep.
+   */
+  coda: number;
 }
 
 /**
@@ -1290,13 +1347,54 @@ export interface PhaseDurations {
  * volume to stay connected and thick while it runs, where a slow trickle chills
  * between cells and stipples the flank instead of streaming down it.
  */
-export const DEFAULT_PHASES: PhaseDurations = { explosive: 300, effusive: 90, repose: 150 };
+export const DEFAULT_PHASES: PhaseDurations = {
+  explosive: 300, effusive: 90, coda: 120, repose: 150,
+};
 
 export function createVolcanoState(): VolcanoState {
   // Open explosively: a real eruption clears its throat with ash and tephra
   // before lava reaches the surface, and it gives the first flows a cone to
   // run down instead of a bare planet.
-  return { phase: 'explosive', phaseFrame: 0, frame: 0, cycle: 0, breach: 0, sourceId: null };
+  return {
+    phase: 'explosive', phaseFrame: 0, frame: 0, cycle: 0,
+    breach: 0, closing: false, startHeight: 0, sourceId: null,
+  };
+}
+
+/**
+ * Shares of this episode's growth allowance, by phase.
+ *
+ * The height cap is one budget for the whole eruption, and every phase used to
+ * check it directly — so it was first-come-first-served, and the opening
+ * explosive phase always got there first. Measured across four eruptions, the
+ * opening burst consumed the entire allowance every time from cycle 2 onward:
+ * the effusive source and the closing ash fall were created and removed on the
+ * same frame, and routed nothing at all. The volcano had exactly one episode
+ * with lava flows in it, ever, and "Erupt again" produced ash and nothing else.
+ *
+ * Reserving a share for each phase is what makes an eruption an eruption rather
+ * than a race. The opening burst builds most of the new cone, effusion adds its
+ * flows on top of that, and the coda keeps the last slice to drape them with.
+ */
+const PHASE_GROWTH_SHARE: Record<'opening' | 'effusive' | 'coda', number> = {
+  opening: 0.6,
+  effusive: 0.8,
+  coda: 1,
+};
+
+/**
+ * The height this phase is allowed to grow the edifice to.
+ *
+ * Always at least `startHeight + 1`, so a phase on an already-capped cone can
+ * still discharge a little rather than being removed on its first frame — an
+ * episode that emits literally nothing reads as a broken button.
+ */
+function phaseCeiling(state: VolcanoState, maxHeight: number): number {
+  const span = Math.max(0, maxHeight - state.startHeight);
+  const share = state.phase === 'effusive'
+    ? PHASE_GROWTH_SHARE.effusive
+    : state.closing ? PHASE_GROWTH_SHARE.coda : PHASE_GROWTH_SHARE.opening;
+  return Math.max(state.startHeight + 1, state.startHeight + span * share);
 }
 
 /** Tuning for {@link stepVolcano}. */
@@ -1489,6 +1587,10 @@ export function stepVolcanoPre(
 ): void {
   void rng; // no longer used after plume removal; retained for API symmetry
   const phases = opts.phases ?? DEFAULT_PHASES;
+  // First frame of the episode: note the height it starts from, so the growth
+  // allowance can be divided between the phases rather than raced for.
+  if (state.frame === 0) state.startHeight = edificeHeight(engine, cfg);
+  const ceiling = phaseCeiling(state, opts.pressure.maxHeight);
 
   if (state.phase === 'explosive') {
     // The explosive phase is now entirely engine-driven: a high-pressure source
@@ -1517,8 +1619,9 @@ export function stepVolcanoPre(
         ventAnchor: opts.pressure.explosive.ventAnchor ?? opts.pressure.ventAnchor,
       });
     }
-    // Height cap applies to the explosive source too.
-    if (edificeHeight(engine, cfg) >= opts.pressure.maxHeight && state.sourceId !== null) {
+    // Height cap applies to the explosive source too — at this phase's share of
+    // the allowance, not the whole thing.
+    if (edificeHeight(engine, cfg) >= ceiling && state.sourceId !== null) {
       engine.removePressureSource(state.sourceId);
       state.sourceId = null;
     }
@@ -1549,9 +1652,9 @@ export function stepVolcanoPre(
       });
     }
     // The height cap is a host concern: the engine has no concept of an
-    // edifice. Stop the source once the cone reaches the cap, and remove it so
-    // the engine stops routing.
-    if (edificeHeight(engine, cfg) >= opts.pressure.maxHeight && state.sourceId !== null) {
+    // edifice. Stop the source once the cone reaches this phase's share of the
+    // allowance, and remove it so the engine stops routing.
+    if (edificeHeight(engine, cfg) >= ceiling && state.sourceId !== null) {
       engine.removePressureSource(state.sourceId);
       state.sourceId = null;
     }
@@ -1561,25 +1664,25 @@ export function stepVolcanoPre(
 
   state.frame++;
   state.phaseFrame++;
-  const limit = phases[state.phase];
+  // The closing ash fall is the same explosive phase on a shorter clock, so the
+  // duration is read from `coda` once effusion has been through.
+  const limit = state.phase === 'explosive' && state.closing ? phases.coda : phases[state.phase];
   if (state.phaseFrame >= limit) {
     state.phaseFrame = 0;
+    // Every transition drops the live source; whichever phase comes next builds
+    // its own on its first frame, with its own pressure, temperature and anchor.
+    if (state.sourceId !== null) {
+      engine.removePressureSource(state.sourceId);
+      state.sourceId = null;
+    }
     if (state.phase === 'explosive') {
-      // Remove the explosive-phase source before transitioning. The effusive
-      // phase creates its own moderate-pressure source on its first frame.
-      if (state.sourceId !== null) {
-        engine.removePressureSource(state.sourceId);
-        state.sourceId = null;
-      }
-      state.phase = 'effusive';
+      // Opening burst → effusion. The closing burst → repose: the eruption ends
+      // on ash so the flows it just laid down are draped rather than left as
+      // bare frozen fronts.
+      state.phase = state.closing ? 'repose' : 'effusive';
     } else if (state.phase === 'effusive') {
-      // End of effusion: remove the source. The engine stops routing; remaining
-      // magma in the conduit cools and sets under the heat field.
-      if (state.sourceId !== null) {
-        engine.removePressureSource(state.sourceId);
-        state.sourceId = null;
-      }
-      state.phase = 'repose';
+      state.phase = 'explosive';
+      state.closing = true;
     } else {
       // End of repose: the single eruption cycle is complete. Stop rather than
       // looping back to explosive. The host can restart with another click.

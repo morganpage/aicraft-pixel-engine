@@ -25,10 +25,19 @@
 > verification (visual captures, full test matrix) are outstanding.
 >
 > **New, not covered here:** the growth cap outruns the erupted volume, so a
-> tall cap funnels the deposit into a spire rather than broadening the cone; the
-> fountain's ballistic range does not grow with the edifice; and
-> `VolcanoState.breach` (flank breakouts instead of summit overflow) is declared
-> and unused, which is what long flank flows want.
+> tall cap funnels the deposit into a spire rather than broadening the cone, and
+> the fountain's ballistic range does not grow with the edifice — fallout keeps
+> landing near the summit as the cone rises, which is what makes a tall cap
+> produce a tower rather than a broader cone.
+>
+> `VolcanoState.breach` remains unused, and two implementations were measured
+> and rejected — see its doc comment in `volcano.ts` for both and for why they
+> fall short. The short version: the outlet is not what decides which flank a
+> flow runs down. Lava emerges at the summit and descends whichever side of the
+> rim is lowest, so steering the flows means steering the conduit's upper
+> section, not the vent's exit cell. Worth knowing first: the flows are not in
+> fact locked to one flank — measured per episode, new exterior rock alternated
+> right/left/right/left across four eruptions on its own.
 
 ## Summary
 

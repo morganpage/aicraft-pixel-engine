@@ -14,6 +14,10 @@ import {
   edificeHeight,
   surfaceRadiusAt,
   makeRng,
+  stepVolcanoFrame,
+  buildVolcanoOpts,
+  DEFAULT_VOLCANO_INPUTS,
+  type VolcanoRuntime,
 } from '../helpers/volcano';
 import {
   DEFAULT_VOLCANO_CFG as CFG,
@@ -315,27 +319,80 @@ describe('conduit and vent: explosive fountain', () => {
 });
 
 describe('the eruption cycle', () => {
-  it('runs explosive → effusive → repose once, then stops', () => {
-    // The eruption cycle runs a single pass: explosive builds the tephra cone,
-    // effusive sends lava flows down the flanks, repose lets everything crust
-    // over. Then it stops — no looping. The host can restart with another click.
+  it('runs explosive → effusive → ash coda → repose once, then stops', () => {
+    // The eruption cycle runs a single pass: the opening burst builds the tephra
+    // cone, effusion sends lava flows down the flanks, a closing ash fall drapes
+    // them, and repose lets everything crust over. Then it stops — no looping.
+    // The host can restart with another click.
+    //
+    // The coda is what stops the eruption ending on bare lava. A flow front
+    // freezes into a blunt wall and `ROCK` is static, so with nothing after it
+    // that wall is permanent — the ledges on the flank. Ending on ash buries
+    // them, the same way the opening phase's fallout was burying them until it
+    // stopped.
     const e = buildVolcanoPlanet(CFG, SIZE);
     stampVolcano(e, CFG);
     const st = createVolcanoState();
     const rng = makeRng(1);
     const seen: string[] = [];
     expect(st.phase).toBe('explosive'); // opens with a burst
-    for (let f = 0; f < 1400; f++) {
-      if (seen[seen.length - 1] !== st.phase) seen.push(st.phase);
+    expect(st.closing).toBe(false);
+    for (let f = 0; f < 1600; f++) {
+      const label = st.phase === 'explosive' && st.closing ? 'coda' : st.phase;
+      if (seen[seen.length - 1] !== label) seen.push(label);
       stepVolcanoPre(e, CFG, st, rng, OPTS);
       if (st.phaseFrame < 0) break; // eruption complete
       e.update();
       stepVolcanoPost(e, CFG, st, rng, OPTS);
     }
-    expect(seen).toEqual(['explosive', 'effusive', 'repose']);
+    expect(seen).toEqual(['explosive', 'effusive', 'coda', 'repose']);
     expect(st.cycle).toBe(1);
     expect(st.phaseFrame).toBe(-1); // signaled complete
   }, 20_000);
+
+  it('gives every phase a share of the growth allowance', () => {
+    // The height cap is one budget for the whole eruption. Checked directly by
+    // each phase it was first-come-first-served, and the opening burst always
+    // got there first — so as the cone approached its cap the later phases were
+    // progressively starved of it. Measured at the third episode, effusion fell
+    // to half its parcels and the closing ash fall to 9 of its 120 frames'
+    // worth, which is the failure the flanks show: the flows the coda is there
+    // to drape are the ones it stops being able to reach.
+    //
+    // Runs the production cap progression through the real per-frame controller
+    // — the pre/post pair alone omits `syncFromHeat`, so lava never stiffens as
+    // it cools and the cone builds differently enough to hide this.
+    const e = buildVolcanoPlanet(CFG, SIZE);
+    stampVolcano(e, CFG);
+    const rng = makeRng(4242);
+
+    const runEpisode = (capHeight: number): Record<string, number> => {
+      const opts = buildVolcanoOpts(CFG, { ...DEFAULT_VOLCANO_INPUTS, maxHeight: capHeight });
+      const st = createVolcanoState();
+      const runtime: VolcanoRuntime = { erupting: true, capHeight };
+      const routed: Record<string, number> = {};
+      let f = 0;
+      while (runtime.erupting && f < 2000) {
+        const label = st.phase === 'explosive' && st.closing ? 'coda' : st.phase;
+        stepVolcanoFrame(e, CFG, st, rng, opts, runtime);
+        for (const r of e.consumeInjectionResults()) {
+          routed[label] = (routed[label] ?? 0) + r.accepted;
+        }
+        f++;
+      }
+      // Dormant gap, as the showcase has between clicks.
+      for (let i = 0; i < 150; i++) stepVolcanoFrame(e, CFG, st, rng, opts, runtime);
+      return routed;
+    };
+
+    for (let c = 0; c < 3; c++) {
+      const routed = runEpisode(Math.min(CAP_START + c * CAP_STEP, CAP_MAX));
+      const where = `episode ${c + 1}`;
+      expect(routed.explosive ?? 0, `${where}: no opening burst`).toBeGreaterThan(60);
+      expect(routed.effusive ?? 0, `${where}: lava flows starved`).toBeGreaterThan(60);
+      expect(routed.coda ?? 0, `${where}: closing ash fall starved`).toBeGreaterThan(40);
+    }
+  }, 60_000);
 
   it('settles to a dead stop once the eruption ends', () => {
     // Guards every liquid invariant the engine established: an eruption must not

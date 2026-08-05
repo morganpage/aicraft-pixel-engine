@@ -181,6 +181,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   also scales with the edifice: a fixed 60 could not reach the summit past about
   25 cells of growth, so the effusive phase silently stopped producing anything
   on a grown cone.
+- **An eruption ends on ash, not on bare lava.** A closing ash fall
+  (`PhaseDurations.coda`, 120 frames) runs between effusion and repose, so the
+  cycle is now explosive → effusive → coda → repose. The last flow of an
+  eruption used to be the last material placed and nothing came after it: its
+  front stalls where it chilled, thickens as the supply behind keeps arriving,
+  and freezes into a blunt wall that `ROCK` being static makes permanent — the
+  ledges on the flank. The opening phase's fallout had been burying exactly
+  those edges until it stopped. Interleaving lava tongues with granular strata
+  is also what actually builds a stratovolcano's steep cone.
+- **Each phase gets a share of the growth allowance.** The height cap is one
+  budget for the whole eruption, and every phase checked it directly, so it was
+  first-come-first-served and the opening burst always got there first. As the
+  cone approached its cap the later phases were progressively starved: measured
+  at the third episode, effusion fell to half its parcels and the closing ash
+  fall to 9 of its 120 frames' worth — the flows the coda exists to drape are
+  precisely the ones it stops being able to reach. `phaseCeiling` now reserves
+  60% of the episode's growth for the opening burst, 80% through effusion, and
+  the last slice for the coda, with a one-cell floor so a phase on an already-
+  capped cone still emits something rather than reading as a broken button. It
+  also bounds the overshoot that let a capped cone reach 59 cells against a cap
+  of 46.
 - **Every eruption runs its full explosive → effusive → repose arc.** Reaching
   the height cap ended the whole eruption, not just the source, so the cap
   tripping partway through the explosive phase sent the volcano straight from
