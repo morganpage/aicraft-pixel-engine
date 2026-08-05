@@ -68,6 +68,15 @@ const SPIN_PER_TICK = (Math.PI / 180) * 0.2;
 /** Sim ticks per second. */
 const FPS = 60;
 
+/**
+ * Development flag: when true, the resolution slider's maximum is raised from
+ * the production 400 to 1000 so the high-resolution work (Phases 0–4) can be
+ * exercised in the browser. This is the doc's recommended first-milestone gate:
+ * 1000 is exposed for measurement, not yet blessed as a public quality tier.
+ * Flip to false to restore the shipping ceiling.
+ */
+const DEV_HIGH_RES = true;
+
 /** Seed for the volcano's PRNG, re-applied on every rebuild for determinism. */
 const VOLCANO_SEED = 4242;
 
@@ -297,6 +306,10 @@ export function initPlanet(container: HTMLElement): void {
   const diaInput = container.querySelector<HTMLInputElement>('.planet-diameter')!;
   const diaValue = container.querySelector<HTMLElement>('.planet-diameter-value')!;
   const perfValue = container.querySelector<HTMLElement>('.planet-perf')!;
+
+  // Development gate: raise the resolution ceiling so the high-resolution work
+  // is exercisable in the browser. Production keeps 400 as the shipped maximum.
+  if (DEV_HIGH_RES) resInput.max = '1000';
 
   let world = buildWorld(Number(resInput.value), Number(diaInput.value), canvas);
   ctx.imageSmoothingEnabled = false;
@@ -745,7 +758,15 @@ export function initPlanet(container: HTMLElement): void {
   const showSliderLabels = (): void => {
     const size = Number(resInput.value);
     const pct = Number(diaInput.value);
-    resValue.textContent = `${size}×${size}`;
+    // In dev high-res mode, annotate the resolution with its quality/presentation
+    // tier so the cost of the larger worlds is legible at the control.
+    const tier = DEV_HIGH_RES
+      ? (size >= 1000 ? ' · Maximum detail (30 FPS render)'
+        : size >= 800 ? ' · Detail'
+        : size >= 600 ? ' · Balanced'
+        : ' · Performance')
+      : '';
+    resValue.textContent = `${size}×${size}${tier}`;
     diaValue.textContent = `${pct}% (r=${Math.round((size * pct) / 200)})`;
   };
 

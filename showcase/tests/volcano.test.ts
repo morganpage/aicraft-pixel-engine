@@ -510,8 +510,11 @@ describe('tephra assimilation', () => {
 });
 
 describe('geometry derived from the planet radius', () => {
-  // The resolution and diameter sliders' full ranges, from index.html.
-  const SIZES = [120, 140, 160, 180, 200, 220, 240, 260, 280, 300, 320, 340, 360, 380, 400];
+  // The resolution and diameter sliders' full ranges. The production slider tops
+  // out at 400; the dev high-res flag (DEV_HIGH_RES) extends it to 1000, so the
+  // geometry clearance checks cover the extended range too. Diameter is every
+  // even percent the slider can produce.
+  const SIZES = [120, 140, 160, 180, 200, 220, 240, 260, 280, 300, 320, 340, 360, 380, 400, 600, 800, 1000];
   const PCTS: number[] = [];
   for (let p = 30; p <= 80; p += 2) PCTS.push(p);
 
@@ -604,5 +607,65 @@ describe('geometry derived from the planet radius', () => {
     stampVolcano(e, cfg);
 
     expect(e.getMaterial(cx, cx)).toBe(MaterialType.ROCK);
+  });
+});
+
+describe('surface scan limit (resolution-aware)', () => {
+  // The historical surface scan stopped at a fixed 60 cells outward from the
+  // surface. At high resolution the volcano's cap can exceed 60 cells, and a
+  // scan that stops short cannot see the summit — breaking cap checks and
+  // dormancy before any other resolution limit matters. The scan limit now
+  // derives from capMax so it always reaches the configured summit.
+
+  it('keeps the historical 60 at the shipping radius', () => {
+    const { cfg } = volcanoGeometryFor(CX, CY, R, SIZE / 2 - R);
+    expect(cfg.surfaceScanLimit).toBe(60);
+  });
+
+  it('scales past 60 so the scan can observe capMax at high resolution', () => {
+    // 1000×1000 at the default 60% diameter: planetR = 300, capMax = 165.
+    // surfaceScanLimit must exceed capMax + gap tolerance (1).
+    const planetR = 300;
+    const headroom = 500 - planetR;
+    const { cfg, capMax } = volcanoGeometryFor(500, 500, planetR, headroom);
+    expect(capMax).toBe(165);
+    expect(cfg.surfaceScanLimit).toBeGreaterThanOrEqual(capMax + 1);
+    // And concretely: max(60, 165 + 10) = 175.
+    expect(cfg.surfaceScanLimit).toBe(175);
+  });
+
+  it('a default-diameter 1000×1000 volcano can observe its initial cap', () => {
+    // The regression: at 1000/60%, capStart is 90, so the old 60-cell scan could
+    // not see even the first eruption's target height. Build a planet with a
+    // 90-cell cone on the vent axis and confirm summitRadius reaches it.
+    const size = 1000, pct = 60;
+    const planetR = Math.round((size * pct) / 200); // 300
+    const headroom = size / 2 - planetR;            // 200
+    const cx = size / 2, cy = size / 2;
+    const { cfg, capStart } = volcanoGeometryFor(cx, cy, planetR, headroom);
+    expect(capStart).toBe(90);
+
+    const e = new PixelEngine({
+      width: size, height: size, seed: 1,
+      gravity: new RadialGravity({ centerX: cx, centerY: cy }),
+    });
+    // Stamp a disc, then pile a 90-cell column of ROCK along the vent axis.
+    const r2 = planetR * planetR;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) e.setMaterial(x, y, MaterialType.ROCK);
+      }
+    }
+    const ux = Math.cos(cfg.ventAngle), uy = Math.sin(cfg.ventAngle);
+    for (let h = 1; h <= capStart; h++) {
+      const px = Math.round(cx + ux * (planetR + h));
+      const py = Math.round(cy + uy * (planetR + h));
+      e.setMaterial(px, py, MaterialType.ROCK);
+    }
+    // With the resolution-aware limit, summitRadius observes the cone top.
+    expect(summitRadius(e, cfg)).toBeGreaterThanOrEqual(planetR + capStart - 1);
+    // The old fixed-60 scan would have stopped at planetR + 60 = 360, short of
+    // the 90-cell cap (planetR + 90 = 390). Confirm the default now exceeds it.
+    expect(summitRadius(e, cfg)).toBeGreaterThan(planetR + 60);
   });
 });

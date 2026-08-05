@@ -79,9 +79,18 @@ export interface VolcanoConfig {
    * melting front propagates outward indefinitely (a freshly-melted cell becomes
    * a new heat source for the next ring), but a fixed reclaim disc is re-applied
    * identically every frame, so it can only ever melt this one ring and stops
-   * short of the bedrock beyond.
+   * short of the bedrock beyond it.
    */
   chamberReclaimHalo?: number;
+  /**
+   * How far outward from the planet surface `surfaceRadiusAt`/`summitRadius` may
+   * scan to find the edifice, in cells. Defaults to 60 (the historical limit)
+   * when unset; `volcanoGeometryFor` sets it to `max(60, capMax + gap tolerance)`
+   * so the scan can always observe the configured cap height. At high resolution
+   * the cap can exceed 60 cells, and a scan that stops short cannot see it —
+   * breaking cap checks and dormancy before any other limit matters.
+   */
+  surfaceScanLimit?: number;
 }
 
 /**
@@ -176,6 +185,11 @@ export function volcanoGeometryFor(
       conduitHalfWidth: Math.max(1, Math.min(3, Math.round(planetRadius * 0.018))),
       chamberRadius,
       chamberDepth,
+      // The surface scan must be able to see at least the configured cap height
+      // plus gap tolerance, or `surfaceRadiusAt` stops short of the summit and
+      // cap checks/dormancy break. 60 is the historical limit and still enough
+      // at the shipping radius; at high resolution the cap outgrows it.
+      surfaceScanLimit: Math.max(60, capMax + 10),
     },
     capStart: Math.min(Math.round(planetRadius * 0.3), capMax),
     capStep: Math.max(2, Math.round(planetRadius * 0.12)),
@@ -402,14 +416,18 @@ export function surfaceRadiusAt(
   engine: PixelEngine,
   cfg: VolcanoConfig,
   angle: number,
-  limit = 60,
+  limit?: number,
   gapTolerance = 1,
 ): number {
+  // Fall back to the config's resolution-aware scan limit, then the historical
+  // 60, so callers that omit `limit` automatically get a scan wide enough to see
+  // the configured cap at any resolution.
+  const lim = limit ?? cfg.surfaceScanLimit ?? 60;
   const ux = Math.cos(angle);
   const uy = Math.sin(angle);
   let surface = cfg.planetRadius;
   let gap = 0;
-  for (let r = cfg.planetRadius; r < cfg.planetRadius + limit; r++) {
+  for (let r = cfg.planetRadius; r < cfg.planetRadius + lim; r++) {
     const x = Math.round(cfg.centerX + ux * r);
     const y = Math.round(cfg.centerY + uy * r);
     if (engine.getMaterial(x, y) === MaterialType.EMPTY) {
@@ -434,7 +452,7 @@ export function surfaceRadiusAt(
  * emission is skipped when the target cell is occupied, so a vent pinned to the
  * original planet radius simply stops erupting once its own deposits cover it.
  */
-export function summitRadius(engine: PixelEngine, cfg: VolcanoConfig, limit = 60): number {
+export function summitRadius(engine: PixelEngine, cfg: VolcanoConfig, limit?: number): number {
   return surfaceRadiusAt(engine, cfg, cfg.ventAngle, limit);
 }
 

@@ -65,6 +65,9 @@ export const DEFAULT_VOLCANO_CFG: VolcanoConfig = {
   conduitHalfWidth: 1,
   chamberRadius: 8,
   chamberDepth: 26,
+  // Matches volcanoGeometryFor at the shipping radius: max(60, capMax+10) where
+  // capMax=36 → 60. The historical scan limit, now explicit.
+  surfaceScanLimit: 60,
 };
 
 /**
@@ -323,6 +326,9 @@ export function heightProfile(e: PixelEngine, cfg: VolcanoConfig, samples = 80):
   const { planetRadius: r } = cfg;
   const hs: number[] = [];
   for (let d = -50; d <= 50; d++) {
+    // `samples` is passed as the explicit scan limit so the profile reaches far
+    // enough outward regardless of the config's surfaceScanLimit (which is sized
+    // for cap observability, not full-cone profiling).
     hs.push(surfaceRadiusAt(e, cfg, cfg.ventAngle + (d * Math.PI) / 180, samples) - r);
   }
   return hs;
