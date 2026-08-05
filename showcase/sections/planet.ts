@@ -21,7 +21,7 @@
 import { PixelEngine } from '../../src/sand';
 import { MaterialType, Materials } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
-import { paintGridInto, buildPalette } from '../helpers/renderer';
+import { paintGridInto, buildPalette, type DirtyReport } from '../helpers/renderer';
 import { attachViewport } from '../helpers/viewport';
 import {
   stampVolcano,
@@ -888,82 +888,111 @@ export function initPlanet(container: HTMLElement): void {
   function render(): void {
     const { engine, img, off, offCtx, size, cx, cy } = world;
     const dirty = engine.consumeRenderDirtyChunks();
-    // Count dirty chunks for the workload readout (the proxy for how much of the
-    // planet actually changed this frame). Summed into the window below.
-    let dirtyCount = 0;
-    for (let i = 0; i < dirty.length; i++) dirtyCount += dirty[i];
-    renderTimings.dirtyChunks = dirtyCount;
 
     let tPack = performance.now();
-    paintGridInto(img.data, engine.grid, engine.colorGrid, size, size, engine.CHUNK_SIZE, dirty, engine.chunkWidth, engine.chunkHeight, palette);
+    const report: DirtyReport = paintGridInto(img.data, engine.grid, engine.colorGrid, size, size, engine.CHUNK_SIZE, dirty, engine.chunkWidth, engine.chunkHeight, palette);
     renderTimings.packMs = performance.now() - tPack;
+    renderTimings.dirtyChunks = report.chunkCount;
 
-    // Base-image upload: only when something actually changed. (Phase 2 will
-    // narrow this to dirty runs; for now a full-image putImageData, but skipped
-    // entirely on a clean frame so a settled planet's upload reads zero.)
+    // Base-image upload. A clean frame (no dirty chunks) uploads nothing. The
+    // adaptive strategy picks between a full-image putImageData and per-run
+    // dirty rects: when dirty coverage is high or the runs are too fragmented,
+    // one full upload is cheaper than dozens of small ones. Otherwise each
+    // coalesced run uploads as a single dirty rect, so call count is bounded by
+    // chunk rows rather than individual dirty chunks.
     renderTimings.uploadCalls = 0;
     renderTimings.uploadBytes = 0;
-    if (dirtyCount > 0) {
-      let tUp = performance.now();
-      offCtx.putImageData(img, 0, 0);
+    renderTimings.uploadMs = 0;
+    let baseImageDirty = report.chunkCount > 0;
+    if (baseImageDirty) {
+      const totalChunk = engine.chunkWidth * engine.chunkHeight;
+      // Thresholds: >50% of chunks dirty, or runs too fragmented (>2 per chunk
+      // row on average) → a single full-image upload wins on call overhead.
+      const coverageHigh = report.chunkCount > totalChunk * 0.5;
+      const fragmented = report.runs.length > engine.chunkHeight * 2;
+      const tUp = performance.now();
+      if (coverageHigh || fragmented || report.bounds === null) {
+        offCtx.putImageData(img, 0, 0);
+        renderTimings.uploadCalls = 1;
+        renderTimings.uploadBytes = img.data.length;
+      } else {
+        for (let i = 0; i < report.runs.length; i++) {
+          const r = report.runs[i];
+          // putImageData(image, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH): uploads
+          // only the sub-rectangle [dirtyX, dirtyX+dirtyW) × [dirtyY, dirtyY+dirtyH)
+          // of the source ImageData to (dx, dy) on the destination.
+          offCtx.putImageData(img, r.x, r.y, r.x, r.y, r.w, r.h);
+          renderTimings.uploadCalls++;
+          renderTimings.uploadBytes += r.w * r.h * 4;
+        }
+      }
       renderTimings.uploadMs = performance.now() - tUp;
-      renderTimings.uploadCalls = 1;
-      renderTimings.uploadBytes = img.data.length;
-    } else {
-      renderTimings.uploadMs = 0;
     }
 
-    // Visible canvas: clear, then composite the grid and all atmospheric layers
-    // under a single transform stack:
-    //   translate(shake) · translate(c) · rotate(spin) · translate(-c)
-    // The shake translation is applied outermost (screen axes), before the
-    // rotation, so the world jitters as a whole rather than rotating about a
-    // displaced center. It shifts rendered pixels, so toGrid() inverts it first
-    // when mapping a click back to grid space. Suppressed under reduced-motion.
-    const tCompose = performance.now();
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, size, size);
-    ctx.save();
+    // Visible-canvas composition. When the offscreen base didn't change AND
+    // nothing visual rides on top (no spin, no clouds, no shaking effects), the
+    // visible canvas is already correct from the last frame — skip the clear,
+    // transform, and drawImage entirely. Spinning or animating clouds force a
+    // recompose, but not a redundant base upload (handled above).
     const rm = reduceMotion();
-    const shX = rm ? 0 : effectsState.shakeX;
-    const shY = rm ? 0 : effectsState.shakeY;
-    if (shX !== 0 || shY !== 0) ctx.translate(shX, shY);
-    ctx.translate(cx, cy);
-    ctx.rotate(spinAngle);
-    ctx.translate(-cx, -cy);
-    ctx.drawImage(off, 0, 0);
+    const shaking = !rm && (effectsState.shakeX !== 0 || effectsState.shakeY !== 0);
+    const hasOverlays = clouds.length > 0 || shaking || effectsState.glow > 0.01 || effectsState.flash > 0.01
+      || effectsState.puffs.length > 0;
+    const needCompose = baseImageDirty || spinning || hasOverlays;
 
-    drawVolcanoEffects(ctx, effectsState, rm);
+    renderTimings.composeMs = 0;
+    if (needCompose) {
+      // Visible canvas: clear, then composite the grid and all atmospheric layers
+      // under a single transform stack:
+      //   translate(shake) · translate(c) · rotate(spin) · translate(-c)
+      // The shake translation is applied outermost (screen axes), before the
+      // rotation, so the world jitters as a whole rather than rotating about a
+      // displaced center. It shifts rendered pixels, so toGrid() inverts it first
+      // when mapping a click back to grid space. Suppressed under reduced-motion.
+      const tCompose = performance.now();
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, size, size);
+      ctx.save();
+      const shX = rm ? 0 : effectsState.shakeX;
+      const shY = rm ? 0 : effectsState.shakeY;
+      if (shX !== 0 || shY !== 0) ctx.translate(shX, shY);
+      ctx.translate(cx, cy);
+      ctx.rotate(spinAngle);
+      ctx.translate(-cx, -cy);
+      ctx.drawImage(off, 0, 0);
 
-    // Clouds are drawn while still inside the rotation transform, so drawing in
-    // grid coords makes them ride the visual spin automatically — the same trick
-    // that keeps painted material aligned under toGrid()'s un-rotation. Each
-    // cloud is a soft white disc faded by its remaining water, so it visibly
-    // thins out as it rains down to nothing. Drawn OVER the volcanic plume so
-    // weather reads in front of ash.
-    for (let i = 0; i < clouds.length; i++) {
-      const c = clouds[i];
-      const frac = c.initialWater > 0 ? c.water / c.initialWater : 0;
-      if (frac <= 0 || c.radius <= 0) continue;
-      const grad = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, c.radius);
-      // Puffier toward the middle; alpha tracks remaining water so a nearly-spent
-      // cloud is barely there before it vanishes.
-      grad.addColorStop(0, `rgba(245, 248, 255, ${0.85 * frac})`);
-      grad.addColorStop(1, `rgba(220, 228, 245, ${0.15 * frac})`);
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, c.radius, 0, Math.PI * 2);
-      ctx.fill();
+      drawVolcanoEffects(ctx, effectsState, rm);
+
+      // Clouds are drawn while still inside the rotation transform, so drawing in
+      // grid coords makes them ride the visual spin automatically — the same trick
+      // that keeps painted material aligned under toGrid()'s un-rotation. Each
+      // cloud is a soft white disc faded by its remaining water, so it visibly
+      // thins out as it rains down to nothing. Drawn OVER the volcanic plume so
+      // weather reads in front of ash.
+      for (let i = 0; i < clouds.length; i++) {
+        const c = clouds[i];
+        const frac = c.initialWater > 0 ? c.water / c.initialWater : 0;
+        if (frac <= 0 || c.radius <= 0) continue;
+        const grad = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, c.radius);
+        // Puffier toward the middle; alpha tracks remaining water so a nearly-spent
+        // cloud is barely there before it vanishes.
+        grad.addColorStop(0, `rgba(245, 248, 255, ${0.85 * frac})`);
+        grad.addColorStop(1, `rgba(220, 228, 245, ${0.15 * frac})`);
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, c.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+
+      // Crosshair is drawn AFTER restore so it stays fixed (not spinning) — it
+      // marks the gravity center, which doesn't move with the visual rotation.
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillRect(cx - 0.5, cy - 4, 1, 9);
+      ctx.fillRect(cx - 4, cy - 0.5, 9, 1);
+      renderTimings.composeMs = performance.now() - tCompose;
     }
-
-    ctx.restore();
-
-    // Crosshair is drawn AFTER restore so it stays fixed (not spinning) — it
-    // marks the gravity center, which doesn't move with the visual rotation.
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.fillRect(cx - 0.5, cy - 4, 1, 9);
-    ctx.fillRect(cx - 4, cy - 0.5, 9, 1);
-    renderTimings.composeMs = performance.now() - tCompose;
   }
 
   render();
