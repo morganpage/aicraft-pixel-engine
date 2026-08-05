@@ -22,6 +22,7 @@ import { PixelEngine } from '../../src/sand';
 import { MaterialType, Materials } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
 import { paintGridInto, buildPalette, type DirtyReport } from '../helpers/renderer';
+import { scheduleFrame, resumeAfterHidden } from '../helpers/frame-scheduler';
 import { attachViewport } from '../helpers/viewport';
 import {
   stampVolcano,
@@ -493,6 +494,7 @@ export function initPlanet(container: HTMLElement): void {
       const sy = Math.round(world.cy + Math.sin(rad) * world.scatterR);
       world.engine.setMaterial(sx, sy, i % 2 === 0 ? MaterialType.WATER : MaterialType.SAND);
     }
+    forcePresent = true; // show the scatter ring immediately, not at the next 30-FPS boundary
     scatterBtn.blur();
   });
 
@@ -997,14 +999,13 @@ export function initPlanet(container: HTMLElement): void {
 
   render();
 
-  window.setInterval(() => {
+  // The pure simulation body of one tick, extracted so the scheduler can run it
+  // a fixed number of times per frame independent of the render rate. Everything
+  // here advances the world state; nothing presents it. Returns nothing — the
+  // timing buckets are folded into the perf record by the caller, which also
+  // owns the render() call.
+  const stepPhysics = (tHostStart: number): void => {
     const { engine, volcanoCfg } = world;
-    // Total frame time brackets EVERYTHING, including render(), so a settled
-    // planet that still pays a render cost shows up here rather than reading as
-    // a misleading 0 ms. (The previous bracket closed before render(), hiding
-    // the very cost the resolution ceiling is most likely to expose.)
-    const tFrame = performance.now();
-    const tHost = performance.now();
 
     // The eruption straddles the engine step: emission has to land before it so
     // new cells move on the frame they appear, while cooling and plumbing
@@ -1048,25 +1049,99 @@ export function initPlanet(container: HTMLElement): void {
     // Attribute host-sim cost: pre/post (and cloud stepping above) vs engine
     // update vs heat sync. The volcano timings split pre/update/post/heat; the
     // cloud stepping and effects work fold into the host-pre bucket.
-    const hostMs = performance.now() - tHost;
+    const hostMs = performance.now() - tHostStart;
     perfHostPreMs += hostMs - volcanoTimings.updateMs - volcanoTimings.heatSyncMs;
     perfUpdateMs += volcanoTimings.updateMs;
     perfHeatSyncMs += volcanoTimings.heatSyncMs;
     perfCells += cellsScanned();
     perfSwaps += engine.swapsLastFrame;
 
+    // Spin advances per physics tick, so rotation rate is independent of the
+    // render rate: a 30-FPS render doesn't slow the apparent spin.
     if (spinning) spinAngle += SPIN_PER_TICK;
-    render();
+  };
 
-    // Render sub-buckets were filled by render(); fold them into the window.
-    perfPackMs += renderTimings.packMs;
-    perfUploadMs += renderTimings.uploadMs;
-    perfComposeMs += renderTimings.composeMs;
-    perfDirtyChunks += renderTimings.dirtyChunks;
-    perfUploadCalls += renderTimings.uploadCalls;
-    perfUploadBytes += renderTimings.uploadBytes;
-    perfTotalMs += performance.now() - tFrame;
-    perfRenderedFrames++;
-    if (++perfTicks >= PERF_WINDOW) reportPerf();
-  }, 1000 / FPS);
+  // --- Fixed-step simulation, decoupled render --------------------------------
+  // Physics runs at a fixed 60 Hz via an accumulator so cooling, growth, rain,
+  // and eruption timing keep their existing per-tick semantics regardless of
+  // how fast the display refreshes. Rendering is throttled separately: at low
+  // resolution we render up to 60 FPS; above the high-resolution threshold we
+  // cap presentation at 30 FPS (physics stays at 60 ticks/s). This replaces the
+  // old fixed setInterval, which offered no back-pressure when a tick overran
+  // 16.7 ms and forced simulation and presentation to share one rate. The
+  // decision math lives in the pure `scheduleFrame` helper (unit-tested in
+  // frame-scheduler.test.ts); this loop applies it.
+  let acc = 0;                         // accumulated unstepped sim time
+  let lastTime = performance.now();    // wall-clock of the last rAF callback
+  let lastRender = 0;                  // wall-clock of the last rendered frame
+  let rafId = 0;                       // requestAnimationFrame handle (cancellable)
+  let scheduled = false;               // guard against double-scheduling on visibility return
+  // Priority-presentation signal: set by one-tick transients or forced after a
+  // direct paint / rebuild so the result shows up immediately rather than at the
+  // next throttle boundary.
+  let forcePresent = false;
+
+  const frame = (now: number): void => {
+    const decision = scheduleFrame({
+      elapsed: now - lastTime,
+      acc,
+      forcePresent,
+      lastRender,
+      now,
+      size: world.size,
+    });
+    lastTime = now;
+    acc = decision.nextAcc;
+
+    const tFrame = performance.now();
+    for (let i = 0; i < decision.ticks; i++) {
+      const tHost = performance.now();
+      stepPhysics(tHost);
+      perfTicks++;
+    }
+
+    if (decision.shouldRender) {
+      render();
+      lastRender = now;
+      perfRenderedFrames++;
+      perfTotalMs += performance.now() - tFrame;
+      // Render sub-buckets were filled by render(); fold them into the window.
+      perfPackMs += renderTimings.packMs;
+      perfUploadMs += renderTimings.uploadMs;
+      perfComposeMs += renderTimings.composeMs;
+      perfDirtyChunks += renderTimings.dirtyChunks;
+      perfUploadCalls += renderTimings.uploadCalls;
+      perfUploadBytes += renderTimings.uploadBytes;
+    }
+    forcePresent = false;
+    if (perfTicks >= PERF_WINDOW) reportPerf();
+
+    if (scheduled) rafId = window.requestAnimationFrame(frame);
+  };
+
+  // Visibility: a deliberate showcase power/CPU policy. When the tab is hidden,
+  // stop scheduling both simulation and rendering — backgrounding pauses growth,
+  // rain, cooling, and eruptions. On return, reset the accumulator and discard
+  // the hidden elapsed time rather than attempting wall-clock catch-up (the
+  // sim never sees a multi-second burst). A future game that promises offline
+  // progression must implement that separately from this scheduler.
+  const onVisibility = (): void => {
+    if (document.hidden) {
+      scheduled = false;
+      window.cancelAnimationFrame(rafId);
+    } else if (!scheduled) {
+      scheduled = true;
+      // Discard hidden elapsed time rather than catching up; force an immediate
+      // render on resume (see resumeAfterHidden).
+      const r = resumeAfterHidden(performance.now());
+      acc = r.acc;
+      lastTime = r.lastTime;
+      lastRender = r.lastRender;
+      rafId = window.requestAnimationFrame(frame);
+    }
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+
+  scheduled = true;
+  rafId = window.requestAnimationFrame(frame);
 }
