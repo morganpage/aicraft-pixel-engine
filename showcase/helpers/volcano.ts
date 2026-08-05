@@ -880,54 +880,109 @@ const GLOW_FLOOR = 0.005;
  * doing, and a freeze clears the cell's colour, so anything that sets while the
  * volcano is quiet would otherwise be left rendering as bedrock.
  *
+ * **Chunk mask.** Pass `engine.thermalChunks` to scan only the chunks the heat
+ * step processed this frame. The engine's host contract: `update()` swaps
+ * `thermalChunks ← nextThermalChunks` at the very top and then `runHeatStep`
+ * reads `thermalChunks` and writes new wakes to `nextThermalChunks` — it never
+ * touches `thermalChunks` again before `update()` returns. So reading it
+ * *after* `update()` (but before the next `update()`, which would swap it away)
+ * yields exactly the chunks that were just processed. Omit the mask for an
+ * unconditional full resync (the first frame after a build, or a forced repaint).
+ *
+ * @param thermalChunks - the chunk mask to scope the scan to. When null/omitted,
+ *   every cell is scanned. Pass `engine.thermalChunks` in steady state so a
+ *   settled planet does no full-grid work.
  * @returns how many cells were painted as glowing.
  */
-export function syncFromHeat(engine: PixelEngine): number {
-  const cg = ensureColorGrid(engine);
+export function syncFromHeat(engine: PixelEngine, thermalChunks?: Uint8Array | null): number {
   const grid = engine.grid;
   const w = engine.width;
+  const h = engine.height;
+  const cs = engine.CHUNK_SIZE;
+  const cw = engine.chunkWidth;
   const floor = engine.ambientTemperature + GLOW_FLOOR;
   let glowing = 0;
 
-  for (let y = 0; y < engine.height; y++) {
-    const rowOff = y * w;
-    for (let x = 0; x < w; x++) {
-      const idx = rowOff + x;
-      const mat = grid[idx];
-      if (mat !== MaterialType.LAVA && mat !== MaterialType.ROCK && mat !== MaterialType.TEPHRA) continue;
+  // Style a single cell's temperature-derived colour and, for lava, its
+  // stiffness. Reads the colour grid lazily: a cell that needs no override
+  // (palette grey rock, cold bedrock) touches nothing, so a planet with no hot
+  // region allocates no colorGrid at all. The colour sentinel is 0 — "use the
+  // material palette" — so reading the null grid as 0 is exactly the fallback.
+  const styleCell = (idx: number, x: number, y: number): void => {
+    const mat = grid[idx];
+    if (mat !== MaterialType.LAVA && mat !== MaterialType.ROCK && mat !== MaterialType.TEPHRA) return;
 
-      const t = engine.getHeat(x, y);
-      if (mat === MaterialType.LAVA) {
-        setStiffness(engine, x, y, stiffnessForTemp(t));
-      } else if (mat === MaterialType.TEPHRA) {
-        // A hot unmarked cell is a fresh fragment. Once painted, the alpha
-        // marker rides with it and identifies it after cooling so the final
-        // granular deposit keeps its ash-brown tint.
-        const marked = isTephraTint(cg[idx]);
-        if (!marked && t <= floor) continue;
+    const t = engine.getHeat(x, y);
+    // Read the current override (0 = none) without forcing allocation.
+    const cg = engine.colorGrid;
+    const prev = cg ? cg[idx] : 0;
 
-        const ti = Math.max(0, Math.min(TEPHRA_STEPS - 1, Math.round(t * (TEPHRA_STEPS - 1))));
-        const tephra = TEPHRA_RAMP[ti];
-        if (cg[idx] !== tephra) {
-          cg[idx] = tephra;
-          engine.markRenderDirty(x, y);
-        }
-        if (t <= floor) continue;
-        glowing++;
-        continue;
-      } else if (t <= floor) {
-        // Cold rock: bedrock that was never heated keeps the palette grey, and
-        // rock that has finished cooling keeps the last dark tint it was given.
-        continue;
-      }
+    if (mat === MaterialType.LAVA) {
+      // Lava stiffness tracks temperature so a cooling flow stiffens before it
+      // freezes. Write only when the tier actually changes — the colour write
+      // below already gates on the ramp value, and the stiffness grid deserves
+      // the same gate to avoid touching every lava cell every frame.
+      const v = stiffnessForTemp(t);
+      const sg = engine.stiffnessGrid;
+      if (!sg || sg[idx] !== v) setStiffness(engine, x, y, v);
+    } else if (mat === MaterialType.TEPHRA) {
+      // A hot unmarked cell is a fresh fragment. Once painted, the alpha
+      // marker rides with it and identifies it after cooling so the final
+      // granular deposit keeps its ash-brown tint.
+      const marked = isTephraTint(prev);
+      if (!marked && t <= floor) return;
 
-      const i = Math.max(0, Math.min(TEMP_STEPS - 1, Math.round(t * (TEMP_STEPS - 1))));
-      const c = TEMP_RAMP[i];
-      if (cg[idx] !== c) {
-        cg[idx] = c;
+      const ti = Math.max(0, Math.min(TEPHRA_STEPS - 1, Math.round(t * (TEPHRA_STEPS - 1))));
+      const tephra = TEPHRA_RAMP[ti];
+      if (prev !== tephra) {
+        ensureColorGrid(engine)[idx] = tephra;
         engine.markRenderDirty(x, y);
       }
+      if (t <= floor) return;
       glowing++;
+      return;
+    } else if (t <= floor) {
+      // Cold rock: bedrock that was never heated keeps the palette grey, and
+      // rock that has finished cooling keeps the last dark tint it was given.
+      return;
+    }
+
+    const i = Math.max(0, Math.min(TEMP_STEPS - 1, Math.round(t * (TEMP_STEPS - 1))));
+    const c = TEMP_RAMP[i];
+    if (prev !== c) {
+      ensureColorGrid(engine)[idx] = c;
+      engine.markRenderDirty(x, y);
+    }
+    glowing++;
+  };
+
+  if (thermalChunks) {
+    // Chunk-aware path: scan only the chunks the heat step just processed. The
+    // engine swaps thermalChunks at the top of update() and never touches it
+    // again before returning, so after update() this mask holds exactly the set
+    // runHeatStep walked this frame. Cost is proportional to the hot region,
+    // not world area — a settled planet scans one chunk-flag byte per chunk.
+    for (let cy = 0; cy < engine.chunkHeight; cy++) {
+      const yStart = cy * cs;
+      const yEnd = yStart + cs > h ? h : yStart + cs;
+      const rowOff0 = cy * cw;
+      for (let cx = 0; cx < cw; cx++) {
+        if (!thermalChunks[rowOff0 + cx]) continue;
+        const xStart = cx * cs;
+        const xEnd = xStart + cs > w ? w : xStart + cs;
+        for (let y = yStart; y < yEnd; y++) {
+          const rowOff = y * w;
+          for (let x = xStart; x < xEnd; x++) styleCell(rowOff + x, x, y);
+        }
+      }
+    }
+  } else {
+    // Full-scan path: used on the first frame after a build (every chunk is
+    // thermally active, so the chunk path would do the same work) and by any
+    // caller that wants an unconditional resync.
+    for (let y = 0; y < h; y++) {
+      const rowOff = y * w;
+      for (let x = 0; x < w; x++) styleCell(rowOff + x, x, y);
     }
   }
   return glowing;
@@ -1876,8 +1931,12 @@ export function stepVolcanoFrame(
     if (time) time.updateMs = performance.now() - tUpd;
   }
   // Every frame, erupting or not: repaint temperature-derived colour/stiffness.
+  // Scope the scan to the chunks the heat step just processed: `engine.thermalChunks`
+  // holds exactly that set after `update()` returns (see the host contract on
+  // syncFromHeat). A settled planet — no thermal chunks active — scans one byte
+  // per chunk and no further.
   const tHeat = time ? performance.now() : 0;
-  syncFromHeat(engine);
+  syncFromHeat(engine, engine.thermalChunks);
   if (time) {
     time.heatSyncMs = performance.now() - tHeat;
     // Dormant frames never call stepVolcanoPost; keep the bucket honest.

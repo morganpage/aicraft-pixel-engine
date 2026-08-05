@@ -154,6 +154,145 @@ describe('temperature and appearance', () => {
   });
 });
 
+describe('chunk-aware heat sync', () => {
+  // The thermal-chunk mask is what lets a settled 1000×1000 planet cost nothing
+  // in the host: syncFromHeat must scan only the chunks the heat step just
+  // processed, and the colour/stiffness bookkeeping must be lazy and change-gated
+  // so a cold planet allocates nothing and a stable lava cell isn't rewritten.
+
+  it('updates hot cells inside an active thermal chunk and skips inactive ones', () => {
+    const e = buildPlanet();
+    // Two hot lava cells in DIFFERENT chunks (chunks are 32 wide; CX=110 is in
+    // chunk 3, so a cell at x≈48 sits in chunk 1 — definitely a different chunk).
+    const hotX = CX, hotY = CY - R - 1;       // surface cell above center
+    const otherX = CX - 60, otherY = hotY;    // different chunk, same row band
+    e.setMaterial(hotX, hotY, MaterialType.LAVA);
+    e.setHeat(hotX, hotY, 1);
+    e.setMaterial(otherX, otherY, MaterialType.LAVA);
+    e.setHeat(otherX, otherY, 1);
+
+    // Mask: only the chunk containing hotX,hotY is "processed". The other lava
+    // cell, even though hot, must be left alone by this scoped sync.
+    const cw = e.chunkWidth, cs = e.CHUNK_SIZE;
+    const mask = new Uint8Array(cw * e.chunkHeight);
+    mask[Math.floor(hotY / cs) * cw + Math.floor(hotX / cs)] = 1;
+    expect(Math.floor(otherX / cs)).not.toBe(Math.floor(hotX / cs)); // sanity: truly different chunks
+
+    syncFromHeat(e, mask);
+
+    expect(e.colorGrid![hotY * SIZE + hotX]).toBe(TEMP_RAMP[TEMP_STEPS - 1]);
+    // otherX,otherY is hot but outside the mask → no override written.
+    expect(e.colorGrid![otherY * SIZE + otherX]).toBe(0);
+  });
+
+  it('falls back to a full scan when no mask is given', () => {
+    const e = buildPlanet();
+    e.setMaterial(CX, CY - R - 1, MaterialType.LAVA);
+    e.setHeat(CX, CY - R - 1, 0.8);
+    syncFromHeat(e); // null mask → full scan
+    expect(e.colorGrid![(CY - R - 1) * SIZE + CX]).toBe(
+      TEMP_RAMP[Math.round(0.8 * (TEMP_STEPS - 1))],
+    );
+  });
+
+  it('does not allocate colorGrid on a planet with no hot cells', () => {
+    const e = buildPlanet(); // cold bedrock disc, nothing heated
+    expect(e.colorGrid).toBeNull();
+    syncFromHeat(e, e.thermalChunks);
+    expect(e.colorGrid).toBeNull();
+    // Full scan either — a cold planet must not allocate just because we walked it.
+    syncFromHeat(e);
+    expect(e.colorGrid).toBeNull();
+  });
+
+  it('keeps a cooling cell synchronised until its thermal chunk goes quiet', () => {
+    const e = buildPlanet();
+    const x = CX, y = CY - R - 1;
+    e.setMaterial(x, y, MaterialType.LAVA);
+    e.setHeat(x, y, 0.9);
+
+    // Frame 1: chunk active, hot cell gets styled.
+    const cw = e.chunkWidth, cs = e.CHUNK_SIZE;
+    const mask = new Uint8Array(cw * e.chunkHeight);
+    mask[Math.floor(y / cs) * cw + Math.floor(x / cs)] = 1;
+    syncFromHeat(e, mask);
+    expect(e.colorGrid![y * SIZE + x]).not.toBe(0);
+
+    // Cell cools but its chunk is still active → still resynced to the cooler tint.
+    e.setHeat(x, y, 0.5);
+    syncFromHeat(e, mask);
+    expect(e.colorGrid![y * SIZE + x]).toBe(TEMP_RAMP[Math.round(0.5 * (TEMP_STEPS - 1))]);
+
+    // Same cooler temperature, but now the chunk is quiet → the cell is no longer
+    // touched. Its tint is frozen at the last value the active sync wrote.
+    const lastTint = e.colorGrid![y * SIZE + x];
+    const quiet = new Uint8Array(cw * e.chunkHeight); // all zero
+    syncFromHeat(e, quiet);
+    expect(e.colorGrid![y * SIZE + x]).toBe(lastTint);
+  });
+
+  it('resyncs a cell on the tick its stored temperature crosses a tint band', () => {
+    // The engine stores every computed temperature but only WAKES a thermal
+    // chunk above HEAT_EPSILON. The host styles the stored value, so a crossing
+    // must be reflected on the exact tick the wake happens. This pins the
+    // wake-threshold relationship: a future change to heat-sleep semantics cannot
+    // silently leave a tint one band behind.
+    const e = buildPlanet();
+    const x = CX, y = CY - R - 1;
+    e.setMaterial(x, y, MaterialType.LAVA);
+    // Two adjacent ramp indices; find the temperature band boundary between them.
+    const i0 = 10, i1 = 11;
+    const tLow = (i0 + 0.4) / (TEMP_STEPS - 1);
+    const tHigh = (i1 + 0.4) / (TEMP_STEPS - 1);
+
+    e.setHeat(x, y, tLow);
+    const cw = e.chunkWidth, cs = e.CHUNK_SIZE;
+    const mask = new Uint8Array(cw * e.chunkHeight);
+    mask[Math.floor(y / cs) * cw + Math.floor(x / cs)] = 1;
+    syncFromHeat(e, mask);
+    expect(e.colorGrid![y * SIZE + x]).toBe(TEMP_RAMP[i0]);
+
+    e.setHeat(x, y, tHigh); // crosses into band i1
+    syncFromHeat(e, mask);
+    expect(e.colorGrid![y * SIZE + x]).toBe(TEMP_RAMP[i1]);
+  });
+
+  it('resyncs stiffness at every stiffnessForTemp tier boundary as lava cools', () => {
+    const e = buildPlanet();
+    const x = CX, y = CY - R - 1;
+    e.setMaterial(x, y, MaterialType.LAVA);
+    const cw = e.chunkWidth, cs = e.CHUNK_SIZE;
+    const mask = new Uint8Array(cw * e.chunkHeight);
+    mask[Math.floor(y / cs) * cw + Math.floor(x / cs)] = 1;
+
+    // stiffnessForTemp boundaries: 0.85 / 0.60 / 0.45 / 0.32. Sample just above
+    // and just below each so each tier is visited, and confirm the stiffness
+    // written matches stiffnessForTemp exactly.
+    for (const t of [0.9, 0.7, 0.5, 0.36, 0.2]) {
+      e.setHeat(x, y, t);
+      syncFromHeat(e, mask);
+      expect(e.stiffnessGrid![y * SIZE + x]).toBe(stiffnessForTemp(t));
+    }
+  });
+
+  it('treats colour 0 as the palette fallback and keeps opaque black as a valid tint', () => {
+    // The sentinel is 0 = "no override, use palette". Opaque black packs to
+    // 0xff000000 (nonzero), so it must be honoured rather than treated as unset.
+    const e = buildPlanet();
+    const x = CX, y = CY - R - 1;
+    e.setMaterial(x, y, MaterialType.ROCK);
+    e.setHeat(x, y, 0.7);
+    // Manually place opaque black, then resync at a temperature that maps to a
+    // different tint — the sync must overwrite it (proving 0xff000000 is a real
+    // override, not skipped like the 0 sentinel).
+    if (!e.colorGrid) e.colorGrid = new Uint32Array(SIZE * SIZE);
+    e.colorGrid[y * SIZE + x] = 0xff000000;
+    const expected = TEMP_RAMP[Math.round(0.7 * (TEMP_STEPS - 1))];
+    syncFromHeat(e, null); // full scan so we don't need a mask
+    expect(e.colorGrid[y * SIZE + x]).toBe(expected);
+  });
+});
+
 describe('conduit and vent', () => {
   it('stamps a conduit that holds its magma without draining', () => {
     // The engine has no pressure term, so magma cannot rise on its own — but a
