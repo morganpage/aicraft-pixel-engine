@@ -10,19 +10,20 @@
 
 Build a minimal but genuinely fun **god game** — a one-screen, circular-planet
 terraforming toy in the spirit of *Reus* / *Godfinger* — on top of the
-[`aicraft-pixel-engine`](https://www.npmjs.com/package/aicraft-pixel-engine)
-falling-sand simulation library. **Single HTML page, no framework, Vite + plain
+[`aicraft-pixel-engine`](https://github.com/morganpage/aicraft-pixel-engine)
+falling-sand simulation library ([npm](https://www.npmjs.com/package/aicraft-pixel-engine)).
+**Single HTML page, no framework, Vite + plain
 TypeScript.** Target a playable MVP in one sitting, not a polished product.
 
 ### The one-paragraph pitch
 
 You are a god hovering over a small circular planet. The planet is alive:
 materials fall toward its center, water pools into oceans, lava erupts and
-flows. You sculpt it with a handful of god-powers — raise land, summon rain
-clouds, drop forests, ignite fire — and the simulation does the rest. There is
-no lose state; the joy is watching a dead rock become a living world. Make it
-*feel* good: every action should have immediate, visible, satisfying
-consequences.
+flows, forests seed themselves and grow. You sculpt it with a handful of
+god-powers — raise land, summon rain clouds, drop forests, ignite a volcano —
+and the simulation does the rest. There is no lose state; the joy is watching a
+dead rock become a living world. Make it *feel* good: every action should have
+immediate, visible, satisfying consequences.
 
 ### Install the engine
 
@@ -53,27 +54,39 @@ distinct; six is plenty:
 | **Raise Land** | Drop sand/rock at the cursor; it piles up into hills/mountains under gravity. | `setMaterial(x, y, SAND)` or `ROCK` with a brush radius |
 | **Summon Cloud** | Paint a cloud above the surface that rains water and shrinks as it empties. | Spawn a host-tracked cloud; each tick emit `WATER` at its base |
 | **Ocean** | Pour water; it flows and levels into seas around the planet. | `setMaterial(x, y, WATER)` |
-| **Forest** | Plant wood/vegetation that (with water nearby) spreads or just decorates. | `setMaterial(x, y, WOOD)` |
-| **Volcano** | Trigger an eruption: lava fountains from the vent, flows downslope, cools to rock. | Lava placement + a host-side cooling step (see below) |
-| **Smite** | Lightning/fire — ignite flammables, scorch terrain. | `setMaterial(x, y, FIRE)` or `explode(x, y, r)` |
+| **Forest** | Scatter `SEED` that falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. | `engine.plant(...)` / `setMaterial(x, y, SEED)` |
+| **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone. | `engine.addPressureSource(...)` — the engine handles eruption, flow, cooling, and cone |
+| **Smite** | Lightning/fire — ignite flammables, scorch terrain. | `setMaterial(x, y, FIRE)` or `engine.explode(x, y, r)` |
 
 ### World setup (the part that makes it a *planet*)
 
-This is the engine's sweet spot — copy it directly:
+This is the engine's sweet spot — copy it directly. The only difference from a
+flat world is the gravity model and the heat/climate dials:
 
 ```ts
-const SIZE = 240;
+const SIZE = 640;
 const cx = SIZE / 2, cy = SIZE / 2;
-const planetR = Math.round(SIZE * 0.3); // ~72 cells
+const planetR = Math.round(SIZE * 0.32); // ~205 cells
 
 const engine = new PixelEngine({
   width: SIZE,
   height: SIZE,
   seed: 1,
   gravity: new RadialGravity({ centerX: cx, centerY: cy }),
+  // Native temperature field — drives lava cooling, water freezing, ice melt,
+  // steam condensation, and the temperature-gated growth rules. Off by default.
+  enableHeat: true,
+  // The climate dial. 0.12 ≈ a temperate world (oceans stay liquid, lava cools
+  // over a few seconds). Drop it toward 0 and oceans freeze on their own.
+  ambientTemperature: 0.12,
+  // Frames between growth ticks. Lower = faster forests. Default 4.
+  growthInterval: 4,
 });
 
 // Stamp a rock disc — the planet body everything falls onto.
+// beginBulk()/endBulk() is the fast path for stamping many cells: it skips the
+// per-cell wake/dirty/heat bookkeeping and recovers it once for the whole stamp.
+engine.beginBulk();
 for (let y = 0; y < SIZE; y++) {
   for (let x = 0; x < SIZE; x++) {
     const dx = x - cx, dy = y - cy;
@@ -82,6 +95,7 @@ for (let y = 0; y < SIZE; y++) {
     }
   }
 }
+engine.endBulk();
 ```
 
 Now every `setMaterial` of sand/water/lava anywhere in the void curves inward
@@ -95,6 +109,7 @@ The engine owns the simulation; you own the pixels. Minimal renderer:
 ```ts
 // Palette: index by MaterialType id → packed RGBA.
 // Materials[id].color is [r, g, b, a]. Precompute a Uint32Array once.
+// `Materials` is keyed by MaterialType id, so its length is the material count.
 const palette = new Uint32Array(Object.keys(Materials).length);
 for (const m of materialDefs) {
   const [r, g, b, a] = m.color;
@@ -131,34 +146,74 @@ The game loop is a fixed-step `setInterval` (60 Hz) calling `engine.update()`
 then `render()`. Mouse → grid cell is a plain scale: `gx = floor((e.clientX -
 rect.left) / rect.width * SIZE)`.
 
+> **Resolution note.** 640×640 is 16× the cells of a 160×160 demo grid. A naive
+> full-canvas repaint every frame still runs, but once the world is busy the
+> proper move is to honour `consumeRenderDirtyChunks()`: only the 32×32 chunks
+> it flags need repainting, and the rest of the canvas keeps its last frame.
+> `update()` itself already skips inactive chunks, so simulation cost stays
+> bounded to where things are actually happening.
+
 ### God-powers that need host logic (read this carefully)
 
-The engine is *deliberately minimal* — it provides the cellular-automaton core
-and nothing multi-cell. Three of the powers need a tiny bit of host-side code
-on top of `engine.update()`. This is by design (see `docs/integration.md` in the
-engine repo); don't try to push these into the engine.
+The engine provides the cellular-automaton core, heat, growth, and pressure —
+so most powers are now a single call. **Only one** power still needs host code,
+because of a deliberate engine boundary:
 
-1. **Clouds that hover and rain.** The engine has **no buoyancy/pressure term** —
-   a gas only ever rises *away* from the gravity center and escapes the grid. So
-   a cloud is a **host-tracked visual entity** (a circle you draw on the canvas),
-   and each tick you spawn real `WATER` cells at its underside. The water falls
-   under `RadialGravity` — genuine rain. Track a water budget per cloud; shrink
-   the drawn radius as it depletes; delete when empty. (A reference
+1. **Clouds that hover and rain.** The engine's heat field has **no buoyancy
+   term** — a gas only ever rises *away* from the gravity center and escapes the
+   grid. So a cloud is a **host-tracked visual entity** (a circle you draw on the
+   canvas), and each tick you spawn real `WATER` cells at its underside. The
+   water falls under `RadialGravity` — genuine rain. Track a water budget per
+   cloud; shrink the drawn radius as it depletes; delete when empty. (A reference
    implementation exists at `showcase/helpers/cloud.ts` in the engine repo —
    read it, then write your own.)
 
-2. **Volcano / lava cooling.** The engine only turns lava→rock via the
-   lava+water reaction, so on a dry planet lava stays molten forever. You need a
-   per-tick cooling step *after* `engine.update()`: scan lava cells, gradually
-   reduce a stored temperature, and flip to `ROCK` below a threshold. Store
-   temperature in `engine.colorGrid` (a `Uint32Array` the engine swaps with the
-   material) so it rides with the flow for free. Tie the yield/stiffness to
-   temperature via `engine.stiffnessGrid` so hot lava flows and cold lava locks.
-   (Reference: `showcase/helpers/volcano.ts`.)
+The other powers are pure engine — no per-tick host step required:
 
-3. **Forest spread (optional).** The engine has no growth mechanic. If you want
-   forests to creep, run a host step that occasionally turns adjacent `GRASS`/
-   `EMPTY` near water into `WOOD`. Or skip it — static forests are fine for an MVP.
+2. **Volcano.** A single `addPressureSource({...})` call opens a magma vent.
+   The engine pressure-routes lava up a connected conduit, ejects it from the
+   first open outlet (with ballistic velocity + a lateral spread so ejecta fans
+   across the flanks), fragments airborne cells into `TEPHRA` as they cool (which
+   builds the cone), and freezes grounded lava to `ROCK` once it cools past its
+   threshold. If the vent seals, configure `fracture` so pressure builds and the
+   cap pops in a visible seal-then-reopen cycle. See the code block below.
+3. **Forest.** `setMaterial(x, y, SEED)` is all you need — the seed falls,
+   germinates into a growing tip on contact with `SAND`/`GRASS`, and grows into a
+   tree (trunk → branches → canopy → leaves) with its own genome. `GRASS` placed
+   near water spreads outward on its own to a bounded radius. For a guaranteed
+   instant tree at a spot, use `engine.plant(x, y, TREE_TIP, { energy: 12 })`.
+4. **Ocean.** `setMaterial(x, y, WATER)` — it flows, levels, and (with heat on)
+   freezes near the poles / melts near lava, all natively.
+
+#### Opening a volcano (copy this)
+
+```ts
+// A vent at the planet surface, magma chamber below it. cx/cy are the planet
+// center; angle points from center to the vent.
+const ventX = Math.round(cx + Math.cos(angle) * planetR);
+const ventY = Math.round(cy + Math.sin(angle) * planetR);
+
+engine.addPressureSource({
+  x: ventX,
+  y: ventY,
+  material: MaterialType.LAVA,
+  rate: 1.5,                 // lava cells accrued per frame
+  pressureRate: 1,           // head accrued per frame while blocked
+  maxPressure: 18,           // how hard it can eventually push
+  maxPending: 40,            // cap on backlog (bounds the post-unblock surge)
+  outletVelocityEfficiency: 0.7,  // fraction of surplus head → launch speed
+  outletLateralSpread: 0.25,       // ±half-angle of the jet (tangent form)
+  temperature: 1.0,          // born at full melt; cools from there
+  // Keep the eruption on the vent axis so summit spread doesn't become extra vents:
+  ventAnchor: { cx, cy, angle, corridorRadius: 6 },
+  // Seal-then-pop: pressure accrues while blocked, then fractures the cap.
+  fracture: { minSealedFrames: 24, pressureRate: 1, maxPressure: 18 },
+});
+```
+
+Remove it with `engine.removePressureSource(id)` (the id `addPressureSource`
+returned) to end the eruption. The state of a live source — accrued volume and
+available pressure — is readable via `getPressureSourceState(id)`.
 
 ### MVP scope — what "done" looks like
 
@@ -166,8 +221,8 @@ A single page where, within a few minutes of loading, a player can:
 - [ ] See a circular planet with gravity pulling toward its center.
 - [ ] Drag to raise mountains out of sand/rock.
 - [ ] Summon a cloud and watch rain pool into oceans.
-- [ ] Trigger a volcano and watch lava flow and cool into new land.
-- [ ] Plant a forest and (optionally) watch it spread.
+- [ ] Open a volcano and watch lava fountain, flow, fragment into a tephra cone, and cool into new land.
+- [ ] Scatter seeds and watch forests grow (and grass creep outward from water).
 - [ ] Smite with fire and watch it spread through flammables.
 - There is **no UI beyond the toolbar**. No score, no levels, no menus. The
   simulation reacting to the player *is* the game.
@@ -177,15 +232,14 @@ A single page where, within a few minutes of loading, a player can:
 - **Do not add a physics library** (no `planck`/matter.js). The engine has no
   rigid bodies and isn't trying to. Trees, buildings, creatures are pixels, not
   sprites-with-colliders.
-- **Do not try to make the engine do pressure or temperature.** Those are
-  host-side (above). The engine's job is displacement, gravity, leveling, and
-  reactions.
+- **Do not hand-roll temperature, growth, or pressure.** All three are native
+  engine features now (see "Engine capabilities" below). Turn them on with
+  `enableHeat` / the growth rules / `addPressureSource` and let the engine do it.
 - **Do not build a tile/sprite renderer first.** Get raw material colors on
   screen as fast as possible; the look comes later. A correct loop with ugly
   pixels beats a pretty loop that doesn't simulate.
 - **Do not skip `consumeRenderDirtyChunks()` forever** — it's fine to ignore for
-  the MVP (full repaint), but know the optimization exists when frame rate
-  matters.
+  the MVP (full repaint), but at 640×640 frame rate will eventually want it.
 
 ### Suggested build order (get something on screen in 15 minutes)
 
@@ -195,10 +249,13 @@ A single page where, within a few minutes of loading, a player can:
    **Goal: feel the gravity.**
 3. Add the water brush; watch it flow and level into seas. **Goal: the first
    "wow".**
-4. Add the cloud power (host entity + rain spawn). **Goal: weather.**
-5. Add volcano (lava placement + cooling step). **Goal: geological drama.**
-6. Add forest + fire. **Goal: life and destruction.**
-7. Polish: nicer colors, brush-size slider, a "clear world" button.
+4. Turn on heat (`enableHeat: true`); drop a `LAVA` cell and watch it cool to
+   rock on its own. **Goal: geology without host code.**
+5. Add the cloud power (host entity + rain spawn). **Goal: weather.**
+6. Open a volcano with `addPressureSource`. **Goal: a fountaining, cone-building eruption.**
+7. Scatter `SEED` / `plant()` a tree; watch a forest establish. **Goal: life.**
+8. Add fire/smite. **Goal: destruction.**
+9. Polish: nicer colors, brush-size slider, a "clear world" button.
 
 ---
 
@@ -215,20 +272,49 @@ a ring. This MVP is that demo, turned into a toy with goals and weather.
 
 ### Engine capabilities you get for free
 
-- **14 materials**: EMPTY, WALL, SAND, WATER, LAVA, ROCK, STEAM, FIRE, SMOKE,
-  OIL, ACID, WOOD, FGAS (flammable gas), ICE.
+- **23 materials**: EMPTY, WALL, SAND, WATER, LAVA, ROCK, STEAM, FIRE, SMOKE,
+  OIL, ACID, WOOD, FGAS (flammable gas), ICE, **GRASS, SEED, TREE_TIP, LEAF,
+  FERN_TIP, SPORE, CORAL, FROND, TEPHRA**. The last nine are the life/ejecta
+  materials — every one of them is inert until its growth rule fires or a host
+  places it, so a world that never uses them pays nothing.
 - **Density-driven displacement** — denser sinks through lighter; gases (negative
   density) rise.
 - **Reactions** — lava+water→rock+steam, fire spreads via flammability and is
   quenched by water, acid dissolves solids, FGAS ignites and explodes.
+- **Native heat / temperature field** — turn on with `enableHeat: true`. Every
+  thermal material conducts to its neighbours, radiates to the environment
+  through exposed faces, and phase-changes: lava → rock, water → steam / ice,
+  steam → water, ice → water. `FIRE` is an infinite heat source (a Dirichlet
+  boundary); `LAVA` is a finite body that cools. `ambientTemperature` is the
+  climate dial — drop it and oceans freeze on their own. No host cooling step
+  needed.
+- **Native growth system** — three rule kinds: `spread` (grass/moss, isotropic,
+  moisture-gated with a travel `range`), `tip` (trees/ferns, a directed
+  stateful growing point that leaves a trunk and branches behind it), and
+  `aggregate` (seeds germinating, spores accreting onto coral). Tips always die,
+  which is why a forest converges instead of consuming the grid. `engine.plant()`
+  seeds a tip; `growthInterval` paces it. Growth is gravity-relative, so on a
+  planet a tree grows radially outward.
+- **Native pressure transport** — `addPressureSource` routes a liquid (V1: lava
+  only) through its connected body to a real boundary outlet via a Dijkstra
+  search, accounting for gravitational head and per-material resistance. Blocked
+  sources accrue pressure and can fracture solids (`ROCK`/`TEPHRA` opt in; `WALL`
+  stays permanent). `injectLiquid` is the one-shot version. This is the
+  volcano engine.
+- **Fragmentation** — an airborne lava cell that cools past `fragmentsAt` while
+  still in flight becomes granular `TEPHRA`, which piles at its angle of repose
+  and builds a cone. Grounded cells never fragment — they freeze to `ROCK`.
 - **Explosions** — `engine.explode(x, y, radius)` carves terrain and scatters
   debris; pass `onExplode` in the constructor for a hook.
+- **Velocity field** — `setVelocity` / `applyImpulse` give a cell a sub-cell
+  velocity that integrates across frames. Pressure outlets use this to launch
+  ejecta ballistically; hosts can use it for anything.
 - **Liquid leveling** — water seeks an equipotential and then goes quiet (0
   swaps/frame), so oceans settle, they don't shimmer forever.
 - **Yield strength (`yieldThickness`)** — lava is a Bingham plastic: it flows
   only while thick enough, stopping at a blunt front. This is why lava *looks*
   like lava and not like orange water. Override per-cell with
-  `engine.stiffnessGrid` (the lever a temperature system uses).
+  `engine.stiffnessGrid` (hot lava flows, cold lava locks).
 - **Deterministic** — seeded RNG (`engine.random()`, never `Math.random()`).
   Same seed + same inputs → identical evolution. Useful for replay/testing.
 - **Active-chunk optimization** — only 32×32 chunks with activity are simulated.
@@ -237,30 +323,32 @@ a ring. This MVP is that demo, turned into a toy with goals and weather.
 
 - **No rigid bodies.** Everything is a cell. Creatures would be sprite overlays
   you move yourself, reading the grid for collisions.
-- **No pressure.** Water in a sealed pipe won't rise; a U-tube won't equalize.
-  Pipes/aqueducts aren't expressible without host help.
-- **No temperature field.** Lava stays molten unless the host cools it (above).
+- **No water pressure transport.** Pressure routing is lava-only in V1 (only
+  LAVA sets `pressureResistance`). A U-tube of water won't equalize; aqueducts
+  aren't expressible without host help.
 - **No buoyancy for gases.** Gases rise away from gravity and exit the grid —
-  hence clouds must be host-tracked, not a gas material.
+  hence clouds must be host-tracked, not a gas material. (Steam is the exception:
+  it rises, cools, and condenses back to water natively.)
 - **No rendering.** You draw every pixel.
 
 ### Reference material in the engine repo
 
-If you cloned it, these files are gold (they're not in the npm tarball):
+The engine lives at <https://github.com/morganpage/aicraft-pixel-engine>. If you
+cloned it, these files are gold (they're not in the npm tarball):
 
 - `showcase/sections/planet.ts` — the full planet demo: world setup, mouse
   painting, the render loop, even a visual spin toggle. Copy its shape.
 - `showcase/helpers/cloud.ts` + `cloud.test.ts` — a complete, tested
   rain-cloud implementation. The cleanest reference for the Summon Cloud power.
-- `showcase/helpers/volcano.ts` — a full eruption system (conduit, plume,
-  cooling, tephra). Heavy, but shows exactly how to host-side temperature.
+- `showcase/helpers/volcano.ts` — a full eruption system built on
+  `addPressureSource` (conduit, plume, fragmentation, fracture). The reference
+  for wiring a volcano with the native pressure system.
 - `docs/integration.md` — the authoritative guide to the host/engine boundary.
-  Read the section on yield strength and `stiffnessGrid` before building the
-  volcano.
 
 ### Stretch goals (only after the MVP is fun)
 
-- **Day/night** — just a canvas tint overlay; costs nothing, adds mood.
+- **Day/night** — modulate `ambientTemperature` on a slow cycle; oceans freeze
+  at night and thaw at dawn, natively. Add a canvas tint overlay for mood.
 - **Population** — simple sprites that walk on the surface and need water +
   food. Read the grid to find walkable ground.
 - **Challenges** — "create an ocean of ≥N water cells", "grow a forest of ≥N

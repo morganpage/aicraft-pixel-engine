@@ -9,6 +9,7 @@ export {
   DEFAULT_VELOCITY_DRAG,
   VELOCITY_GRAVITY_SCALE,
   OUTLET_VELOCITY_EFFICIENCY,
+  OUTLET_LATERAL_SPREAD,
   MIN_OUTLET_SURPLUS,
   EXPLOSION_VELOCITY_SCALE,
   HEAT_EPSILON,
@@ -23,6 +24,7 @@ export {
   type InjectionRejectionReason,
   type PressureSourceOptions,
   type PressureSourceState,
+  type PressureSourceFractureOptions,
 } from './engine.js';
 export { neighborFrame, fillNeighborFrame, octantOffset } from './neighbors.js';
 export type { NeighborFrame, CellOffset } from './types.js';

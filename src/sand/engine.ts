@@ -1250,6 +1250,8 @@ export class PixelEngine {
    * dirtiness. Terrain-dirty is tracked when a structural solid moves.
    */
   swap(x1: number, y1: number, x2: number, y2: number): void {
+    if (x1 < 0 || x1 >= this.width || y1 < 0 || y1 >= this.height) return;
+    if (x2 < 0 || x2 >= this.width || y2 < 0 || y2 >= this.height) return;
     const idx1 = this.getIndex(x1, y1);
     const idx2 = this.getIndex(x2, y2);
     const m1 = this.grid[idx1];

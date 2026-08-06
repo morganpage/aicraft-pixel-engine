@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-08-06
+
 ### Changed
 - **The volcano per-frame loop is now a shared controller.**
   `stepVolcanoFrame` (`showcase/helpers/volcano.ts`) is the single source of
@@ -225,6 +227,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   repose heating stops 3 cells short, Phase 5 (debris accounting) not started.
   See `docs/plan-volcano-vent-stability.md` for full status. Legacy sources (no
   `fracture` config) are unchanged.
+
+### Fixed
+- **`swap()` now bounds-checks its coordinates.** Every other public accessor
+  (`getMaterial`, `setMaterial`, `setHeat`, `isStructural`) guards out-of-range
+  coordinates, but `swap()` called `getIndex()` (which does no bounds check)
+  directly, so an out-of-range argument silently wrote to the wrong cell. `swap`
+  now no-ops on out-of-bounds coordinates like its siblings. In-bounds call sites
+  are unaffected.
+
+### Changed
+- **`OUTLET_LATERAL_SPREAD` and `PressureSourceFractureOptions` are now exported
+  from the package root.** Both were `export`ed from `engine.ts` (and documented
+  as public) but missing from the `sand` barrel, so they were unreachable from
+  `aicraft-pixel-engine`. They now re-export through `src/sand/index.ts`.
+- **npm metadata completed.** Added `repository`, `homepage`, `bugs`, `keywords`,
+  `author`, and a `default` export condition so the npm page links back to the
+  GitHub repo and is discoverable in search. Added a `prepublishOnly` gate
+  (`npm run build && npm test`) so a release can never ship without a green
+  typecheck and full test run.
 
 ## [0.1.1] — 2026-08-03
 

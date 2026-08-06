@@ -1,16 +1,35 @@
 {
   "name": "aicraft-pixel-engine",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Pixel-based falling-sand cellular-automaton physics engine for AI Craft games. Zero runtime dependencies.",
   "license": "MIT",
+  "author": "AI Craft",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/morganpage/aicraft-pixel-engine.git"
+  },
+  "homepage": "https://github.com/morganpage/aicraft-pixel-engine#readme",
+  "bugs": {
+    "url": "https://github.com/morganpage/aicraft-pixel-engine/issues"
+  },
+  "keywords": [
+    "falling-sand",
+    "cellular-automaton",
+    "physics-engine",
+    "pixel",
+    "simulation",
+    "game",
+    "deterministic"
+  ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
   "files": [
@@ -27,6 +46,7 @@
     "build": "tsc --noEmit",
     "build:dist": "tsc -p tsconfig.build.json",
     "prepack": "npm run build:dist",
+    "prepublishOnly": "npm run build && npm test",
     "test": "vitest run",
     "test:watch": "vitest",
     "showcase:dev": "vite --config showcase/vite.config.ts",
