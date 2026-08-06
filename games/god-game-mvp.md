@@ -164,9 +164,66 @@ because of a deliberate engine boundary:
    grid. So a cloud is a **host-tracked visual entity** (a circle you draw on the
    canvas), and each tick you spawn real `WATER` cells at its underside. The
    water falls under `RadialGravity` — genuine rain. Track a water budget per
-   cloud; shrink the drawn radius as it depletes; delete when empty. (A reference
-   implementation exists at `showcase/helpers/cloud.ts` in the engine repo —
-   read it, then write your own.)
+   cloud, shrink the drawn radius as it depletes, and drop it when empty.
+
+   This is small enough to inline in full — a cloud is just a tracked point with
+   a water budget, and a per-tick step that spends some of it as real `WATER`
+   cells. The engine does the rest (the rain falls under gravity, pools, levels):
+
+   ```ts
+   import { MaterialType } from 'aicraft-pixel-engine';
+
+   interface Cloud {
+     x: number; y: number;          // center, grid cells
+     radius: number;                // current visible radius, shrinks with water
+     initialRadius: number;
+     water: number;                 // remaining budget; 0 = exhausted
+     initialWater: number;
+   }
+
+   const WATER_PER_CELL = 60;       // budget per cell of initial radius
+   const RAIN_OFFSET = 0.7;         // how far below center rain spawns (× radius)
+
+   // Place a cloud only in the void above the surface; null inside the planet
+   // disc or off the grid. Clamp radius so it never draws past the grid edge.
+   function placeCloud(
+     cx: number, cy: number, planetR: number, size: number,
+     x: number, y: number, radius = 7,
+   ): Cloud | null {
+     const dx = x - cx, dy = y - cy;
+     if (dx * dx + dy * dy <= planetR * planetR) return null; // inside planet
+     if (x < 0 || x >= size || y < 0 || y >= size) return null; // off grid
+     const maxR = Math.max(1, Math.min(x, size - 1 - x, y, size - 1 - y, radius));
+     const initialWater = maxR * WATER_PER_CELL;
+     return { x, y, radius: maxR, initialRadius: maxR, water: initialWater, initialWater };
+   }
+
+   // Advance one cloud one tick, before engine.update() so fresh rain moves same
+   // frame. Spends rain as WATER cells jittered across the underside; only writes
+   // into EMPTY so rain never carves into terrain. Radius tracks the water left.
+   function stepCloud(engine: any, cloud: Cloud, rainPerTick: number, rng: () => number): void {
+     if (cloud.water <= 0) { cloud.radius = 0; return; }
+     const spend = Math.min(rainPerTick, cloud.water);
+     const halfWidth = Math.max(0.5, cloud.initialRadius * 0.8);
+     const yOffset = cloud.initialRadius * RAIN_OFFSET;
+     for (let i = 0; i < spend; i++) {
+       const t = rng() * 2 - 1;                                   // [-1, 1]
+       const rx = Math.round(cloud.x + t * halfWidth);
+       const ry = Math.round(cloud.y + yOffset + rng() * 2);      // small jitter
+       if (engine.getMaterial(rx, ry) === MaterialType.EMPTY) {   // out-of-bounds reads as WALL
+         engine.setMaterial(rx, ry, MaterialType.WATER);
+       }
+     }
+     cloud.water -= spend;
+     cloud.radius = cloud.water > 0 ? cloud.initialRadius * (cloud.water / cloud.initialWater) : 0;
+   }
+
+   // Render: draw each cloud as a soft circle on the canvas overlay (alpha
+   // fading with remaining water). Call removeDead(clouds) each frame to drop
+   // spent clouds, and throttle placement on drag to ~2*radius cells apart so a
+   // pointer sweep leaves distinct clouds, not a solid white mass.
+   ```
+
 
 The other powers are pure engine — no per-tick host step required:
 
@@ -266,9 +323,9 @@ A single page where, within a few minutes of loading, a player can:
 `aicraft-pixel-engine` is a falling-sand cellular automaton with a pluggable
 gravity seam. Its `RadialGravity` model makes every cell fall toward a planet
 center — which is precisely the defining mechanic of circular-planet god games.
-The engine already ships a planet demo (`showcase/sections/planet.ts`) that
-proves the feel: paint sand in the void and watch it curve inward and settle as
-a ring. This MVP is that demo, turned into a toy with goals and weather.
+The feel is immediate: stamp the rock disc above, paint sand anywhere in the
+void, and watch it curve inward and settle as a ring around the planet. This MVP
+is that behavior, turned into a toy with goals and weather.
 
 ### Engine capabilities you get for free
 
@@ -331,18 +388,22 @@ a ring. This MVP is that demo, turned into a toy with goals and weather.
   it rises, cools, and condenses back to water natively.)
 - **No rendering.** You draw every pixel.
 
-### Reference material in the engine repo
+### Reference material in the engine repo (optional)
 
-The engine lives at <https://github.com/morganpage/aicraft-pixel-engine>. If you
-cloned it, these files are gold (they're not in the npm tarball):
+> The brief above is self-contained — everything you need to build the MVP is
+> inline, including the full cloud implementation. The engine repo
+> (<https://github.com/morganpage/aicraft-pixel-engine>) holds the reference
+> app these patterns were extracted from, but it is **not required** and may be
+> private. Treat these only as optional further reading if you happen to have
+> access; none of them ship in the npm tarball.
+
+If you do have access:
 
 - `showcase/sections/planet.ts` — the full planet demo: world setup, mouse
-  painting, the render loop, even a visual spin toggle. Copy its shape.
-- `showcase/helpers/cloud.ts` + `cloud.test.ts` — a complete, tested
-  rain-cloud implementation. The cleanest reference for the Summon Cloud power.
+  painting, the render loop. Worth skimming for renderer structure.
 - `showcase/helpers/volcano.ts` — a full eruption system built on
-  `addPressureSource` (conduit, plume, fragmentation, fracture). The reference
-  for wiring a volcano with the native pressure system.
+  `addPressureSource` (conduit, plume, fragmentation, fracture). Useful if you
+  want a more elaborate volcano than the one-liner above.
 - `docs/integration.md` — the authoritative guide to the host/engine boundary.
 
 ### Stretch goals (only after the MVP is fun)
