@@ -1031,10 +1031,14 @@ export function initPlanet(container: HTMLElement): void {
       } else {
         for (let i = 0; i < report.runs.length; i++) {
           const r = report.runs[i];
-          // putImageData(image, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH): uploads
-          // only the sub-rectangle [dirtyX, dirtyX+dirtyW) × [dirtyY, dirtyY+dirtyH)
-          // of the source ImageData to (dx, dy) on the destination.
-          offCtx.putImageData(img, r.x, r.y, r.x, r.y, r.w, r.h);
+          // putImageData(image, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH): the
+          // source origin maps to (dx, dy) and the dirty rect (in DESTINATION
+          // space) clips which of that drawn region lands. We want source pixel
+          // (x,y) to land at destination (x,y) — i.e. an identity mapping — so
+          // dx=dy=0 (source-0,0 → dest-0,0) and the dirty rect is the run itself.
+          // Passing r.x,r.y as dx,dy would shift the source origin and upload the
+          // WRONG region (the bug that shattered the circle on Scatter).
+          offCtx.putImageData(img, 0, 0, r.x, r.y, r.w, r.h);
           renderTimings.uploadCalls++;
           renderTimings.uploadBytes += r.w * r.h * 4;
         }
