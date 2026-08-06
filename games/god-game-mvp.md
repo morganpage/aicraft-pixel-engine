@@ -104,7 +104,30 @@ into it.
 
 ### Rendering — you own the canvas
 
-The engine owns the simulation; you own the pixels. Minimal renderer:
+The engine owns the simulation; you own the pixels.
+
+**Pin the canvas to the grid, or the planet will look stretched.** The single
+most common rendering bug is a canvas whose internal resolution doesn't match
+the grid (640×640 cells → a 640×640 backing store), or whose CSS size stretches
+it into a non-square box. Both turn the circular planet into an ellipse and
+desynchronize the mouse-to-grid mapping. Three rules prevent it:
+
+1. **Set the backing store once, in pixels:** `canvas.width = canvas.height = SIZE`.
+   `width`/`height` are the resolution; never let CSS override them. Allocate
+   `ImageData` from this same `SIZE`.
+2. **Keep the CSS box square and at a whole-number scale** (e.g. `style="width:640px;height:640px"`
+   or `width: min(90vw, 90vh)` so it stays square on any screen). Do **not**
+   stretch a square canvas to a wide/tall flex child — that is exactly what
+   elongates the disc.
+3. **Scale via the camera (below), not CSS.** Zoom/pan is a `ctx` transform on
+   the square backing store; the CSS box stays fixed and square.
+
+```ts
+canvas.width = canvas.height = SIZE;          // backing store = grid (once)
+canvas.style.width = canvas.style.height = `${SIZE}px`; // square CSS box, no stretch
+```
+
+Minimal renderer:
 
 ```ts
 // Palette: index by MaterialType id → packed RGBA.
@@ -392,6 +415,9 @@ A single page where, within a few minutes of loading, a player can:
   pixels beats a pretty loop that doesn't simulate.
 - **Do not skip `consumeRenderDirtyChunks()` forever** — it's fine to ignore for
   the MVP (full repaint), but at 640×640 frame rate will eventually want it.
+- **Do not let CSS stretch the canvas.** Set `canvas.width = canvas.height = SIZE`
+  and keep the CSS box square. A stretched backing store turns the circular
+  planet into an ellipse and breaks the mouse-to-grid mapping. See "Rendering".
 
 ### Suggested build order (get something on screen in 15 minutes)
 
