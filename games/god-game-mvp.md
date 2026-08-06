@@ -165,6 +165,11 @@ function render() {
 }
 ```
 
+That full-canvas repaint is fine to ship the MVP with. The optimization — only
+repainting chunks the simulation actually changed — is important enough at
+640×640 to do up front, because it's also where the single most common rendering
+bug lives. See **Repainting dirty chunks** below.
+
 The game loop is a fixed-step `setInterval` (60 Hz) calling `engine.update()`
 then `render()`. Mouse → grid cell must go through the **camera** (see below),
 not a plain scale.
@@ -226,6 +231,70 @@ correctly with zoom without extra work.
 > it flags need repainting, and the rest of the canvas keeps its last frame.
 > `update()` itself already skips inactive chunks, so simulation cost stays
 > bounded to where things are actually happening.
+
+### Repainting dirty chunks (do this — and read the `putImageData` warning)
+
+`engine.consumeRenderDirtyChunks()` returns a `Uint8Array` with one byte per
+32×32 chunk; a non-zero byte means that chunk's pixels changed this frame and
+need repainting. The structure is an offscreen canvas at grid resolution that
+you write into and then blit through the camera:
+
+```ts
+const CHUNK = engine.CHUNK_SIZE;          // 32
+const chunksPerRow = engine.width / CHUNK;
+const gridCanvas = document.createElement('canvas');
+gridCanvas.width = engine.width;
+gridCanvas.height = engine.height;
+const gctx = gridCanvas.getContext('2d')!;
+const img = gctx.createImageData(engine.width, engine.height);
+
+// Repaint one 32×32 chunk whose origin is (x0, y0), writing its pixels into
+// `img` at offset (x0, y0), then blitting JUST that region to gridCanvas.
+function paintChunk(x0: number, y0: number) {
+  for (let y = y0; y < y0 + CHUNK; y++) {
+    for (let x = x0; x < x0 + CHUNK; x++) {
+      const o = (y * engine.width + x) * 4;
+      const mat = engine.grid[y * engine.width + x];
+      if (mat === MaterialType.EMPTY) { /* background colour into img[o..o+3] */ }
+      else { /* palette[mat] unpacked into img[o..o+3] */ }
+    }
+  }
+  // ⚠️ The source dirty-offset is (0,0), NOT (x0,y0). See warning below.
+  gctx.putImageData(img, 0, 0, x0, y0, CHUNK, CHUNK);
+}
+
+// In the game loop, after engine.update():
+const dirty = engine.consumeRenderDirtyChunks();
+for (let i = 0; i < dirty.length; i++) {
+  if (!dirty[i]) continue;
+  const cx = i % chunksPerRow;
+  const cy = (i / chunksPerRow) | 0;
+  paintChunk(cx * CHUNK, cy * CHUNK);
+}
+// Then blit gridCanvas through the camera with ctx.drawImage(gridCanvas, 0, 0)
+// under the camera transform — see the Camera section.
+```
+
+> **⚠️ `putImageData` argument trap — read this.** This is the #1 rendering bug
+> in engine-built games, and it renders the planet *invisible* while the grid
+> data is perfectly correct, which makes it maddening to debug.
+>
+> `putImageData(imageData, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH)` — the
+> `dirtyX`/`dirtyY` parameters are an offset **into the source `imageData`**,
+> *not* a destination coordinate. When you write a chunk's pixels into `img` at
+> offset `(x0, y0)`, the correct source offset to read them back from is `0, 0`:
+>
+> ```ts
+> gctx.putImageData(img, 0, 0, x0, y0, CHUNK, CHUNK);  // ✅ correct
+> gctx.putImageData(img, x0, y0, x0, y0, CHUNK, CHUNK); // ❌ reads img from the
+>                                                       //    wrong offset; only
+>                                                       //    chunk (0,0) works
+> ```
+>
+> With the wrong call, chunk `(0,0)` happens to render fine (because `x0=y0=0`
+> makes the source offset correct by accident) and **every other chunk shows
+> nothing or garbage.** If your planet is stamped but invisible and only a
+> fragment appears in the top-left corner, this is it.
 
 ### God-powers that need host logic (read this carefully)
 
@@ -422,7 +491,9 @@ A single page where, within a few minutes of loading, a player can:
 ### Suggested build order (get something on screen in 15 minutes)
 
 1. Vite + TS scaffold, install the engine, stamp the planet disc, render raw
-   grid colors in a `setInterval` loop. **Goal: see a grey disc.**
+   grid colors in a `setInterval` loop. Use the dirty-chunk repaint from
+   "Repainting dirty chunks" (and mind the `putImageData` warning) — a
+   full-canvas `putImageData(img, 0, 0)` also works to start. **Goal: see a grey disc.**
 2. Add mouse→grid + a sand brush; drag to drop sand that piles on the surface.
    **Goal: feel the gravity.**
 3. Add the camera: wheel-zoom toward cursor, middle-drag pan, double-click
