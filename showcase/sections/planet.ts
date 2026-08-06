@@ -230,6 +230,14 @@ function constructWorld(
       // bore before it re-freezes; 4 lets a new effusive episode break through
       // in under 10 frames.
       fracturePerFrame: 4,
+      // The pressure router (Dijkstra) must explore from the chamber feed to a
+      // surface outlet to emit magma. At high resolution the chamber + conduit
+      // are proportionally longer, so the default visit budget (2048) is
+      // exhausted before a route is found and the eruption cycles through its
+      // phases emitting nothing — no cone forms. Scale the budget linearly with
+      // the planet radius (the route length scales with it), anchored at the
+      // 2048 default for the 220² reference (planetR 66).
+      pressureVisitLimit: Math.max(2048, Math.round(2048 * planetR / 66)),
     });
 
     // Offscreen canvas holds the unrotated grid each frame. The visible canvas
