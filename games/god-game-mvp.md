@@ -10,8 +10,8 @@
 
 Build a minimal but genuinely fun **god game** — a one-screen, circular-planet
 terraforming toy in the spirit of *Reus* / *Godfinger* — on top of the
-[`aicraft-pixel-engine`](https://github.com/morganpage/aicraft-pixel-engine)
-falling-sand simulation library ([npm](https://www.npmjs.com/package/aicraft-pixel-engine)).
+[`aicraft-pixel-engine`](https://www.npmjs.com/package/aicraft-pixel-engine)
+falling-sand simulation library.
 **Single HTML page, no framework, Vite + plain
 TypeScript.** Target a playable MVP in one sitting, not a polished product.
 
@@ -387,24 +387,6 @@ is that behavior, turned into a toy with goals and weather.
   hence clouds must be host-tracked, not a gas material. (Steam is the exception:
   it rises, cools, and condenses back to water natively.)
 - **No rendering.** You draw every pixel.
-
-### Reference material in the engine repo (optional)
-
-> The brief above is self-contained — everything you need to build the MVP is
-> inline, including the full cloud implementation. The engine repo
-> (<https://github.com/morganpage/aicraft-pixel-engine>) holds the reference
-> app these patterns were extracted from, but it is **not required** and may be
-> private. Treat these only as optional further reading if you happen to have
-> access; none of them ship in the npm tarball.
-
-If you do have access:
-
-- `showcase/sections/planet.ts` — the full planet demo: world setup, mouse
-  painting, the render loop. Worth skimming for renderer structure.
-- `showcase/helpers/volcano.ts` — a full eruption system built on
-  `addPressureSource` (conduit, plume, fragmentation, fracture). Useful if you
-  want a more elaborate volcano than the one-liner above.
-- `docs/integration.md` — the authoritative guide to the host/engine boundary.
 
 ### Stretch goals (only after the MVP is fun)
 
