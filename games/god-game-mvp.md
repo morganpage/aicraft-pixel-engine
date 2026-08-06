@@ -56,7 +56,7 @@ distinct; six is plenty:
 | **Ocean** | Pour water; it flows and levels into seas around the planet. | `setMaterial(x, y, WATER)` |
 | **Forest** | Scatter `SEED` that falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. | `engine.plant(...)` / `setMaterial(x, y, SEED)` |
 | **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone. | `engine.addPressureSource(...)` — the engine handles eruption, flow, cooling, and cone |
-| **Smite** | Lightning/fire — ignite flammables, scorch terrain. | `setMaterial(x, y, FIRE)` or `engine.explode(x, y, r)` |
+| **Smite** | Lightning bolt strikes the cursor: a jagged flash, an ignition at the impact, and a small scorch. | Host-drawn bolt (one-frame visual) + `setMaterial(x, y, FIRE)` / `engine.explode(x, y, r)` at the strike point |
 
 ### World setup (the part that makes it a *planet*)
 
@@ -143,8 +143,59 @@ function render() {
 ```
 
 The game loop is a fixed-step `setInterval` (60 Hz) calling `engine.update()`
-then `render()`. Mouse → grid cell is a plain scale: `gx = floor((e.clientX -
-rect.left) / rect.width * SIZE)`.
+then `render()`. Mouse → grid cell must go through the **camera** (see below),
+not a plain scale.
+
+### Camera — zoom and pan (standard mouse controls)
+
+At 640×640 the planet is detailed enough that players want to get close. Add a
+2D camera with the controls every map/canvas app uses — no modifiers to
+remember:
+
+- **Scroll wheel** — zoom toward the cursor. Clamp zoom in `[1, ~8]`× so you
+  can't lose the planet by zooming out past 1× or pixel-peep past ~8×.
+- **Drag with the middle mouse button** (or space + left) — pan.
+- **Double-click** — reset to the default centered fit.
+
+The camera is just a scale + translate applied in `render()`; it never touches
+the engine grid. Because every grid cell maps to a fixed source rectangle,
+`ctx.drawImage()` (or `putImageData` into an offscreen canvas, then `drawImage`
+scaled) is the clean path — draw the grid once at native resolution and let the
+camera transform the blit. Mouse input then has to invert the same transform to
+recover the grid cell:
+
+```ts
+// Camera state. originX/originY is the grid cell currently at the canvas
+// top-left; zoom is pixels-per-cell.
+const camera = { originX: 0, originY: 0, zoom: 1 };
+
+// Screen → grid cell: invert the camera. `rect` is the canvas bounding rect.
+function screenToGrid(e: MouseEvent) {
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  return {
+    gx: Math.floor(camera.originX + sx / camera.zoom),
+    gy: Math.floor(camera.originY + sy / camera.zoom),
+  };
+}
+
+// Zoom toward the cursor: keep the cell under the cursor pinned.
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const before = screenToGrid(e);
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  camera.zoom = Math.min(8, Math.max(1, camera.zoom * factor));
+  const after = screenToGrid(e);
+  camera.originX += before.gx - after.gx;
+  camera.originY += before.gy - after.gy;
+}, { passive: false });
+
+// Pan: drag updates origin by the delta divided by zoom (cells, not pixels).
+// Middle-mouse drag, or space + left drag — pick one and stay consistent.
+```
+
+Brush radii and cloud placement use grid coordinates, so they automatically scale
+correctly with zoom without extra work.
 
 > **Resolution note.** 640×640 is 16× the cells of a 160×160 demo grid. A naive
 > full-canvas repaint every frame still runs, but once the world is busy the
@@ -272,15 +323,59 @@ Remove it with `engine.removePressureSource(id)` (the id `addPressureSource`
 returned) to end the eruption. The state of a live source — accrued volume and
 available pressure — is readable via `getPressureSourceState(id)`.
 
+#### Smiting with lightning (copy this)
+
+Lightning is pure presentation on top of two engine calls — the strike itself is
+a one-frame jagged line you draw from the top of the canvas to the cursor, then
+the engine takes over: a `FIRE` cell ignites at the impact and spreads through
+anything flammable, and an `explode()` carves a small scorch. The drama is the
+flash and the ignition; the engine does the consequences.
+
+```ts
+// A live bolt lasts exactly one rendered frame, then clears.
+let bolt: { points: { x: number; y: number }[] } | null = null;
+
+function smite(engine: any, gx: number, gy: number, ctx: CanvasRenderingContext2D) {
+  // 1. The visual: a jagged polyline from the canvas top to the strike point.
+  //    Midpoint-displacement lightning — a few segments of randomized offset.
+  bolt = makeBolt(gx, gy);                 // see below
+  // 2. The ignition + scorch, at the actual grid cell under the cursor.
+  engine.setMaterial(gx, gy, MaterialType.FIRE);
+  engine.explode(gx, gy, 3, 4);            // small crater, light debris
+}
+
+// Draw `bolt` in render() right after putImageData/drawImage, then set
+// bolt = null so it flashes for exactly one frame. White core + pale-blue glow
+// reads instantly as lightning against the planet.
+
+function makeBolt(gx: number, gy: number) {
+  const points = [{ x: gx, y: 0 }];        // top of the grid
+  let y = 0;
+  while (y < gy) {
+    y += 4 + Math.floor(Math.random() * 6); // step down 4–9 cells
+    const xJitter = (Math.random() - 0.5) * 12;
+    points.push({ x: gx + xJitter, y });    // points are in GRID space —
+  }                                         // apply the camera in render()
+  points.push({ x: gx, y: gy });            // land exactly on the cursor
+  return { points };
+}
+```
+
+Keep the bolt one-frame — a strike is an event, not a state. Determinism note:
+`Math.random()` is fine *for the visual only*; never use it for anything that
+touches the engine grid (use `engine.random()` for that, to keep the simulation
+reproducible).
+
 ### MVP scope — what "done" looks like
 
 A single page where, within a few minutes of loading, a player can:
 - [ ] See a circular planet with gravity pulling toward its center.
+- [ ] Zoom with the scroll wheel and pan by dragging — get close to the surface.
 - [ ] Drag to raise mountains out of sand/rock.
 - [ ] Summon a cloud and watch rain pool into oceans.
 - [ ] Open a volcano and watch lava fountain, flow, fragment into a tephra cone, and cool into new land.
 - [ ] Scatter seeds and watch forests grow (and grass creep outward from water).
-- [ ] Smite with fire and watch it spread through flammables.
+- [ ] Smite with lightning and watch the bolt flash, the impact ignite, and fire spread through flammables.
 - There is **no UI beyond the toolbar**. No score, no levels, no menus. The
   simulation reacting to the player *is* the game.
 
@@ -304,15 +399,18 @@ A single page where, within a few minutes of loading, a player can:
    grid colors in a `setInterval` loop. **Goal: see a grey disc.**
 2. Add mouse→grid + a sand brush; drag to drop sand that piles on the surface.
    **Goal: feel the gravity.**
-3. Add the water brush; watch it flow and level into seas. **Goal: the first
+3. Add the camera: wheel-zoom toward cursor, middle-drag pan, double-click
+   reset. Reroute mouse input through `screenToGrid()`. **Goal: get close.**
+4. Add the water brush; watch it flow and level into seas. **Goal: the first
    "wow".**
-4. Turn on heat (`enableHeat: true`); drop a `LAVA` cell and watch it cool to
+5. Turn on heat (`enableHeat: true`); drop a `LAVA` cell and watch it cool to
    rock on its own. **Goal: geology without host code.**
-5. Add the cloud power (host entity + rain spawn). **Goal: weather.**
-6. Open a volcano with `addPressureSource`. **Goal: a fountaining, cone-building eruption.**
-7. Scatter `SEED` / `plant()` a tree; watch a forest establish. **Goal: life.**
-8. Add fire/smite. **Goal: destruction.**
-9. Polish: nicer colors, brush-size slider, a "clear world" button.
+6. Add the cloud power (host entity + rain spawn). **Goal: weather.**
+7. Open a volcano with `addPressureSource`. **Goal: a fountaining, cone-building eruption.**
+8. Scatter `SEED` / `plant()` a tree; watch a forest establish. **Goal: life.**
+9. Add lightning smite (host-drawn bolt + `FIRE`/`explode` at the strike).
+   **Goal: wrath.**
+10. Polish: nicer colors, brush-size slider, a "clear world" button.
 
 ---
 
