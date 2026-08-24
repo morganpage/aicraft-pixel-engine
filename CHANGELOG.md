@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The god-game volcano acceptance scenario** (`showcase/tests/godgame-volcano.scenario.test.ts`,
+  runs with `showcase:test:scenario`). Defines a good volcano as nine measurable
+  criteria — buried magma chamber, sustained vent activity, ballistic ejecta,
+  fragmentation into a spreading tephra fan, a cone that is a mound (≥8 of 11
+  tangent bins) with volume, new frozen rock, an eruption that settles, and
+  byte-determinism — and pins the brief §8.2 recipe that passes them. The
+  recipe it enforces: a bulk-stamped magma chamber + conduit with explicit
+  `setHeat` after `endBulk` (bulk stamps carry no heat); the pressure source
+  inside the stamped body (a buried source is skipped forever); **no carved
+  mouth** — the source fractures its own vent open (an open crater lets
+  fallback tephra choke the conduit and kill the source, measured: effusion
+  discharged zero for 500 frames); head refilled in full each frame and
+  dimensioned as `ascent × parcels + surplus` (a one-launch budget throttles
+  the jet to ~1 parcel/frame); a host-side throat remelt every 20 frames
+  (fallback tephra plugs the vent mid-eruption); a host-side edifice height
+  cap measured in built solids only (an uncapped fountain builds a 66-cell
+  chimney, not a cone); and a two-phase fountain→effusion schedule. Measured
+  on the due-north cardinal vent: ~524 fountain parcels, ~1,000 effusion
+  cells, 11/11 criteria green; the previous recipes failed 8/11, 3/11 and 4/11.
 - **`engine.stampDisc(cx, cy, radius, mat, opts?)` — the brush primitive.**
   Stamps a filled Euclidean disc of material through the full `setMaterial`
   bookkeeping (wake + render-dirty + heat ride-along), bounds-clipped, and

@@ -461,58 +461,61 @@ function stepCloud(engine: any, cloud: Cloud, rainPerTick: number, rng: () => nu
 (Pass `engine.random` as `rng` — cloud rain spends grid cells, so it belongs on
 the seeded stream per §2.)
 
-### 8.2 Volcano (copy this — the heated-chamber recipe)
+### 8.2 Volcano (the acceptance-tested recipe)
 
 The engine pressure-routes lava through its connected body to an outlet, ejects
 it ballistically (with lateral spread so ejecta fans across the flanks),
 fragments airborne cells into `TEPHRA` as they cool (which builds the cone),
 and freezes grounded lava to `ROCK`. If the vent seals, `fracture` builds
-pressure and pops the cap in a seal-then-reopen cycle.
+pressure and pops the cap.
 
-**⚠️ A bare `addPressureSource` at the surface is a squib on a cold planet —
-do not ship it.** Two engine facts bite, both measured against the published
-package on a 640×640 temperate world:
+**This recipe is enforced by a test** — `showcase/tests/godgame-volcano.scenario.test.ts`
+in the engine repo defines a good volcano as: a buried magma chamber (≥150
+deep lava cells), sustained vent activity, ballistic ejecta (≥8 lava cells 8+
+above the surface), fragmentation into a tephra fan (≥150 cells, ≥25 landing
+10+ cells off-axis), a cone ≥10 tall that is a mound (≥8 of 11 tangent bins
+raised) with ≥250 cells of volume, ≥150 cells of new rock, an eruption that
+settles, and byte-determinism. If you change the recipe, change the test with
+it — the test failing is how the previous three recipes were caught.
 
-- The routed lava is born hot but has **no thermal mass behind it**: on rock
-  at `ambientTemperature` the eruption freezes shut within seconds (~20 lava
-  cells, gone by frame ~300).
-- **`beginBulk()`/`endBulk()` stamps carry no heat** — `endBulk()` recovers
-  wake/dirty bookkeeping, not temperatures. A lava chamber stamped in a bulk
-  batch without an explicit `setHeat` afterwards is born cold and freezes
-  without ever flowing (measured: zero erupted cells, ever).
+Five measured facts the recipe must respect:
 
-The recipe that works (measured: **~1,050 lava cells at frame 60, still ~1,030
-at frame 300**, then freezing into new land — a real cone-building eruption):
+1. **A bare `addPressureSource` at the surface is a cold squib** (~20 lava
+   cells, frozen shut within seconds on a temperate planet).
+2. **`beginBulk()`/`endBulk()` stamps carry no heat** — `setHeat(1.0)` every
+   stamped cell after `endBulk()`, or the chamber freezes without ever flowing.
+3. **A source buried in another material is skipped forever** — put the source
+   inside the stamped lava body.
+4. **Do NOT carve the vent mouth.** An open crater lets the fountain's own
+   fallback tephra rain back down the conduit, choke the chamber, and kill the
+   source cell (measured: effusion discharged zero for 500 frames). Let the
+   source seal behind rock and **fracture its own vent open** — fracture
+   pressure 18 beats rock strength 15.
+5. **Remelt fallback tephra out of the throat** (the narrow corridor: crater +
+   upper conduit) every ~20 frames while the volcano runs, or the vent plugs
+   and dies mid-eruption.
 
-1. **Carve the vent mouth** (a small EMPTY disc at the surface point). This is
-   also your instant click feedback.
-2. **Stamp a magma chamber + conduit of `LAVA`** below the vent in a
-   `beginBulk()` batch — then **`setHeat(x, y, 1.0)` every stamped cell after
-   `endBulk()`**. This is the thermal mass that keeps the eruption alive.
-3. **Place the pressure source inside the chamber.** Its cell holds the source
-   material itself, so the preflight always passes (a source cell holding
-   *another* material — e.g. rock — is skipped every frame, forever), and the
-   routed volume has the whole hot body to climb.
+And two dimensioning rules (from the showcase's tuned model):
+
+- **Head is refilled in full every frame** (`pressureRate = maxPressure`) and
+  must afford `parcels` launches, each costing the **ascent climb** —
+  `(chamber depth + cone target + chamber radius) × 1.2` head units — plus the
+  surplus that Torricelli-converts to launch speed (`speed = √(2·surplus)·efficiency`).
+  A head budget sized for one launch throttles the jet to ~1 parcel/frame
+  however high `rate` is set.
+- **Cap the edifice height** host-side (the engine has no `maxHeight` because
+  nothing removes material): an uncapped fountain builds a 66-cell chimney,
+  not a cone. Measure the height in built solids only (tephra/frozen rock) —
+  the lava jet itself is not edifice.
+
+The shape that passes all criteria is a two-phase eruption:
 
 ```ts
-// angle points from the planet centre to the clicked surface point.
+const CHAMBER_R = 18, CHAMBER_DEPTH = 34, CONE_TARGET = 24, PARCELS = 3, SURPLUS = 80;
+const FOUNTAIN_FRAMES = 300, EFFUSION_FRAMES = 500;
+
+// --- open: stamp the heated body (chamber + conduit, NO carved mouth) ---
 const ux = Math.cos(angle), uy = Math.sin(angle);
-const ventX = Math.round(cx + ux * planetR);
-const ventY = Math.round(cy + uy * planetR);
-const MOUTH = 2, CHAMBER_R = 18, CHAMBER_DEPTH = 34;
-
-// 1. Carve the mouth.
-for (let dy = -MOUTH; dy <= MOUTH; dy++) {
-  for (let dx = -MOUTH; dx <= MOUTH; dx++) {
-    if (dx * dx + dy * dy > MOUTH * MOUTH) continue;
-    const m = engine.getMaterial(ventX + dx, ventY + dy);
-    if (m !== MaterialType.EMPTY && m !== MaterialType.WATER) {
-      engine.setMaterial(ventX + dx, ventY + dy, MaterialType.EMPTY);
-    }
-  }
-}
-
-// 2. Stamp the heated magma body.
 const chx = Math.round(cx + ux * (planetR - CHAMBER_DEPTH));
 const chy = Math.round(cy + uy * (planetR - CHAMBER_DEPTH));
 const hot: number[] = [];
@@ -521,41 +524,45 @@ const cell = (x: number, y: number) => {
   hot.push(y * width + x);
 };
 engine.beginBulk();
-for (let y = chy - CHAMBER_R; y <= chy + CHAMBER_R; y++) {
-  for (let x = chx - CHAMBER_R; x <= chx + CHAMBER_R; x++) {
-    const dx = x - chx, dy = y - chy;
-    if (dx * dx + dy * dy <= CHAMBER_R * CHAMBER_R) cell(x, y);
-  }
-}
-// 3-wide conduit from just below the mouth down to the chamber.
-for (let t = MOUTH + 1; t <= CHAMBER_DEPTH - CHAMBER_R; t++) {
-  const px = Math.round(cx + ux * (planetR - t));
-  const py = Math.round(cy + uy * (planetR - t));
-  cell(px, py);
-  cell(Math.round(px + uy), Math.round(py - ux));
-  cell(Math.round(px - uy), Math.round(py + ux));
-}
+/* chamber disc radius CHAMBER_R at (chx, chy); 3-wide conduit shaft along the
+   axis from the surface down to the chamber — see the test for the loops */
 engine.endBulk();
 for (const idx of hot) engine.setHeat(idx % width, (idx / width) | 0, 1.0);
 
-// 3. Feed the chamber.
-const id = engine.addPressureSource({
-  x: chx, y: chy,
-  material: MaterialType.LAVA,
-  rate: 3, pressureRate: 1, maxPressure: 22, maxPending: 120,
-  outletVelocityEfficiency: 0.7,   // fraction of surplus head → launch speed
-  outletLateralSpread: 0.25,       // ±half-angle of the jet (tangent form)
-  temperature: 1.0,                // routed cells are born at full melt
-  // Keep the eruption on the vent axis so summit spread doesn't become extra vents:
-  ventAnchor: { cx, cy, angle, corridorRadius: 6 },
-  // Seal-then-pop: pressure accrues while blocked, then fractures the cap.
-  fracture: { minSealedFrames: 12, pressureRate: 1.5, maxPressure: 22 },
+const ascent = Math.ceil((CHAMBER_DEPTH + CONE_TARGET + CHAMBER_R) * 1.2);
+
+// Phase 1 — FOUNTAIN: surplus head → ballistic velocity → tephra cone.
+const fountainId = engine.addPressureSource({
+  x: chx, y: chy, material: MaterialType.LAVA,
+  rate: PARCELS,
+  pressureRate: (ascent + SURPLUS) * PARCELS,  // refilled in full each frame
+  maxPressure: (ascent + SURPLUS) * PARCELS,
+  maxPending: 5, maxDischargePerFrame: PARCELS,
+  outletVelocityEfficiency: 0.7,
+  outletLateralSpread: 0.55,       // fan the ejecta into a cone, not a spike
+  temperature: 1.0,
+  ventAnchor: { cx, cy, angle, corridorRadius: 3 },
+  fracture: { minSealedFrames: 6, pressureRate: 3, maxPressure: 18 },
 });
+
+// Phase 2 — EFFUSION (after FOUNTAIN_FRAMES or the height cap): remove the
+// fountain source, add the same-source extruder with
+//   outletVelocityEfficiency: 0        // surplus stays head: extrude, don't launch
+//   pressureRate/maxPressure: ascent * PARCELS + 12
+// The corridor tracks cone growth (axis to any height), so flows spill from
+// the summit and freeze into new rock down the flanks.
+// After EFFUSION_FRAMES more, remove it — the eruption settles into land.
+
+// While either phase runs, every 20 frames:
+// remeltThroat() — any TEPHRA in the |tangent| ≤ 2 strip from 8 above the
+// surface to 16 below becomes LAVA at heat 1.0 (fact 5).
 ```
 
-End the eruption with `engine.removePressureSource(id)`. The state of a live
-source — accrued volume (`pending`) and available pressure — is readable via
-`getPressureSourceState(id)`.
+Measured on the published engine, 640×640 temperate world, due-north vent:
+fountain discharges ~524 parcels, effusion ~1,000 cells; final cone ~11-22
+cells tall, all 11 acceptance criteria green. End an eruption early with
+`engine.removePressureSource(id)`; a live source's `pending` and
+`availablePressure` are readable via `getPressureSourceState(id)`.
 
 **Forest** and **Ocean** are one-liners by comparison:
 
