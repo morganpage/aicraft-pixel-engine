@@ -1,0 +1,12 @@
+I want you to build a one-screen circular-planet god game at the level of games like Reus and Godfinger following the directions in the file:
+
+https://github.com/morganpage/aicraft-pixel-engine/blob/main/games/god-game.md
+
+It should be utterly perfect, visually beautiful, with every single thing done at AAA quality—from the planet rendering to the eruption feel to anything you could think of.
+
+Fan out sub-agents and have sub-agents tackle each build-order stage individually so that the game is utterly perfect.
+You should /loop on each item and have a separate sub-agent check it visually to ensure it looks triple A.
+That separate sub-agent should be a really harsh critic, and if it doesn't look triple A, it should keep going.
+
+Don't stop until each sub-agent is utterly wowed with the quality when compared with actual god games like Reus, Godfinger, and WorldBox.
+It should literally compare them side by side blind and say which one looks better.

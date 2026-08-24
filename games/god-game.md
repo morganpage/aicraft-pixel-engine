@@ -1,21 +1,15 @@
-# Prompt: build an MVP god game on aicraft-pixel-engine
+# God Game — a circular-planet terraforming toy on `aicraft-pixel-engine@0.1.2`
 
-> Paste the **"Build brief"** section below into your coding agent (or hand it to a
-> developer). The rest of this document is context the author needs; the brief is
-> the self-contained instruction.
+> Paste this entire document to a coding agent (Claude / Cursor / etc.). It is a complete, self-contained build brief: concept, engine wiring, rendering discipline, god-power specs, acceptance criteria, and build order. The agent should produce a single runnable Vite + plain-TypeScript browser game that imports everything from `aicraft-pixel-engine` (the npm package) and writes **no** re-implementations of what the engine already provides.
 
 ---
 
-## Build brief
+## 0. What You Are Building
 
-Build a minimal but genuinely fun **god game** — a one-screen, circular-planet
-terraforming toy in the spirit of *Reus* / *Godfinger* — on top of the
+**God Game** — a minimal but genuinely fun one-screen, circular-planet
+terraforming toy in the spirit of *Reus* / *Godfinger*, built on the
 [`aicraft-pixel-engine`](https://www.npmjs.com/package/aicraft-pixel-engine)
 falling-sand simulation library.
-**Single HTML page, no framework, Vite + plain
-TypeScript.** Target a playable MVP in one sitting, not a polished product.
-
-### The one-paragraph pitch
 
 You are a god hovering over a small circular planet. The planet is alive:
 materials fall toward its center, water pools into oceans, lava erupts and
@@ -25,40 +19,84 @@ and the simulation does the rest. There is no lose state; the joy is watching a
 dead rock become a living world. Make it *feel* good: every action should have
 immediate, visible, satisfying consequences.
 
-### Install the engine
+**This is NOT a tech demo.** The simulation reacting to the player *is* the
+game. There is no UI beyond the toolbar — no score, no levels, no menus.
+
+**Target a playable MVP in one sitting, not a polished product.**
+
+**Non-negotiable: build the entire game on top of `aicraft-pixel-engine@0.1.2`.**
+Do not add a physics library, hand-roll temperature, growth, or pressure, or
+write your own falling-sand rules — those are all in the engine. See §9.2 for
+the forbidden-pattern checks.
+
+---
+
+## 1. Tech Stack & Install
 
 ```bash
-npm install aicraft-pixel-engine
+npm create vite@latest god-game -- --template vanilla-ts
+cd god-game
+npm install aicraft-pixel-engine@0.1.2
 ```
 
-```ts
-// The entire public API — all from the package root.
-import {
-  PixelEngine,
-  FlatGravity,
-  RadialGravity,
-  MaterialType,
-  Materials,
-  materialDefs,
-} from 'aicraft-pixel-engine';
-```
+- **TypeScript**, strict. **Vite** dev server + build. Single `<canvas>` in
+  `index.html`.
+- **`aicraft-pixel-engine` is your only runtime dependency.** Import from the
+  **root barrel only** — the published package exposes a single `.` entry:
+  ```ts
+  // The entire public API — all from the package root.
+  import {
+    PixelEngine,
+    FlatGravity,
+    RadialGravity,
+    MaterialType,
+    Materials,
+    materialDefs,
+  } from 'aicraft-pixel-engine';
+  ```
+  (Never deep-import subpaths like `aicraft-pixel-engine/src/sand`; the `exports`
+  map does not publish them.)
 
-### Core loop — what the player does
+---
 
-A toolbar of god-powers (left side or top). The player picks one and clicks/drags
-on the planet. Each power maps to one or two engine calls. Keep the set tiny and
-distinct; six is plenty:
+## 2. Determinism & Discipline Rules (enforced by the engine — follow them)
 
-| Power | Effect | Maps to |
-|-------|--------|---------|
-| **Raise Land** | Drop sand/rock at the cursor; it piles up into hills/mountains under gravity. | `setMaterial(x, y, SAND)` or `ROCK` with a brush radius |
-| **Summon Cloud** | Paint a cloud above the surface that rains water and shrinks as it empties. | Spawn a host-tracked cloud; each tick emit `WATER` at its base |
-| **Ocean** | Pour water; it flows and levels into seas around the planet. | `setMaterial(x, y, WATER)` |
-| **Forest** | Scatter `SEED` that falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. | `engine.plant(...)` / `setMaterial(x, y, SEED)` |
-| **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone. | `engine.addPressureSource(...)` — the engine handles eruption, flow, cooling, and cone |
-| **Smite** | Lightning bolt strikes the cursor: a jagged flash, an ignition at the impact, and a small scorch. | Host-drawn bolt (one-frame visual) + `setMaterial(x, y, FIRE)` / `engine.explode(x, y, r)` at the strike point |
+- **No `Math.random()` for anything that touches the engine grid.** The engine
+  is deterministic: same seed + same inputs → identical grid evolution, which is
+  what makes replay and regression-testing possible. Use `engine.random()` (the
+  seeded mulberry32) for every decision that writes a cell. `Math.random()` is
+  OK **only** for purely decorative visuals that never feed back into the grid
+  (e.g. the lightning bolt's jitter, §8.3).
+- **No `Date.now()` in the sim.** Time is frame count; the loop drives
+  everything.
+- **Fixed-step loop.** A 60 Hz `setInterval` calling `engine.update()` then
+  `render()`. One simulation step per tick — the engine already decouples
+  simulation cost from frame cost internally (active-chunk optimization), so
+  there is nothing to gain and determinism to lose by variable-stepping.
+- **The camera never touches the engine.** Zoom/pan is a `ctx` transform in
+  `render()`; mouse input inverts the same transform to recover the grid cell
+  (§6).
 
-### World setup (the part that makes it a *planet*)
+---
+
+## 3. Architecture — Engine Module → Game System Map
+
+| Game system | Engine API |
+|---|---|
+| Circular-planet gravity | `RadialGravity({ centerX, centerY })` via the `gravity` option |
+| Planet body stamping | `setMaterial(x, y, ROCK)` inside `beginBulk()` / `endBulk()` |
+| Climate & thermodynamics | `enableHeat: true` + `ambientTemperature` — native conduction, radiation, phase change (§4) |
+| Ocean | `setMaterial(x, y, WATER)` — flows, levels into seas, freezes/melts with the climate |
+| Rain clouds | Host-tracked entity + `setMaterial(x, y, WATER)` per tick — **the one power that needs host logic** (§8.1) |
+| Forest | `setMaterial(x, y, SEED)` + native growth rules; `plant(x, y, TREE_TIP, { energy })` for an instant tree |
+| Volcano | `addPressureSource({...})` (+ `removePressureSource`, `getPressureSourceState`) — native conduit routing, ballistic ejecta, `TEPHRA` fragmentation, freezing (§8.2) |
+| Lightning smite | Host-drawn one-frame bolt + `setMaterial(x, y, FIRE)` + `explode(x, y, r)` (§8.3) |
+| Rendering | `grid`, `colorGrid`, `consumeRenderDirtyChunks()`, `CHUNK_SIZE` (§5, §7) |
+| Reproducibility | `engine.random()` — seeded; never `Math.random` for grid decisions |
+
+---
+
+## 4. World Setup (the part that makes it a *planet*)
 
 This is the engine's sweet spot — copy it directly. The only difference from a
 flat world is the gravity model and the heat/climate dials:
@@ -102,7 +140,9 @@ Now every `setMaterial` of sand/water/lava anywhere in the void curves inward
 and settles on the surface. That single behavior *is* the god-game feel — lean
 into it.
 
-### Rendering — you own the canvas
+---
+
+## 5. Rendering — you own the canvas
 
 The engine owns the simulation; you own the pixels.
 
@@ -119,8 +159,8 @@ desynchronize the mouse-to-grid mapping. Three rules prevent it:
    or `width: min(90vw, 90vh)` so it stays square on any screen). Do **not**
    stretch a square canvas to a wide/tall flex child — that is exactly what
    elongates the disc.
-3. **Scale via the camera (below), not CSS.** Zoom/pan is a `ctx` transform on
-   the square backing store; the CSS box stays fixed and square.
+3. **Scale via the camera (§6), not CSS.** Zoom/pan is a `ctx` transform on the
+   square backing store; the CSS box stays fixed and square.
 
 ```ts
 canvas.width = canvas.height = SIZE;          // backing store = grid (once)
@@ -168,13 +208,15 @@ function render() {
 That full-canvas repaint is fine to ship the MVP with. The optimization — only
 repainting chunks the simulation actually changed — is important enough at
 640×640 to do up front, because it's also where the single most common rendering
-bug lives. See **Repainting dirty chunks** below.
+bug lives. See **§7**.
 
 The game loop is a fixed-step `setInterval` (60 Hz) calling `engine.update()`
-then `render()`. Mouse → grid cell must go through the **camera** (see below),
-not a plain scale.
+then `render()`. Mouse → grid cell must go through the **camera** (§6), not a
+plain scale.
 
-### Camera — zoom and pan (standard mouse controls)
+---
+
+## 6. Camera — zoom and pan (standard mouse controls)
 
 At 640×640 the planet is detailed enough that players want to get close. Add a
 2D camera with the controls every map/canvas app uses — no modifiers to
@@ -232,7 +274,9 @@ correctly with zoom without extra work.
 > `update()` itself already skips inactive chunks, so simulation cost stays
 > bounded to where things are actually happening.
 
-### Repainting dirty chunks (do this — and read the `putImageData` warning)
+---
+
+## 7. Repainting dirty chunks (do this — and read the `putImageData` warning)
 
 `engine.consumeRenderDirtyChunks()` returns a `Uint8Array` with one byte per
 32×32 chunk; a non-zero byte means that chunk's pixels changed this frame and
@@ -272,7 +316,7 @@ for (let i = 0; i < dirty.length; i++) {
   paintChunk(cx * CHUNK, cy * CHUNK);
 }
 // Then blit gridCanvas through the camera with ctx.drawImage(gridCanvas, 0, 0)
-// under the camera transform — see the Camera section.
+// under the camera transform — see §6.
 ```
 
 > **⚠️ `putImageData` argument trap — read this.** This is the #1 rendering bug
@@ -296,96 +340,106 @@ for (let i = 0; i < dirty.length; i++) {
 > nothing or garbage.** If your planet is stamped but invisible and only a
 > fragment appears in the top-left corner, this is it.
 
-### God-powers that need host logic (read this carefully)
+---
+
+## 8. God-Powers
+
+A toolbar of god-powers (left side or top). The player picks one and clicks/drags
+on the planet. Each power maps to one or two engine calls. Keep the set tiny and
+distinct; six is plenty:
+
+| Power | Effect | Maps to |
+|-------|--------|---------|
+| **Raise Land** | Drop sand/rock at the cursor; it piles up into hills/mountains under gravity. | `setMaterial(x, y, SAND)` or `ROCK` with a brush radius |
+| **Summon Cloud** | Paint a cloud above the surface that rains water and shrinks as it empties. | Spawn a host-tracked cloud; each tick emit `WATER` at its base |
+| **Ocean** | Pour water; it flows and levels into seas around the planet. | `setMaterial(x, y, WATER)` |
+| **Forest** | Scatter `SEED` that falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. | `engine.plant(...)` / `setMaterial(x, y, SEED)` |
+| **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone. | `engine.addPressureSource(...)` — the engine handles eruption, flow, cooling, and cone |
+| **Smite** | Lightning bolt strikes the cursor: a jagged flash, an ignition at the impact, and a small scorch. | Host-drawn bolt (one-frame visual) + `setMaterial(x, y, FIRE)` / `engine.explode(x, y, r)` at the strike point |
 
 The engine provides the cellular-automaton core, heat, growth, and pressure —
-so most powers are now a single call. **Only one** power still needs host code,
-because of a deliberate engine boundary:
+so most powers are a single call. **Only one** power still needs host code,
+because of a deliberate engine boundary (§8.1).
 
-1. **Clouds that hover and rain.** The engine's heat field has **no buoyancy
-   term** — a gas only ever rises *away* from the gravity center and escapes the
-   grid. So a cloud is a **host-tracked visual entity** (a circle you draw on the
-   canvas), and each tick you spawn real `WATER` cells at its underside. The
-   water falls under `RadialGravity` — genuine rain. Track a water budget per
-   cloud, shrink the drawn radius as it depletes, and drop it when empty.
+### 8.1 Clouds that hover and rain (the one host-logic power)
 
-   This is small enough to inline in full — a cloud is just a tracked point with
-   a water budget, and a per-tick step that spends some of it as real `WATER`
-   cells. The engine does the rest (the rain falls under gravity, pools, levels):
+The engine's heat field has **no buoyancy term** — a gas only ever rises *away*
+from the gravity center and escapes the grid. So a cloud is a **host-tracked
+visual entity** (a circle you draw on the canvas), and each tick you spawn real
+`WATER` cells at its underside. The water falls under `RadialGravity` — genuine
+rain. Track a water budget per cloud, shrink the drawn radius as it depletes,
+and drop it when empty.
 
-   ```ts
-   import { MaterialType } from 'aicraft-pixel-engine';
+This is small enough to inline in full — a cloud is just a tracked point with
+a water budget, and a per-tick step that spends some of it as real `WATER`
+cells. The engine does the rest (the rain falls under gravity, pools, levels):
 
-   interface Cloud {
-     x: number; y: number;          // center, grid cells
-     radius: number;                // current visible radius, shrinks with water
-     initialRadius: number;
-     water: number;                 // remaining budget; 0 = exhausted
-     initialWater: number;
-   }
+```ts
+import { MaterialType } from 'aicraft-pixel-engine';
 
-   const WATER_PER_CELL = 60;       // budget per cell of initial radius
-   const RAIN_OFFSET = 0.7;         // how far below center rain spawns (× radius)
+interface Cloud {
+  x: number; y: number;          // center, grid cells
+  radius: number;                // current visible radius, shrinks with water
+  initialRadius: number;
+  water: number;                 // remaining budget; 0 = exhausted
+  initialWater: number;
+}
 
-   // Place a cloud only in the void above the surface; null inside the planet
-   // disc or off the grid. Clamp radius so it never draws past the grid edge.
-   function placeCloud(
-     cx: number, cy: number, planetR: number, size: number,
-     x: number, y: number, radius = 7,
-   ): Cloud | null {
-     const dx = x - cx, dy = y - cy;
-     if (dx * dx + dy * dy <= planetR * planetR) return null; // inside planet
-     if (x < 0 || x >= size || y < 0 || y >= size) return null; // off grid
-     const maxR = Math.max(1, Math.min(x, size - 1 - x, y, size - 1 - y, radius));
-     const initialWater = maxR * WATER_PER_CELL;
-     return { x, y, radius: maxR, initialRadius: maxR, water: initialWater, initialWater };
-   }
+const WATER_PER_CELL = 60;       // budget per cell of initial radius
+const RAIN_OFFSET = 0.7;         // how far below center rain spawns (× radius)
 
-   // Advance one cloud one tick, before engine.update() so fresh rain moves same
-   // frame. Spends rain as WATER cells jittered across the underside; only writes
-   // into EMPTY so rain never carves into terrain. Radius tracks the water left.
-   function stepCloud(engine: any, cloud: Cloud, rainPerTick: number, rng: () => number): void {
-     if (cloud.water <= 0) { cloud.radius = 0; return; }
-     const spend = Math.min(rainPerTick, cloud.water);
-     const halfWidth = Math.max(0.5, cloud.initialRadius * 0.8);
-     const yOffset = cloud.initialRadius * RAIN_OFFSET;
-     for (let i = 0; i < spend; i++) {
-       const t = rng() * 2 - 1;                                   // [-1, 1]
-       const rx = Math.round(cloud.x + t * halfWidth);
-       const ry = Math.round(cloud.y + yOffset + rng() * 2);      // small jitter
-       if (engine.getMaterial(rx, ry) === MaterialType.EMPTY) {   // out-of-bounds reads as WALL
-         engine.setMaterial(rx, ry, MaterialType.WATER);
-       }
-     }
-     cloud.water -= spend;
-     cloud.radius = cloud.water > 0 ? cloud.initialRadius * (cloud.water / cloud.initialWater) : 0;
-   }
+// Place a cloud only in the void above the surface; null inside the planet
+// disc or off the grid. Clamp radius so it never draws past the grid edge.
+function placeCloud(
+  cx: number, cy: number, planetR: number, size: number,
+  x: number, y: number, radius = 7,
+): Cloud | null {
+  const dx = x - cx, dy = y - cy;
+  if (dx * dx + dy * dy <= planetR * planetR) return null; // inside planet
+  if (x < 0 || x >= size || y < 0 || y >= size) return null; // off grid
+  const maxR = Math.max(1, Math.min(x, size - 1 - x, y, size - 1 - y, radius));
+  const initialWater = maxR * WATER_PER_CELL;
+  return { x, y, radius: maxR, initialRadius: maxR, water: initialWater, initialWater };
+}
 
-   // Render: draw each cloud as a soft circle on the canvas overlay (alpha
-   // fading with remaining water). Call removeDead(clouds) each frame to drop
-   // spent clouds, and throttle placement on drag to ~2*radius cells apart so a
-   // pointer sweep leaves distinct clouds, not a solid white mass.
-   ```
+// Advance one cloud one tick, before engine.update() so fresh rain moves same
+// frame. Spends rain as WATER cells jittered across the underside; only writes
+// into EMPTY so rain never carves into terrain. Radius tracks the water left.
+function stepCloud(engine: any, cloud: Cloud, rainPerTick: number, rng: () => number): void {
+  if (cloud.water <= 0) { cloud.radius = 0; return; }
+  const spend = Math.min(rainPerTick, cloud.water);
+  const halfWidth = Math.max(0.5, cloud.initialRadius * 0.8);
+  const yOffset = cloud.initialRadius * RAIN_OFFSET;
+  for (let i = 0; i < spend; i++) {
+    const t = rng() * 2 - 1;                                   // [-1, 1]
+    const rx = Math.round(cloud.x + t * halfWidth);
+    const ry = Math.round(cloud.y + yOffset + rng() * 2);      // small jitter
+    if (engine.getMaterial(rx, ry) === MaterialType.EMPTY) {   // out-of-bounds reads as WALL
+      engine.setMaterial(rx, ry, MaterialType.WATER);
+    }
+  }
+  cloud.water -= spend;
+  cloud.radius = cloud.water > 0 ? cloud.initialRadius * (cloud.water / cloud.initialWater) : 0;
+}
 
+// Render: draw each cloud as a soft circle on the canvas overlay (alpha
+// fading with remaining water). Call removeDead(clouds) each frame to drop
+// spent clouds, and throttle placement on drag to ~2*radius cells apart so a
+// pointer sweep leaves distinct clouds, not a solid white mass.
+```
 
-The other powers are pure engine — no per-tick host step required:
+(Pass `engine.random` as `rng` — cloud rain spends grid cells, so it belongs on
+the seeded stream per §2.)
 
-2. **Volcano.** A single `addPressureSource({...})` call opens a magma vent.
-   The engine pressure-routes lava up a connected conduit, ejects it from the
-   first open outlet (with ballistic velocity + a lateral spread so ejecta fans
-   across the flanks), fragments airborne cells into `TEPHRA` as they cool (which
-   builds the cone), and freezes grounded lava to `ROCK` once it cools past its
-   threshold. If the vent seals, configure `fracture` so pressure builds and the
-   cap pops in a visible seal-then-reopen cycle. See the code block below.
-3. **Forest.** `setMaterial(x, y, SEED)` is all you need — the seed falls,
-   germinates into a growing tip on contact with `SAND`/`GRASS`, and grows into a
-   tree (trunk → branches → canopy → leaves) with its own genome. `GRASS` placed
-   near water spreads outward on its own to a bounded radius. For a guaranteed
-   instant tree at a spot, use `engine.plant(x, y, TREE_TIP, { energy: 12 })`.
-4. **Ocean.** `setMaterial(x, y, WATER)` — it flows, levels, and (with heat on)
-   freezes near the poles / melts near lava, all natively.
+### 8.2 Volcano (pure engine — copy this)
 
-#### Opening a volcano (copy this)
+A single `addPressureSource({...})` call opens a magma vent. The engine
+pressure-routes lava up a connected conduit, ejects it from the first open
+outlet (with ballistic velocity + a lateral spread so ejecta fans across the
+flanks), fragments airborne cells into `TEPHRA` as they cool (which builds the
+cone), and freezes grounded lava to `ROCK` once it cools past its threshold. If
+the vent seals, configure `fracture` so pressure builds and the cap pops in a
+visible seal-then-reopen cycle.
 
 ```ts
 // A vent at the planet surface, magma chamber below it. cx/cy are the planet
@@ -415,7 +469,17 @@ Remove it with `engine.removePressureSource(id)` (the id `addPressureSource`
 returned) to end the eruption. The state of a live source — accrued volume and
 available pressure — is readable via `getPressureSourceState(id)`.
 
-#### Smiting with lightning (copy this)
+**Forest** and **Ocean** are one-liners by comparison:
+
+- **Forest.** `setMaterial(x, y, SEED)` is all you need — the seed falls,
+  germinates into a growing tip on contact with `SAND`/`GRASS`, and grows into a
+  tree (trunk → branches → canopy → leaves) with its own genome. `GRASS` placed
+  near water spreads outward on its own to a bounded radius. For a guaranteed
+  instant tree at a spot, use `engine.plant(x, y, TREE_TIP, { energy: 12 })`.
+- **Ocean.** `setMaterial(x, y, WATER)` — it flows, levels, and (with heat on)
+  freezes near the poles / melts near lava, all natively.
+
+### 8.3 Smiting with lightning (copy this)
 
 Lightning is pure presentation on top of two engine calls — the strike itself is
 a one-frame jagged line you draw from the top of the canvas to the cursor, then
@@ -453,12 +517,14 @@ function makeBolt(gx: number, gy: number) {
 }
 ```
 
-Keep the bolt one-frame — a strike is an event, not a state. Determinism note:
-`Math.random()` is fine *for the visual only*; never use it for anything that
-touches the engine grid (use `engine.random()` for that, to keep the simulation
-reproducible).
+Keep the bolt one-frame — a strike is an event, not a state. `Math.random()` is
+fine *for the visual only* (per §2); the grid writes go through the engine.
 
-### MVP scope — what "done" looks like
+---
+
+## 9. Acceptance Criteria
+
+### 9.1 What "done" looks like
 
 A single page where, within a few minutes of loading, a player can:
 - [ ] See a circular planet with gravity pulling toward its center.
@@ -471,29 +537,36 @@ A single page where, within a few minutes of loading, a player can:
 - There is **no UI beyond the toolbar**. No score, no levels, no menus. The
   simulation reacting to the player *is* the game.
 
-### Hard constraints — do NOT
+### 9.2 Forbidden patterns — do NOT
 
-- **Do not add a physics library** (no `planck`/matter.js). The engine has no
-  rigid bodies and isn't trying to. Trees, buildings, creatures are pixels, not
+Static checks (grep the game source) must find:
+
+- **No physics library** (no `planck`/matter.js). The engine has no rigid bodies
+  and isn't trying to. Trees, buildings, creatures are pixels, not
   sprites-with-colliders.
-- **Do not hand-roll temperature, growth, or pressure.** All three are native
-  engine features now (see "Engine capabilities" below). Turn them on with
-  `enableHeat` / the growth rules / `addPressureSource` and let the engine do it.
-- **Do not build a tile/sprite renderer first.** Get raw material colors on
-  screen as fast as possible; the look comes later. A correct loop with ugly
-  pixels beats a pretty loop that doesn't simulate.
-- **Do not skip `consumeRenderDirtyChunks()` forever** — it's fine to ignore for
-  the MVP (full repaint), but at 640×640 frame rate will eventually want it.
-- **Do not let CSS stretch the canvas.** Set `canvas.width = canvas.height = SIZE`
-  and keep the CSS box square. A stretched backing store turns the circular
-  planet into an ellipse and breaks the mouse-to-grid mapping. See "Rendering".
+- **No hand-rolled temperature, growth, or pressure.** All three are native
+  engine features. Turn them on with `enableHeat` / the growth rules /
+  `addPressureSource` and let the engine do it.
+- **No tile/sprite renderer first.** Get raw material colors on screen as fast
+  as possible; the look comes later. A correct loop with ugly pixels beats a
+  pretty loop that doesn't simulate.
+- **No permanent skip of `consumeRenderDirtyChunks()`** — it's fine to ignore
+  for the MVP (full repaint), but at 640×640 frame rate will eventually want it.
+- **No CSS-stretched canvas.** Set `canvas.width = canvas.height = SIZE` and
+  keep the CSS box square (§5). A stretched backing store turns the circular
+  planet into an ellipse and breaks the mouse-to-grid mapping.
+- **No `Math.random` / `Date.now` feeding the grid** — §2 applies.
 
-### Suggested build order (get something on screen in 15 minutes)
+---
+
+## 10. Implementation Workflow (get something on screen in 15 minutes)
+
+Build in this order:
 
 1. Vite + TS scaffold, install the engine, stamp the planet disc, render raw
-   grid colors in a `setInterval` loop. Use the dirty-chunk repaint from
-   "Repainting dirty chunks" (and mind the `putImageData` warning) — a
-   full-canvas `putImageData(img, 0, 0)` also works to start. **Goal: see a grey disc.**
+   grid colors in a `setInterval` loop. Use the dirty-chunk repaint from §7
+   (and mind the `putImageData` warning) — a full-canvas
+   `putImageData(img, 0, 0)` also works to start. **Goal: see a grey disc.**
 2. Add mouse→grid + a sand brush; drag to drop sand that piles on the surface.
    **Goal: feel the gravity.**
 3. Add the camera: wheel-zoom toward cursor, middle-drag pan, double-click
@@ -511,79 +584,7 @@ A single page where, within a few minutes of loading, a player can:
 
 ---
 
-## Context for the author (not part of the brief)
-
-### Why this engine, and why this game shape
-
-`aicraft-pixel-engine` is a falling-sand cellular automaton with a pluggable
-gravity seam. Its `RadialGravity` model makes every cell fall toward a planet
-center — which is precisely the defining mechanic of circular-planet god games.
-The feel is immediate: stamp the rock disc above, paint sand anywhere in the
-void, and watch it curve inward and settle as a ring around the planet. This MVP
-is that behavior, turned into a toy with goals and weather.
-
-### Engine capabilities you get for free
-
-- **23 materials**: EMPTY, WALL, SAND, WATER, LAVA, ROCK, STEAM, FIRE, SMOKE,
-  OIL, ACID, WOOD, FGAS (flammable gas), ICE, **GRASS, SEED, TREE_TIP, LEAF,
-  FERN_TIP, SPORE, CORAL, FROND, TEPHRA**. The last nine are the life/ejecta
-  materials — every one of them is inert until its growth rule fires or a host
-  places it, so a world that never uses them pays nothing.
-- **Density-driven displacement** — denser sinks through lighter; gases (negative
-  density) rise.
-- **Reactions** — lava+water→rock+steam, fire spreads via flammability and is
-  quenched by water, acid dissolves solids, FGAS ignites and explodes.
-- **Native heat / temperature field** — turn on with `enableHeat: true`. Every
-  thermal material conducts to its neighbours, radiates to the environment
-  through exposed faces, and phase-changes: lava → rock, water → steam / ice,
-  steam → water, ice → water. `FIRE` is an infinite heat source (a Dirichlet
-  boundary); `LAVA` is a finite body that cools. `ambientTemperature` is the
-  climate dial — drop it and oceans freeze on their own. No host cooling step
-  needed.
-- **Native growth system** — three rule kinds: `spread` (grass/moss, isotropic,
-  moisture-gated with a travel `range`), `tip` (trees/ferns, a directed
-  stateful growing point that leaves a trunk and branches behind it), and
-  `aggregate` (seeds germinating, spores accreting onto coral). Tips always die,
-  which is why a forest converges instead of consuming the grid. `engine.plant()`
-  seeds a tip; `growthInterval` paces it. Growth is gravity-relative, so on a
-  planet a tree grows radially outward.
-- **Native pressure transport** — `addPressureSource` routes a liquid (V1: lava
-  only) through its connected body to a real boundary outlet via a Dijkstra
-  search, accounting for gravitational head and per-material resistance. Blocked
-  sources accrue pressure and can fracture solids (`ROCK`/`TEPHRA` opt in; `WALL`
-  stays permanent). `injectLiquid` is the one-shot version. This is the
-  volcano engine.
-- **Fragmentation** — an airborne lava cell that cools past `fragmentsAt` while
-  still in flight becomes granular `TEPHRA`, which piles at its angle of repose
-  and builds a cone. Grounded cells never fragment — they freeze to `ROCK`.
-- **Explosions** — `engine.explode(x, y, radius)` carves terrain and scatters
-  debris; pass `onExplode` in the constructor for a hook.
-- **Velocity field** — `setVelocity` / `applyImpulse` give a cell a sub-cell
-  velocity that integrates across frames. Pressure outlets use this to launch
-  ejecta ballistically; hosts can use it for anything.
-- **Liquid leveling** — water seeks an equipotential and then goes quiet (0
-  swaps/frame), so oceans settle, they don't shimmer forever.
-- **Yield strength (`yieldThickness`)** — lava is a Bingham plastic: it flows
-  only while thick enough, stopping at a blunt front. This is why lava *looks*
-  like lava and not like orange water. Override per-cell with
-  `engine.stiffnessGrid` (hot lava flows, cold lava locks).
-- **Deterministic** — seeded RNG (`engine.random()`, never `Math.random()`).
-  Same seed + same inputs → identical evolution. Useful for replay/testing.
-- **Active-chunk optimization** — only 32×32 chunks with activity are simulated.
-
-### Engine limits (the boundaries of the sandbox)
-
-- **No rigid bodies.** Everything is a cell. Creatures would be sprite overlays
-  you move yourself, reading the grid for collisions.
-- **No water pressure transport.** Pressure routing is lava-only in V1 (only
-  LAVA sets `pressureResistance`). A U-tube of water won't equalize; aqueducts
-  aren't expressible without host help.
-- **No buoyancy for gases.** Gases rise away from gravity and exit the grid —
-  hence clouds must be host-tracked, not a gas material. (Steam is the exception:
-  it rises, cools, and condenses back to water natively.)
-- **No rendering.** You draw every pixel.
-
-### Stretch goals (only after the MVP is fun)
+## 11. Stretch Goals (only after §9 acceptance criteria pass)
 
 - **Day/night** — modulate `ambientTemperature` on a slow cycle; oceans freeze
   at night and thaw at dawn, natively. Add a canvas tint overlay for mood.

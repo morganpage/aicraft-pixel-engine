@@ -113,6 +113,12 @@ src/
 
 **Layer discipline** (mirrors `aicraft-engine`): the entire v1 library is the *deterministic core* — pure functions, no DOM, no `Math.random`, no `Date.now`, no side effects. This keeps it fast to test in Node and safe to run headless or in a worker.
 
+## Game prompts
+
+Ready-to-paste build briefs for games built on the engine live in
+[`games/`](./games/README.md) — start with the [god game](./games/god-game.md),
+a one-screen circular-planet terraforming toy.
+
 ## License
 
 MIT
