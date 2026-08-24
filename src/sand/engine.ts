@@ -3226,6 +3226,13 @@ export class PixelEngine {
    * through the connected body. While blocked, both accrue up to their caps;
    * when an outlet opens the backlog releases as a bounded surge.
    *
+   * ⚠️ The source cell must hold {@link EMPTY} or the source material — a
+   * source buried in another material (e.g. rock) is silently skipped every
+   * frame and never routes. Place the source inside the liquid body it feeds,
+   * and remember that a body stamped through `beginBulk()` carries no heat:
+   * `setHeat` the stamped cells afterwards or the routed liquid will freeze
+   * shut on a cold world (see the god-game brief's volcano recipe).
+   *
    * Sources are processed in creation order each frame, which is another
    * explicit part of the call-sequence determinism contract. Returns an id for
    * {@link removePressureSource}.

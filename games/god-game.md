@@ -73,10 +73,15 @@ a range.)
   (e.g. the lightning bolt's jitter, §8.3).
 - **No `Date.now()` in the sim.** Time is frame count; the loop drives
   everything.
-- **Fixed-step loop.** A 60 Hz `setInterval` calling `engine.update()` then
-  `render()`. One simulation step per tick — the engine already decouples
-  simulation cost from frame cost internally (active-chunk optimization), so
-  there is nothing to gain and determinism to lose by variable-stepping.
+- **Fixed-step loop.** A 60 Hz timer calling `engine.update()` then `render()`,
+  one simulation step per tick — the engine already decouples simulation cost
+  from frame cost internally (active-chunk optimization), so there is nothing
+  to gain and determinism to lose by variable-stepping. **Beware timer
+  throttling:** occluded/background tabs throttle `setInterval` to ~1 Hz, which
+  crawls a naive tick-per-interval loop 60× (measured in the wild). Drive the
+  fixed steps from a wall-clock accumulator (`performance.now()` delta, clamped
+  catch-up of ~100 ms) so every step is exactly 1/60 s of sim time regardless
+  of how the browser starves the timer.
 - **The camera never touches the engine.** Zoom/pan is a `ctx` transform in
   `render()`; mouse input inverts the same transform to recover the grid cell
   (§6).
@@ -165,6 +170,13 @@ desynchronize the mouse-to-grid mapping. Three rules prevent it:
    elongates the disc.
 3. **Scale via the camera (§6), not CSS.** Zoom/pan is a `ctx` transform on the
    square backing store; the CSS box stays fixed and square.
+
+**Size the canvas box from JavaScript, measured against the space the page
+actually gives it** (`min(stage.clientWidth, stage.clientHeight)` on resize),
+not from a CSS `vmin`/`vmin-px` formula. A CSS magic-number reserve for the
+toolbar/footer breaks the moment the toolbar wraps to a second row at a narrow
+window — the exact "canvas covers the buttons" bug — and a JS measurement
+cannot drift from the real chrome.
 
 ```ts
 canvas.width = canvas.height = SIZE;          // backing store = grid (once)
@@ -449,43 +461,101 @@ function stepCloud(engine: any, cloud: Cloud, rainPerTick: number, rng: () => nu
 (Pass `engine.random` as `rng` — cloud rain spends grid cells, so it belongs on
 the seeded stream per §2.)
 
-### 8.2 Volcano (pure engine — copy this)
+### 8.2 Volcano (copy this — the heated-chamber recipe)
 
-A single `addPressureSource({...})` call opens a magma vent. The engine
-pressure-routes lava up a connected conduit, ejects it from the first open
-outlet (with ballistic velocity + a lateral spread so ejecta fans across the
-flanks), fragments airborne cells into `TEPHRA` as they cool (which builds the
-cone), and freezes grounded lava to `ROCK` once it cools past its threshold. If
-the vent seals, configure `fracture` so pressure builds and the cap pops in a
-visible seal-then-reopen cycle.
+The engine pressure-routes lava through its connected body to an outlet, ejects
+it ballistically (with lateral spread so ejecta fans across the flanks),
+fragments airborne cells into `TEPHRA` as they cool (which builds the cone),
+and freezes grounded lava to `ROCK`. If the vent seals, `fracture` builds
+pressure and pops the cap in a seal-then-reopen cycle.
+
+**⚠️ A bare `addPressureSource` at the surface is a squib on a cold planet —
+do not ship it.** Two engine facts bite, both measured against the published
+package on a 640×640 temperate world:
+
+- The routed lava is born hot but has **no thermal mass behind it**: on rock
+  at `ambientTemperature` the eruption freezes shut within seconds (~20 lava
+  cells, gone by frame ~300).
+- **`beginBulk()`/`endBulk()` stamps carry no heat** — `endBulk()` recovers
+  wake/dirty bookkeeping, not temperatures. A lava chamber stamped in a bulk
+  batch without an explicit `setHeat` afterwards is born cold and freezes
+  without ever flowing (measured: zero erupted cells, ever).
+
+The recipe that works (measured: **~1,050 lava cells at frame 60, still ~1,030
+at frame 300**, then freezing into new land — a real cone-building eruption):
+
+1. **Carve the vent mouth** (a small EMPTY disc at the surface point). This is
+   also your instant click feedback.
+2. **Stamp a magma chamber + conduit of `LAVA`** below the vent in a
+   `beginBulk()` batch — then **`setHeat(x, y, 1.0)` every stamped cell after
+   `endBulk()`**. This is the thermal mass that keeps the eruption alive.
+3. **Place the pressure source inside the chamber.** Its cell holds the source
+   material itself, so the preflight always passes (a source cell holding
+   *another* material — e.g. rock — is skipped every frame, forever), and the
+   routed volume has the whole hot body to climb.
 
 ```ts
-// A vent at the planet surface, magma chamber below it. cx/cy are the planet
-// center; angle points from center to the vent.
-const ventX = Math.round(cx + Math.cos(angle) * planetR);
-const ventY = Math.round(cy + Math.sin(angle) * planetR);
+// angle points from the planet centre to the clicked surface point.
+const ux = Math.cos(angle), uy = Math.sin(angle);
+const ventX = Math.round(cx + ux * planetR);
+const ventY = Math.round(cy + uy * planetR);
+const MOUTH = 2, CHAMBER_R = 18, CHAMBER_DEPTH = 34;
 
-engine.addPressureSource({
-  x: ventX,
-  y: ventY,
+// 1. Carve the mouth.
+for (let dy = -MOUTH; dy <= MOUTH; dy++) {
+  for (let dx = -MOUTH; dx <= MOUTH; dx++) {
+    if (dx * dx + dy * dy > MOUTH * MOUTH) continue;
+    const m = engine.getMaterial(ventX + dx, ventY + dy);
+    if (m !== MaterialType.EMPTY && m !== MaterialType.WATER) {
+      engine.setMaterial(ventX + dx, ventY + dy, MaterialType.EMPTY);
+    }
+  }
+}
+
+// 2. Stamp the heated magma body.
+const chx = Math.round(cx + ux * (planetR - CHAMBER_DEPTH));
+const chy = Math.round(cy + uy * (planetR - CHAMBER_DEPTH));
+const hot: number[] = [];
+const cell = (x: number, y: number) => {
+  engine.setMaterial(x, y, MaterialType.LAVA);
+  hot.push(y * width + x);
+};
+engine.beginBulk();
+for (let y = chy - CHAMBER_R; y <= chy + CHAMBER_R; y++) {
+  for (let x = chx - CHAMBER_R; x <= chx + CHAMBER_R; x++) {
+    const dx = x - chx, dy = y - chy;
+    if (dx * dx + dy * dy <= CHAMBER_R * CHAMBER_R) cell(x, y);
+  }
+}
+// 3-wide conduit from just below the mouth down to the chamber.
+for (let t = MOUTH + 1; t <= CHAMBER_DEPTH - CHAMBER_R; t++) {
+  const px = Math.round(cx + ux * (planetR - t));
+  const py = Math.round(cy + uy * (planetR - t));
+  cell(px, py);
+  cell(Math.round(px + uy), Math.round(py - ux));
+  cell(Math.round(px - uy), Math.round(py + ux));
+}
+engine.endBulk();
+for (const idx of hot) engine.setHeat(idx % width, (idx / width) | 0, 1.0);
+
+// 3. Feed the chamber.
+const id = engine.addPressureSource({
+  x: chx, y: chy,
   material: MaterialType.LAVA,
-  rate: 1.5,                 // lava cells accrued per frame
-  pressureRate: 1,           // head accrued per frame while blocked
-  maxPressure: 18,           // how hard it can eventually push
-  maxPending: 40,            // cap on backlog (bounds the post-unblock surge)
-  outletVelocityEfficiency: 0.7,  // fraction of surplus head → launch speed
+  rate: 3, pressureRate: 1, maxPressure: 22, maxPending: 120,
+  outletVelocityEfficiency: 0.7,   // fraction of surplus head → launch speed
   outletLateralSpread: 0.25,       // ±half-angle of the jet (tangent form)
-  temperature: 1.0,          // born at full melt; cools from there
+  temperature: 1.0,                // routed cells are born at full melt
   // Keep the eruption on the vent axis so summit spread doesn't become extra vents:
   ventAnchor: { cx, cy, angle, corridorRadius: 6 },
   // Seal-then-pop: pressure accrues while blocked, then fractures the cap.
-  fracture: { minSealedFrames: 24, pressureRate: 1, maxPressure: 18 },
+  fracture: { minSealedFrames: 12, pressureRate: 1.5, maxPressure: 22 },
 });
 ```
 
-Remove it with `engine.removePressureSource(id)` (the id `addPressureSource`
-returned) to end the eruption. The state of a live source — accrued volume and
-available pressure — is readable via `getPressureSourceState(id)`.
+End the eruption with `engine.removePressureSource(id)`. The state of a live
+source — accrued volume (`pending`) and available pressure — is readable via
+`getPressureSourceState(id)`.
 
 **Forest** and **Ocean** are one-liners by comparison:
 
@@ -499,44 +569,53 @@ available pressure — is readable via `getPressureSourceState(id)`.
 
 ### 8.3 Smiting with lightning (copy this)
 
-Lightning is pure presentation on top of two engine calls — the strike itself is
-a one-frame jagged line you draw from the top of the canvas to the cursor, then
-the engine takes over: a `FIRE` cell ignites at the impact and spreads through
-anything flammable, and an `explode()` carves a small scorch. The drama is the
-flash and the ignition; the engine does the consequences.
+Lightning is pure presentation on top of one engine call — the player touches
+the sky and the bolt **arcs down to the ground below the touch** ("down" on a
+radial-gravity world is toward the planet centre), then `explode()` carves a
+small crater and ignites its own fire core at the strike. March radially inward
+from the touch point to the first solid cell; treat `WATER` as transparent so a
+strike through rain or onto an ocean grounds out on the floor. A touch already
+on terrain backs off outward to open sky first so the arc is always visible.
+The drama is the flash and the ignition; the engine does the consequences.
 
 ```ts
-// A live bolt lasts exactly one rendered frame, then clears.
-let bolt: { points: { x: number; y: number }[] } | null = null;
+function smite(engine: any, gx: number, gy: number) {
+  const dxC = cx - gx, dyC = cy - gy;
+  const dist = Math.hypot(dxC, dyC) || 1;
+  const ux = dxC / dist, uy = dyC / dist;      // inward ("down") unit vector
 
-function smite(engine: any, gx: number, gy: number, ctx: CanvasRenderingContext2D) {
-  // 1. The visual: a jagged polyline from the canvas top to the strike point.
-  //    Midpoint-displacement lightning — a few segments of randomized offset.
-  bolt = makeBolt(gx, gy);                 // see below
-  // 2. The ignition + scorch, at the actual grid cell under the cursor.
-  engine.setMaterial(gx, gy, MaterialType.FIRE);
-  engine.explode(gx, gy, 3, 4);            // small crater, light debris
+  // Bolt origin: the touch point — or, on terrain, back off outward to the
+  // first EMPTY cell (up to 64) so the arc has sky to travel through.
+  let fx = gx, fy = gy;
+  if (engine.getMaterial(gx, gy) !== MaterialType.EMPTY) {
+    for (let t = 1; t <= 64; t++) {
+      const x = Math.round(gx - ux * t), y = Math.round(gy - uy * t);
+      if (x < 0 || x >= width || y < 0 || y >= height) break;
+      if (engine.getMaterial(x, y) === MaterialType.EMPTY) { fx = x; fy = y; break; }
+    }
+  }
+
+  // Strike point: march inward to the first non-empty, non-water cell.
+  let sx = gx, sy = gy;
+  for (let t = 0; t <= Math.ceil(dist); t++) {
+    const x = Math.round(gx + ux * t), y = Math.round(gy + uy * t);
+    const m = engine.getMaterial(x, y);
+    if (m === MaterialType.WALL) break;        // out of bounds
+    if (m !== MaterialType.EMPTY && m !== MaterialType.WATER) { sx = x; sy = y; break; }
+  }
+
+  engine.explode(sx, sy, 3, 4);                // carves the crater + fire core
+  return makeBolt(fx, fy, sx, sy);             // jagged polyline, see below
 }
 
-// Draw `bolt` in render() right after putImageData/drawImage, then set
-// bolt = null so it flashes for exactly one frame. White core + pale-blue glow
-// reads instantly as lightning against the planet.
-
-function makeBolt(gx: number, gy: number) {
-  const points = [{ x: gx, y: 0 }];        // top of the grid
-  let y = 0;
-  while (y < gy) {
-    y += 4 + Math.floor(Math.random() * 6); // step down 4–9 cells
-    const xJitter = (Math.random() - 0.5) * 12;
-    points.push({ x: gx + xJitter, y });    // points are in GRID space —
-  }                                         // apply the camera in render()
-  points.push({ x: gx, y: gy });            // land exactly on the cursor
-  return { points };
-}
+// makeBolt(from, to): step along the segment in 4–9 cell increments with
+// perpendicular midpoint-displacement jitter. Draw it in render() under the
+// camera transform (line widths divided by zoom), fade it over ~8 frames
+// rather than a single frame — a 16ms flash is invisible in practice.
 ```
 
-Keep the bolt one-frame — a strike is an event, not a state. `Math.random()` is
-fine *for the visual only* (per §2); the grid writes go through the engine.
+Keep the bolt short-lived — a strike is an event, not a state. `Math.random()`
+is fine *for the visual only* (per §2); the grid writes go through the engine.
 
 ---
 
