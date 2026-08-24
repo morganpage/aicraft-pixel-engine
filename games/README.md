@@ -14,9 +14,7 @@ surface. The brief was validated end-to-end by building the game from it
 against the package and testing every power in a browser; its volcano section
 calls the library's tested eruption subsystem rather than re-deriving one.
 
-> **0.2.0 is not on the npm registry yet** (publish pending the owner's npm
-> auth). Until it lands, builds against this brief need the engine from
-> source (`file:` dependency or a checkout); the moment `npm publish` runs,
+> **0.2.0 is live on the npm registry** (`latest`) —
 > `npm install --save-exact aicraft-pixel-engine@0.2.0` works as written.
 
 For a maximum-quality run, [god-game-gauntlet-prompt.txt](./god-game-gauntlet-prompt.txt)
