@@ -7,26 +7,17 @@ to a coding agent (Claude / Cursor / etc.) and it produces a runnable game that
 imports everything from the engine and writes no re-implementations of what the
 engine already provides.
 
-[god-game.md](./god-game.md) pins `aicraft-pixel-engine@0.1.2` — a version, not
-a range (install with `npm install --save-exact`, or npm writes `^0.1.2` into
-package.json) — and every import it claims compiles against the published
-`0.1.2` surface. The brief was validated end-to-end by building the game from
-it against the npm package and testing every power in a browser.
+[god-game.md](./god-game.md) pins `aicraft-pixel-engine@0.2.0` — a version,
+not a range (install with `npm install --save-exact`, or npm writes `^0.2.0`
+into package.json) — and every import it claims compiles against the `0.2.0`
+surface. The brief was validated end-to-end by building the game from it
+against the package and testing every power in a browser; its volcano section
+calls the library's tested eruption subsystem rather than re-deriving one.
 
-> **Pin status.** The brief deliberately still says `0.1.2`, which is what is on
-> npm today. `0.2.0` is prepared in [CHANGELOG.md](../CHANGELOG.md) but
-> unpublished, and re-pinning a brief to a version an agent cannot install would
-> break every build made from it. When `0.2.0` ships, two parts of §8.2 collapse:
->
-> - the hand-rolled bounds-checked disc loops become `engine.stampDisc(...)`;
-> - the hand-rolled magma chamber + conduit + two-phase eruption recipe — the
->   part currently written out as prose and kept in sync with
->   `showcase/tests/godgame-volcano.scenario.test.ts` by hand — becomes
->   `stampVolcano` + `createVolcanoState` + `stepVolcanoFrame` from the engine's
->   own `volcano` subsystem, which is now library code with its own tests.
->
-> That is the whole reason the subsystem moved out of the showcase: a recipe a
-> brief has to *describe* is a recipe that drifts.
+> **0.2.0 is not on the npm registry yet** (publish pending the owner's npm
+> auth). Until it lands, builds against this brief need the engine from
+> source (`file:` dependency or a checkout); the moment `npm publish` runs,
+> `npm install --save-exact aicraft-pixel-engine@0.2.0` works as written.
 
 For a maximum-quality run, [god-game-gauntlet-prompt.txt](./god-game-gauntlet-prompt.txt)
 is a launcher prompt: it points the agent at the hosted brief and adds a
@@ -59,11 +50,18 @@ The common contract every prompt here enforces:
   publishes a single `.` entry; deep subpaths like `aicraft-pixel-engine/src/…`
   are not part of the public surface.
 
+> **Reusable wiring lives in [`../recipes/`](../recipes/)**, not in these
+> briefs: the throttle-proof fixed-step clock, the pointer-hygiene camera,
+> the dirty-chunk renderer, and the census scanner. Recipes are typechecked
+> and unit-tested against the engine source in CI, so they cannot drift from
+> the shipped API the way inline sketches in briefs did. New briefs: point at
+> a recipe; do not paste its code.
+
 ## Prompts
 
 | Game | File | Genre | Engine pillars exercised |
 |---|---|---|---|
-| **God Game** | [god-game.md](./god-game.md) | One-screen circular-planet terraforming toy (*Reus* / *Godfinger*) | `RadialGravity` planet setup, `beginBulk`/`endBulk` stamping, native heat & climate (`enableHeat`, `ambientTemperature`), growth (`SEED` → trees, grass spread), pressure transport + `TEPHRA` fragmentation (volcano cones), explosions + the velocity field, dirty-chunk rendering under a host camera |
+| **God Game** | [god-game.md](./god-game.md) | One-screen circular-planet terraforming toy with a living population (*Reus* / *Godfinger*) | `RadialGravity` planet setup, `beginBulk`/`endBulk` stamping, native heat & climate, growth (`SEED` → trees, fertile-ash grass spread), the volcano subsystem (`stampVolcano`/`stepVolcanoFrame`), explosions + the velocity field, dirty-chunk rendering under a host camera, census/milestone game layer, polar-frame surface-walker population |
 
 _More to come — see "Adding a new prompt" below._
 

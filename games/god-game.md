@@ -1,4 +1,4 @@
-# God Game — a circular-planet terraforming toy on `aicraft-pixel-engine@0.1.2`
+# God Game — a circular-planet terraforming toy on `aicraft-pixel-engine@0.2.0`
 
 > Paste this entire document to a coding agent (Claude / Cursor / etc.). It is a complete, self-contained build brief: concept, engine wiring, rendering discipline, god-power specs, acceptance criteria, and build order. The agent should produce a single runnable Vite + plain-TypeScript browser game that imports everything from `aicraft-pixel-engine` (the npm package) and writes **no** re-implementations of what the engine already provides.
 
@@ -19,12 +19,14 @@ and the simulation does the rest. There is no lose state; the joy is watching a
 dead rock become a living world. Make it *feel* good: every action should have
 immediate, visible, satisfying consequences.
 
-**This is NOT a tech demo.** The simulation reacting to the player *is* the
-game. There is no UI beyond the toolbar — no score, no levels, no menus.
+**This is NOT a tech demo, but it is a toy, not a product.** The simulation
+reacting to the player *is* the game. The only chrome is the toolbar, a
+footer line (the live census + the selected power's description + controls
+hint), and milestone toasts — no score screen, no levels, no menus.
 
 **Target a playable MVP in one sitting, not a polished product.**
 
-**Non-negotiable: build the entire game on top of `aicraft-pixel-engine@0.1.2`.**
+**Non-negotiable: build the entire game on top of `aicraft-pixel-engine@0.2.0`.**
 Do not add a physics library, hand-roll temperature, growth, or pressure, or
 write your own falling-sand rules — those are all in the engine. See §9.2 for
 the forbidden-pattern checks.
@@ -36,19 +38,20 @@ the forbidden-pattern checks.
 ```bash
 npm create vite@latest god-game -- --template vanilla-ts
 cd god-game
-npm install --save-exact aicraft-pixel-engine@0.1.2
+npm install --save-exact aicraft-pixel-engine@0.2.0
 ```
 
-(`--save-exact` matters: a plain `npm install pkg@0.1.2` writes `"^0.1.2"` to
-package.json, and the brief targets the `0.1.2` API exactly — a version, not
+(`--save-exact` matters: a plain `npm install pkg@0.2.0` writes `"^0.2.0"` to
+package.json, and the brief targets the `0.2.0` API exactly — a version, not
 a range.)
 
 - **TypeScript**, strict. **Vite** dev server + build. Single `<canvas>` in
   `index.html`.
-- **`aicraft-pixel-engine` is your only runtime dependency.** Import from the
+- **`aicraft-pixel-engine` is your only *required* runtime dependency** (the
+  optional slime rig in §8.5 adds `aicraft-engine`). Import from the
   **root barrel only** — the published package exposes a single `.` entry:
   ```ts
-  // The entire public API — all from the package root.
+  // The public API — all from the package root.
   import {
     PixelEngine,
     FlatGravity,
@@ -56,6 +59,10 @@ a range.)
     MaterialType,
     Materials,
     materialDefs,
+    // The volcano subsystem (0.2.0): the tested eruption, as library calls.
+    volcanoGeometryFor, stampVolcano, createVolcanoState, buildVolcanoOpts,
+    stepVolcanoFrame, makeRng, DEFAULT_VOLCANO_INPUTS,
+    type VolcanoConfig, type VolcanoState, type VolcanoStepOptions, type VolcanoRuntime,
   } from 'aicraft-pixel-engine';
   ```
   (Never deep-import subpaths like `aicraft-pixel-engine/src/sand`; the `exports`
@@ -98,8 +105,9 @@ a range.)
 | Ocean | `setMaterial(x, y, WATER)` — flows, levels into seas, freezes/melts with the climate |
 | Rain clouds | Host-tracked entity + `setMaterial(x, y, WATER)` per tick — **the one power that needs host logic** (§8.1) |
 | Forest | `setMaterial(x, y, SEED)` + native growth rules; `plant(x, y, TREE_TIP, { energy })` for an instant tree |
-| Volcano | `addPressureSource({...})` (+ `removePressureSource`, `getPressureSourceState`) — native conduit routing, ballistic ejecta, `TEPHRA` fragmentation, freezing (§8.2) |
-| Lightning smite | Host-drawn one-frame bolt + `setMaterial(x, y, FIRE)` + `explode(x, y, r)` (§8.3) |
+| Volcano | The library subsystem: `volcanoGeometryFor` → `stampVolcano` → `stepVolcanoFrame` (+ `createVolcanoState`, `buildVolcanoOpts`, `makeRng`) — the tested cone-building eruption (§8.2) |
+| Lightning smite | Host-drawn arcing bolt + `explode(x, y, r)` (which owns the fire core) (§8.3) |
+| Game feel | Census HUD (`engine.grid` scan, 1/s), milestone toasts, day/night tint (§8.4) |
 | Rendering | `grid`, `colorGrid`, `consumeRenderDirtyChunks()`, `CHUNK_SIZE` (§5, §7) |
 | Reproducibility | `engine.random()` — seeded; never `Math.random` for grid decisions |
 
@@ -128,6 +136,16 @@ const engine = new PixelEngine({
   ambientTemperature: 0.12,
   // Frames between growth ticks. Lower = faster forests. Default 4.
   growthInterval: 4,
+  // REQUIRED at this scale for the volcano subsystem (see §8.2). With the
+  // defaults the pressure router's visit budget exhausts before any route
+  // from a chamber this deep reaches the surface — the eruption cycles
+  // through its phases emitting nothing, with no error to debug (measured:
+  // above ~700² no cone formed at all; the god-game's 640²/R205 sits just
+  // inside the same regime, needing a budget of ~6,400 vs the default 2,048).
+  pressureVisitLimit: Math.max(2048, Math.round(2048 * 205 / 66)),
+  // Fracture must clear a ~26-cell bore in one eruption; the default 1/frame
+  // is too slow and the vent never opens.
+  fracturePerFrame: 4,
 });
 
 // Stamp a rock disc — the planet body everything falls onto.
@@ -384,7 +402,7 @@ distinct; six is plenty:
 | **Summon Cloud** | Paint a cloud above the surface that rains water and shrinks as it empties. | Spawn a host-tracked cloud; each tick emit `WATER` at its base |
 | **Ocean** | Pour water; it flows and levels into seas around the planet. | `setMaterial(x, y, WATER)` |
 | **Forest** | Scatter `SEED` that falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. | `engine.plant(...)` / `setMaterial(x, y, SEED)` |
-| **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone. | `engine.addPressureSource(...)` — the engine handles eruption, flow, cooling, and cone |
+| **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone — then, once cooled, the ash greens over. | `stampVolcano` + `stepVolcanoFrame` (the library's tested eruption subsystem) |
 | **Smite** | Lightning bolt strikes the cursor: a jagged flash, an ignition at the impact, and a small scorch. | Host-drawn bolt (one-frame visual) + `setMaterial(x, y, FIRE)` / `engine.explode(x, y, r)` at the strike point |
 
 The engine provides the cellular-automaton core, heat, growth, and pressure —
@@ -461,156 +479,88 @@ function stepCloud(engine: any, cloud: Cloud, rainPerTick: number, rng: () => nu
 (Pass `engine.random` as `rng` — cloud rain spends grid cells, so it belongs on
 the seeded stream per §2.)
 
-### 8.2 Volcano (the acceptance-tested recipe)
+### 8.2 Volcano (library calls — copy this)
 
-The engine pressure-routes lava through its connected body to an outlet, ejects
-it ballistically (with lateral spread so ejecta fans across the flanks),
-fragments airborne cells into `TEPHRA` as they cool (which builds the cone),
-and freezes grounded lava to `ROCK`. If the vent seals, `fracture` builds
-pressure and pops the cap.
-
-**This recipe is enforced by a test** — `showcase/tests/godgame-volcano.scenario.test.ts`
-in the engine repo defines a good volcano as: a buried magma chamber (≥150
-deep lava cells), sustained vent activity, ballistic ejecta (≥8 lava cells 8+
-above the surface), fragmentation into a tephra fan (≥150 cells, ≥25 landing
-10+ cells off-axis), a cone ≥10 tall that is a mound (≥8 of 11 tangent bins
-raised) with ≥250 cells of volume, **no spire** (max final height ≤34 cells),
-**no needle** (centre ≤18 cells over the shoulders — the runaway-tower
-defect), ≥150 cells of new rock, an eruption that settles, byte-determinism —
-**and all of it at five vent angles** (N/E/S/W + diagonal), because corridor
-rounding makes the eruption's fate angle-dependent. If you change the recipe,
-change the test with it — the test failing is how the previous four recipes
-were caught.
-
-Seven measured facts the recipe must respect:
-
-1. **A bare `addPressureSource` at the surface is a cold squib** (~20 lava
-   cells, frozen shut within seconds on a temperate planet).
-2. **`beginBulk()`/`endBulk()` stamps carry no heat** — `setHeat(1.0)` every
-   stamped cell after `endBulk()`, or the chamber freezes without ever flowing.
-3. **A source buried in another material is skipped forever** — put the source
-   inside the stamped lava body.
-4. **Do NOT carve the vent mouth.** An open crater lets the fountain's own
-   fallback tephra rain back down the conduit, choke the chamber, and kill the
-   source cell (measured: effusion discharged zero for 500 frames). Let the
-   source seal behind rock and **fracture its own vent open** — fracture
-   pressure 18 beats rock strength 15.
-5. **Remelt fallback tephra out of the throat** every ~20 frames while the
-   volcano runs, over a band wide enough to cover the **shoulder outlets**
-   (|tangent| ≤ 6), not just the summit channel — if only the summit stays
-   open, extrusion stacks a tower.
-6. **Cap the edifice height host-side in BOTH phases** (the engine has no
-   `maxHeight` because nothing removes material), checked every 5 frames — at
-   3 parcels/frame a 15-frame interval overshoots by ~45 cells. An uncapped
-   fountain builds a 66-cell chimney; an uncapped **effusion** builds a
-   74-cell needle (extruded lava on a narrow summit is fully exposed, cools
-   ~0.08/frame, and freezes in place faster than it can flow). Measure the
-   height in built solids only (tephra/frozen rock) — the lava jet itself is
-   not edifice.
-7. **Head is refilled in full every frame** (`pressureRate = maxPressure`) and
-   must afford `parcels` launches, each costing the **ascent climb** —
-   `(chamber depth + cone target + chamber radius) × 1.2` head units — plus the
-   surplus that Torricelli-converts to launch speed
-   (`speed = √(2·surplus)·efficiency`). A head budget sized for one launch
-   throttles the jet to ~1 parcel/frame however high `rate` is set.
-
-8. **The fountain builds the cone; the effusion only adds rock to it.** Tephra
-   is granular — it lands, tumbles, and finds its angle of repose, so every
-   fountain parcel widens the footprint. Frozen lava sets where it stops. Run
-   the fountain long (500 frames) or the base is still narrow when the effusion
-   takes over, and the finished edifice stands at a ~48° flank.
-
-9. **Effusion delivers ONE parcel per frame.** This single number decides
-   whether you get a volcano or a mesa, and it is the defect a player
-   screenshotted: a straight-sided chimney with a magma blob at its foot.
-   A lava pool levels to an equipotential, which on a radial-gravity planet is
-   a spherical shell — a **flat top**. Whether the summit ponds or drains is a
-   race between delivery rate and how fast a flow runs down the flank and
-   stiffens. At 3 parcels/frame the summit is refilled faster than it drains,
-   never falls below the hot end of `LAVA.yieldThicknessCurve` (0.85, where the
-   yield gate is off entirely), spreads into a shell, and freezes as a slab —
-   measured at a constant 74 cells wide for fifteen consecutive rows of height.
-   At 1 parcel/frame each parcel runs downslope and chills before the next
-   arrives. Measured across five vent angles, the longest non-tapering run
-   falls from **13 rows to 1**.
-
-The shape that passes all criteria is a two-phase eruption:
+**0.2.0 shipped the eruption as a tested subsystem.** `stampVolcano` /
+`stepVolcanoFrame` (exported from the package root) compose pressure sources,
+the heat field, fragmentation and the velocity field into the one arrangement
+of them that is hard to derive from scratch: an eruption that clears its
+throat with tephra, fountains ballistically, extrudes flows, and stacks a cone
+that stops growing. The engine repo guards it with a silhouette contract
+(cone **taper**, not just magnitude — chimneys-on-skirts fail it) at five vent
+angles. Using the library means inheriting all of that. Do NOT re-derive the
+eruption by hand: four successive hand-written recipes failed the acceptance
+test before the library one passed.
 
 ```ts
-const CHAMBER_R = 18, CHAMBER_DEPTH = 34, CONE_TARGET = 24, PARCELS = 3, SURPLUS = 80;
-// Fountain long (it shapes the cone); effusion slow (it must not pond).
-const FOUNTAIN_FRAMES = 500, EFFUSION_FRAMES = 500, EFFUSION_PARCELS = 1;
+// --- once, at boot ---
+// headroom = free cells above the surface (SIZE/2 - PLANET_R = 115 here). It
+// sizes the cap ladder: capMax = min(headroom - 2, scaled-by-radius); a value
+// smaller than the world's actual sky stunts the cone to that height and
+// collapses the ladder (capStart == capMax).
+const HEADROOM = 320 - PLANET_R;
+const volcanoGeom = volcanoGeometryFor(CX, CY, PLANET_R, HEADROOM);
+let volcanoState = createVolcanoState();
+const volcanoRng = makeRng(seed);          // dedicated stream: the eruption's
+                                           // randomness never perturbs the sim's
 
-// --- open: stamp the heated body (chamber + conduit, NO carved mouth) ---
-const ux = Math.cos(angle), uy = Math.sin(angle);
-const chx = Math.round(cx + ux * (planetR - CHAMBER_DEPTH));
-const chy = Math.round(cy + uy * (planetR - CHAMBER_DEPTH));
-const hot: number[] = [];
-const cell = (x: number, y: number) => {
-  engine.setMaterial(x, y, MaterialType.LAVA);
-  hot.push(y * width + x);
-};
-engine.beginBulk();
-/* chamber disc radius CHAMBER_R at (chx, chy); 3-wide conduit shaft along the
-   axis from the surface down to the chamber — see the test for the loops */
-engine.endBulk();
-for (const idx of hot) engine.setHeat(idx % width, (idx / width) | 0, 1.0);
+// --- on Volcano click (the angle is the click direction from the centre) ---
+const cfg = volcanoGeometryFor(CX, CY, PLANET_R, HEADROOM, Math.atan2(gy - CY, gx - CX)).cfg;
+if (!volcanoStarted) {
+  stampVolcano(engine, cfg);               // chamber + conduit + vent
+  volcanoStarted = true;
+} else {
+  capHeight = Math.min(capHeight + volcanoGeom.capStep, volcanoGeom.capMax);
+  // ^ re-eruption grows the cap, so the cone builds in stages
+}
+volcanoState = createVolcanoState();        // REQUIRED: restart the cycle on its
+                                            // explosive phase. Without this the
+                                            // completed state machine sits in
+                                            // repose forever and every later
+                                            // click is 150 frames of nothing.
+erupting = true;
 
-const ascent = Math.ceil((CHAMBER_DEPTH + CONE_TARGET + CHAMBER_R) * 1.2);
-
-// Phase 1 — FOUNTAIN: surplus head → ballistic velocity → tephra cone.
-const fountainId = engine.addPressureSource({
-  x: chx, y: chy, material: MaterialType.LAVA,
-  rate: PARCELS,
-  pressureRate: (ascent + SURPLUS) * PARCELS,  // refilled in full each frame
-  maxPressure: (ascent + SURPLUS) * PARCELS,
-  maxPending: 5, maxDischargePerFrame: PARCELS,
-  outletVelocityEfficiency: 0.7,
-  outletLateralSpread: 0.65,       // fan the ejecta into a cone, not a spike
-  temperature: 1.0,
-  ventAnchor: { cx, cy, angle, corridorRadius: 3 },
-  fracture: { minSealedFrames: 6, pressureRate: 3, maxPressure: 18 },
+// --- every tick, unconditionally (the dormant branch matters too — see below).
+// Rebuild opts fresh each tick so the live cap applies:
+const volcanoOpts = buildVolcanoOpts(cfg, {
+  ...DEFAULT_VOLCANO_INPUTS,               // the shipped, acceptance-tested tuning
+  maxHeight: capHeight,                    // the operative cap; capStart for cycle 1
 });
-
-// Phase 2 — EFFUSION (after FOUNTAIN_FRAMES or the fountain height cap):
-// remove the fountain source, add the same-source extruder with
-//   outletVelocityEfficiency: 0        // surplus stays head: extrude, don't launch
-//   rate / maxDischargePerFrame: EFFUSION_PARCELS   // ONE. see fact 9 — 3 ponds
-//   pressureRate/maxPressure: ascent * EFFUSION_PARCELS + 12
-//   ventAnchor corridorRadius: 6       // exits at the shoulders, not just the summit
-// The corridor tracks cone growth (axis to any height), so flows spill down
-// the flanks and freeze into new rock. End it at EFFUSION_FRAMES **or its own
-// height cap** (solids ≥ CONE_TARGET + 2, checked every 5 frames) — the
-// effusion's late central stacking is the needle defect.
-
-// While either phase runs, every 20 frames:
-// remeltThroat() — any TEPHRA in the |tangent| ≤ 6 band from 8 above the
-// surface to 16 below becomes LAVA at heat 1.0 (facts 5).
+const runtime: VolcanoRuntime = { erupting, capHeight };
+stepVolcanoFrame(engine, cfg, volcanoState, volcanoRng, volcanoOpts, runtime);
+erupting = runtime.erupting;               // false once the cycle completes
 ```
 
-Measured on the published engine, 640×640 temperate world, at all five vent
-angles: final cones 16–27 cells tall on 45–60 cell footprints, height/width
-0.32–0.49 (a 18–26° flank), and the width **decreases on essentially every row
-of height** — longest non-tapering run 1. All acceptance criteria green,
-including the silhouette contract that the earlier 300/3-parcel recipe failed
-at three of five angles.
+Four contracts to respect — each one is a measured failure mode:
 
-> **Do not tune the fountain and effusion independently of each other.** They
-> are one balance: the fountain sets the footprint, and the effusion must stay
-> under the drainage rate that footprint's flank can carry. Raise the effusion
-> rate and you get a mesa however good the fountain was.
+- **`stepVolcanoFrame` runs `engine.update()` itself, and it must be called
+  EVERY tick, erupting or not.** Do not also call `engine.update()` in the
+  same tick (double-stepping breaks phases and caps). And do not stop calling
+  it when the eruption ends: the dormant branch recharges the reservoir (an
+  unfed chamber sets solid in under 200 frames) and keeps `syncFromHeat`
+  running so cooling lava renders as dark basalt through `colorGrid` instead
+  of falling back to flat bedrock grey.
+- **The volcano owns its RNG.** Pass `makeRng(seed)`, never `engine.random` —
+  the eruption must not perturb the simulation's shared stream, and
+  re-seeding per world makes replays identical.
+- **The cap is `maxHeight` in the opts, not the runtime field.**
+  `VolcanoRuntime.capHeight` is advisory; the eruption stops growing at
+  `opts.pressure.maxHeight`, which `buildVolcanoOpts` derives from
+  `inputs.maxHeight`. Start at `volcanoGeom.capStart`, raise by `capStep` on
+  each re-eruption, capped at `capMax`.
+- **`volcanoGeometryFor` is positional** — `(centerX, centerY, planetRadius,
+  headroom, ventAngle?)`, where headroom is the free sky above the surface
+  (`SIZE/2 − planetR`) — and returns `{ cfg, capStart, capStep, capMax }`;
+  pass `geom.cfg` (the `VolcanoConfig`) to the engine calls, and keep the
+  wrapper for the cap ladder. §4's `pressureVisitLimit`/`fracturePerFrame`
+  are load-bearing at 640² — with defaults, this code emits nothing.
 
-**Forest** and **Ocean** are one-liners by comparison:
-
-- **Forest.** `setMaterial(x, y, SEED)` is all you need — the seed falls,
-  germinates into a growing tip on contact with `SAND`/`GRASS`/`TEPHRA` (volcanic
-  ash is fertile once it has cooled), and grows into a tree (trunk → branches →
-  canopy → leaves) with its own genome. `GRASS` placed next to water spreads
-  outward on its own — including across a cone's tephra flanks, so an eruption's
-  scar heals green under a rain cloud. For a guaranteed instant tree at a spot,
-  use `engine.plant(x, y, TREE_TIP, { energy: 12 })`.
-- **Ocean.** `setMaterial(x, y, WATER)` — it flows, levels, and (with heat on)
-  freezes near the poles / melts near lava, all natively.
+**Fertile ash is the payoff.** The cone it builds is `TEPHRA`, which counts as
+soil for both life rules once cooled: rain on a settled cone and grass
+colonizes the flanks (§8 Forest). Destroy-then-garden is the point of the
+power. And render through `engine.colorGrid`: the subsystem writes per-cell
+incandescence and cooled-rock tints there (0 = fall back to the palette) — a
+renderer that ignores it shows a flat grey cone where the showcase glows.
 
 ### 8.3 Smiting with lightning (copy this)
 
@@ -664,6 +614,50 @@ is fine *for the visual only* (per §2); the grid writes go through the engine.
 
 ---
 
+### 8.4 The game layer: census, milestones, day/night
+
+Three small systems turn the toy into something that reads as a game. All
+host-side; none touch the engine beyond reads.
+
+- **World census** (the readable-feedback pillar). Once a second — on wall
+  clock, not tick count, or throttled tabs under-report — scan `engine.grid`
+  and show the counts: `🌊 12 · 🏔 3.4k · 🌋 210 · 🔥 0 · 🌲 87`. Use the
+  engine repo's [`recipes/census.ts`](../recipes/census.ts); it also exposes
+  `forestGrown` (WOOD/LEAF/TREE_TIP, no seeds), because gating anything on
+  "a forest exists" must not count a handful of scattered seeds.
+- **Milestone toasts.** One-time achievements for shaping the world (first
+  ocean, first forest, the land rises, the world erupts, wrath from above),
+  toasted top-right. Two measured lessons: gate them on the *grown* census
+  (a seed scatter is not a forest), and fire **event-driven milestones from
+  the per-frame event detection, not the 1s census** — a strike's visual
+  lasts 8 frames, so a census-gated "first smite" fires on ~13% of strikes.
+- **Day/night.** A ~90-second cycle as a canvas tint overlay (device-space
+  fill after the camera blit — a grid-space tint slides off the sky when you
+  pan). Purely presentational; do not modulate engine state for it.
+
+### 8.5 Population: surface walkers
+
+ Creatures are what make it feel alive. The pattern that works on a
+ radial-gravity world is **polar-coordinate surface walkers**: each creature
+ lives at `(angle, radius)` in the planet's frame, samples the terrain along
+ its angle (`WALKABLE`/`LIQUID`/`DEADLY` material sets decide footing,
+ bobbing, and death), and moves by advancing its angle — the surface comes to
+ you, so no physics is needed. React to the god's acts: a lightning strike
+ nearby makes them freeze and stare at the point (then flee if it continues);
+ a live volcano keeps them scared and at a distance. Fear is an event-driven
+ scalar with decay — read the strike/vent state your power code already has.
+
+ The reference build's creature art is a ~2,200-line procedural rig (gazing
+ eye, blinking, mouth morphs, antenna physics) shipped as a copy-in asset:
+ [`games/assets/slime-rig/`](./assets/slime-rig/). It builds on the sibling
+ package's animation primitives, so using it means one extra dependency:
+ `npm install --save-exact aicraft-engine` (its `solveLimb`,
+ `advanceSpringChain` and palette helpers — see the rig's README). Compose
+ the rig; do not reinvent it. A minimal slime (body + eye + hop) satisfies
+ the acceptance criteria; the rig is polish.
+
+---
+
 ## 9. Acceptance Criteria
 
 ### 9.1 What "done" looks like
@@ -686,9 +680,11 @@ Static checks (grep the game source) must find:
 - **No physics library** (no `planck`/matter.js). The engine has no rigid bodies
   and isn't trying to. Trees, buildings, creatures are pixels, not
   sprites-with-colliders.
-- **No hand-rolled temperature, growth, or pressure.** All three are native
-  engine features. Turn them on with `enableHeat` / the growth rules /
-  `addPressureSource` and let the engine do it.
+- **No hand-rolled temperature, growth, pressure, or eruptions.** All native
+  engine features: `enableHeat`, the growth rules, `addPressureSource`, and
+  the volcano subsystem. Do not re-derive the eruption by hand — four
+  hand-written recipes failed the volcano acceptance test before the library
+  one passed (§8.2).
 - **No tile/sprite renderer first.** Get raw material colors on screen as fast
   as possible; the look comes later. A correct loop with ugly pixels beats a
   pretty loop that doesn't simulate.
@@ -718,7 +714,7 @@ Build in this order:
 5. Turn on heat (`enableHeat: true`); drop a `LAVA` cell and watch it cool to
    rock on its own. **Goal: geology without host code.**
 6. Add the cloud power (host entity + rain spawn). **Goal: weather.**
-7. Open a volcano with `addPressureSource`. **Goal: a fountaining, cone-building eruption.**
+7. Wire the library volcano (`stampVolcano` + per-tick `stepVolcanoFrame`, §8.2). **Goal: a fountaining, cone-building eruption.**
 8. Scatter `SEED` / `plant()` a tree; watch a forest establish. **Goal: life.**
 9. Add lightning smite (host-drawn bolt + `FIRE`/`explode` at the strike).
    **Goal: wrath.**
@@ -737,3 +733,39 @@ Build in this order:
 - **Biomes** — tint rock by depth, sand by moisture, etc., in your renderer.
 - **Save/load** — `grid` is a `Uint8Array`; serialize to base64 in
   `localStorage`.
+
+---
+
+## 12. Known traps — the pre-flight checklist
+
+Every item below cost a debugging round to learn. Read once before building,
+once before declaring done.
+
+1. **`putImageData` dirty offsets are source offsets.** The correct chunk
+   repaint is `putImageData(img, 0, 0, x0, y0, CHUNK, CHUNK)` — anything else
+   renders every chunk but (0,0) invisible (§7).
+2. **The first `consumeRenderDirtyChunks()` reports everything dirty.** No
+   boot-paint special case is needed — or allowed to double-paint.
+3. **Bulk-stamped lava carries no heat.** If you ever stamp lava by hand,
+   `setHeat(1.0)` every stamped cell after `endBulk()`, or the body freezes
+   without ever flowing. (The library volcano handles this internally; the
+   measured story is in the engine CHANGELOG's 0.2.0 section.)
+4. **A pressure source buried in another material is skipped forever.** The
+   source cell must be EMPTY or its own material.
+5. **Timer throttling.** Occluded tabs throttle `setInterval` to ~1 Hz; drive
+   fixed steps from a wall-clock accumulator with a clamped catch-up (§2,
+   [`recipes/fixed-tick-clock.ts`](../recipes/fixed-tick-clock.ts)).
+6. **Pointer-capture hygiene.** Stop painting/panning on window-level
+   `pointerup`/`pointercancel`/`blur` and release the capture, or one broken
+   drag wedges all input (§6, [`recipes/radial-camera.ts`](../recipes/radial-camera.ts)).
+7. **Size the canvas from JS against the stage**, not a CSS `vmin` formula —
+   toolbar wrap breaks the reserve and the canvas covers the buttons (§5).
+8. **Never CSS-stretch the backing store** — the planet becomes an ellipse
+   and mouse mapping desynchronizes (§5).
+9. **Volcano = library calls, and `stepVolcanoFrame` owns `engine.update()`**
+   while erupting. Double-stepping breaks phases and caps (§8.2).
+10. **Event-driven feedback needs per-frame detection.** Anything gated on a
+    1 Hz census misses sub-second events (§8.4).
+11. **Grass needs a colonist and adjacency to water** — sprinkle a little
+    GRASS with the forest brush, or the meadow never starts; the moisture
+    scan reaches an adjacent cell, not one further along (§8).
