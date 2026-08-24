@@ -15,8 +15,12 @@ coverage/
 
 # Editor / agent working state — not project source.
 .zcode/
-.claude/
 .scratch/
+
+# Agent config: `launch.json` is shared project config (how to run the showcase
+# dev server) and belongs in the repo. Only the per-machine settings are local.
+.claude/*
+!.claude/launch.json
 
 # Secrets — never commit.
 .env

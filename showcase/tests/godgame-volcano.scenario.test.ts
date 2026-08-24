@@ -2,6 +2,13 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { PixelEngine } from '../../src/sand';
 import { MaterialType, isTerrainSolid } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
+import {
+  assertVolcanoShape,
+  measureVolcanoShape,
+  renderShape,
+  type VolcanoShape,
+} from '../../src/tests/helpers/volcano-fixtures';
+import type { VolcanoConfig } from '../../src/volcano';
 
 /**
  * The god-game volcano acceptance test — the arbiter for the recipe published
@@ -92,8 +99,41 @@ const CHAMBER_R = 18, CHAMBER_DEPTH = 34;
 const CONE_TARGET = 24; // cells of edifice the head must be able to climb
 const PARCELS = 3;      // parcels per frame the head budget must afford
 const SURPLUS = 80;     // surplus head per parcel → Torricelli launch speed
-const FOUNTAIN_FRAMES = 300;
+/**
+ * The fountain runs long, and that is what shapes the cone.
+ *
+ * Tephra is granular: it lands, tumbles, and finds its angle of repose, so
+ * every cell the fountain throws widens the footprint. Frozen lava does not —
+ * it sets where it stops. So the fountain is the phase that builds a *cone*
+ * and the effusion is the phase that adds rock to one. At 300 frames the
+ * footprint was still narrow when the effusion took over, and the finished
+ * edifice stood at a 0.57 height/width ratio — a ~48-degree flank, steeper
+ * than any pile of loose ejecta stands. 500 frames widens the base enough to
+ * bring it to 0.48 at the same 24-cell target height.
+ */
+const FOUNTAIN_FRAMES = 500;
 const EFFUSION_FRAMES = 500;
+/**
+ * Effusion delivers ONE parcel per frame, not `PARCELS`.
+ *
+ * This is the single number that decides whether the result is a volcano or a
+ * mesa, and the mechanism is a real one: a lava pool levels to an
+ * equipotential, which on a radial-gravity planet is a spherical shell — a
+ * FLAT TOP. Whether the summit ponds or drains is a race between the delivery
+ * rate and how fast a flow can run down the flank and stiffen.
+ *
+ * At 3 parcels/frame the summit is replenished faster than it drains. The pool
+ * never falls below the hot end of `LAVA.yieldThicknessCurve` (0.85, where the
+ * yield gate is off entirely), so it stays free to level, spreads into a shell,
+ * and freezes as a slab. Measured: width pinned at 74 cells for fifteen
+ * consecutive rows of height — a flat-topped mesa. Stacked on top of the
+ * fountain's cone it reads as the straight-sided chimney a player screenshotted.
+ *
+ * At 1 parcel/frame each parcel has time to run downslope and chill through the
+ * curve before the next arrives. Measured across all five vent angles: longest
+ * non-tapering run falls from 13 rows to 1.
+ */
+const EFFUSION_PARCELS = 1;
 
 function openVolcano(engine: PixelEngine, angle: number): number {
   const ux = Math.cos(angle), uy = Math.sin(angle);
@@ -228,11 +268,11 @@ function createVolcanoController(engine: PixelEngine, angle: number) {
     effusionId = engine.addPressureSource({
       x: chx, y: chy,
       material: MaterialType.LAVA,
-      rate: PARCELS,
-      pressureRate: ascent * PARCELS + 12,
-      maxPressure: ascent * PARCELS + 12,
+      rate: EFFUSION_PARCELS,
+      pressureRate: ascent * EFFUSION_PARCELS + 12,
+      maxPressure: ascent * EFFUSION_PARCELS + 12,
       maxPending: 5,
-      maxDischargePerFrame: PARCELS,
+      maxDischargePerFrame: EFFUSION_PARCELS,
       outletVelocityEfficiency: 0,
       outletLateralSpread: 0.25,
       temperature: 1.0,
@@ -354,6 +394,35 @@ function best<T>(samples: T[], pick: (m: T) => number): number {
   return samples.reduce((acc, m) => Math.max(acc, pick(m)), 0);
 }
 
+/**
+ * THE SILHOUETTE CONTRACT — does the thing on screen read as a volcano?
+ *
+ * Every criterion in the suite below this one measures **magnitude**: is the
+ * edifice tall, does it have volume, did the ejecta spread, is the centre
+ * higher than the shoulders, did it settle. A player screenshot showed all
+ * thirteen of them passing on an eruption that had built a straight-sided grey
+ * chimney with a magma blob at its foot — because a chimney standing on a skirt
+ * satisfies every one of them. Height it has. Volume it has. Its centre is
+ * certainly higher than its shoulders.
+ *
+ * What none of them measured is **taper**, and taper is the entire difference
+ * between a cone and a tower. Measured in the vent frame, the shipped recipe
+ * held one constant width for eleven consecutive rows of height at due-north:
+ *
+ *   widths t=0..27:  39,38,37,35,33,32,31,29,27,25,23,20,18,17,
+ *                    16,16,16,16,16,16,16,16,16,16,16,16,12,3
+ *                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ vertical wall
+ *
+ * The tell is that the flat width equals the effusive phase's outlet corridor:
+ * the chimney *is* the corridor, extruded upward. Lava emerging at a narrow
+ * summit is fully exposed, cools past its yield threshold within a couple of
+ * frames, and freezes where it lands — so every parcel stacks on the last
+ * instead of running down the flank. Tephra does not do this; it is granular
+ * and finds its angle of repose, which is why the lower skirt tapers correctly
+ * while the lava-built upper section does not.
+ *
+ * This suite fails on that shape. It is deliberately placed first in the file.
+ */
 describe('god-game volcano acceptance (brief §8.2 recipe)', () => {
   // metrics[angleIdx] = the checkpoint series for that vent angle.
   const runs: VolcanoMetrics[][] = ANGLES.map(() => []);
@@ -439,4 +508,71 @@ describe('god-game volcano acceptance (brief §8.2 recipe)', () => {
     for (let f = 1; f <= 600; f++) { va.step(f); vb.step(f); a.update(); b.update(); }
     expect(Array.from(a.grid)).toEqual(Array.from(b.grid));
   }, 60_000);
+});
+
+
+describe('god-game volcano SILHOUETTE (does it read as a volcano?)', () => {
+  /** The vent-frame config the shape metric measures in. */
+  const shapeCfg = (angle: number): VolcanoConfig => ({
+    centerX: CX, centerY: CY, planetRadius: R, ventAngle: angle,
+    conduitHalfWidth: 1, chamberRadius: CHAMBER_R, chamberDepth: CHAMBER_DEPTH,
+    surfaceScanLimit: 90,
+  });
+
+  /** Run the shipped recipe to completion at one vent angle. */
+  function eruptAt(angle: number): PixelEngine {
+    const engine = buildWorld();
+    const ctl = createVolcanoController(engine, angle);
+    for (let f = 0; f < FRAMES; f++) { ctl.step(f); engine.update(); }
+    return engine;
+  }
+
+  const shapes = new Map<number, VolcanoShape>();
+  beforeAll(() => {
+    for (const a of ANGLES) {
+      shapes.set(a, measureVolcanoShape(eruptAt(a), shapeCfg(a)));
+    }
+  }, 600_000);
+
+  const NAMES = new Map(ANGLES.map((a, i) => [a, ['N', 'E', 'S', 'W', 'NW'][i]]));
+
+  for (const angle of ANGLES) {
+    const name = NAMES.get(angle)!;
+
+    it(`${name}: the flank tapers — no vertical wall`, () => {
+      const s = shapes.get(angle)!;
+      // THE criterion. A cone loses width on essentially every row; a chimney
+      // cannot. The library's own volcano reports 0-1 here at every angle and
+      // both planet scales, so 3 leaves a wide margin for grid quantisation.
+      expect(s.maxFlatRun, `widths: ${s.widths.slice(0, s.height + 2).join(',')}\n${renderShape(s)}`)
+        .toBeLessThanOrEqual(3);
+    });
+
+    it(`${name}: the flank is shallow enough to stand up on its own`, () => {
+      const s = shapes.get(angle)!;
+      // height/base is the flank angle in disguise. Tephra's angle of repose is
+      // ~33 degrees (0.32); 0.55 is ~48 and already generous.
+      expect(s.aspect, `H=${s.height} base=${s.baseWidth}\n${renderShape(s)}`)
+        .toBeLessThanOrEqual(0.55);
+    });
+
+    it(`${name}: nothing overhangs or perches`, () => {
+      const s = shapes.get(angle)!;
+      expect(s.maxBulge, `widths: ${s.widths.slice(0, s.height + 2).join(',')}`).toBeLessThanOrEqual(3);
+      expect(s.detachedCells, 'edifice cells floating free of the planet').toBe(0);
+    });
+
+    it(`${name}: it is a volcano at all — real height on a real footprint`, () => {
+      const s = shapes.get(angle)!;
+      expect(s.height).toBeGreaterThanOrEqual(8);
+      expect(s.baseWidth).toBeGreaterThanOrEqual(20);
+    });
+
+    it(`${name}: full silhouette contract`, () => {
+      // The composite assertion, with the diagnostic dump the individual
+      // criteria above omit. This is the one to read when something breaks.
+      const engine = eruptAt(angle);
+      expect(() => assertVolcanoShape(engine, shapeCfg(angle), `vent ${name}`)).not.toThrow();
+    }, 300_000);
+  }
 });

@@ -1,6 +1,6 @@
 {
   "name": "aicraft-pixel-engine",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "description": "Pixel-based falling-sand cellular-automaton physics engine for AI Craft games. Zero runtime dependencies.",
   "license": "MIT",
@@ -20,7 +20,10 @@
     "pixel",
     "simulation",
     "game",
-    "deterministic"
+    "deterministic",
+    "volcano",
+    "terrain",
+    "godgame"
   ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -43,10 +46,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc --noEmit",
-    "build:dist": "tsc -p tsconfig.build.json",
-    "prepack": "npm run build:dist",
-    "prepublishOnly": "npm run build && npm test",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "showcase:dev": "vite --config showcase/vite.config.ts",
@@ -55,7 +56,11 @@
     "showcase:test": "vitest run --config showcase/vitest.config.ts",
     "showcase:test:watch": "vitest --config showcase/vitest.config.ts",
     "showcase:test:scenario": "vitest run --config showcase/vitest.scenario.config.ts",
-    "showcase:test:all": "npm run showcase:test && npm run showcase:test:scenario"
+    "showcase:test:all": "npm run showcase:test && npm run showcase:test:scenario",
+    "verify": "npm run typecheck && npm run showcase:typecheck && npm test && npm run showcase:test",
+    "verify:full": "npm run verify && npm run showcase:test:scenario",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run verify"
   },
   "devDependencies": {
     "tsx": "4.23.1",

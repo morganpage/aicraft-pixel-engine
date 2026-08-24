@@ -514,11 +514,32 @@ Seven measured facts the recipe must respect:
    (`speed = √(2·surplus)·efficiency`). A head budget sized for one launch
    throttles the jet to ~1 parcel/frame however high `rate` is set.
 
+8. **The fountain builds the cone; the effusion only adds rock to it.** Tephra
+   is granular — it lands, tumbles, and finds its angle of repose, so every
+   fountain parcel widens the footprint. Frozen lava sets where it stops. Run
+   the fountain long (500 frames) or the base is still narrow when the effusion
+   takes over, and the finished edifice stands at a ~48° flank.
+
+9. **Effusion delivers ONE parcel per frame.** This single number decides
+   whether you get a volcano or a mesa, and it is the defect a player
+   screenshotted: a straight-sided chimney with a magma blob at its foot.
+   A lava pool levels to an equipotential, which on a radial-gravity planet is
+   a spherical shell — a **flat top**. Whether the summit ponds or drains is a
+   race between delivery rate and how fast a flow runs down the flank and
+   stiffens. At 3 parcels/frame the summit is refilled faster than it drains,
+   never falls below the hot end of `LAVA.yieldThicknessCurve` (0.85, where the
+   yield gate is off entirely), spreads into a shell, and freezes as a slab —
+   measured at a constant 74 cells wide for fifteen consecutive rows of height.
+   At 1 parcel/frame each parcel runs downslope and chills before the next
+   arrives. Measured across five vent angles, the longest non-tapering run
+   falls from **13 rows to 1**.
+
 The shape that passes all criteria is a two-phase eruption:
 
 ```ts
 const CHAMBER_R = 18, CHAMBER_DEPTH = 34, CONE_TARGET = 24, PARCELS = 3, SURPLUS = 80;
-const FOUNTAIN_FRAMES = 300, EFFUSION_FRAMES = 500;
+// Fountain long (it shapes the cone); effusion slow (it must not pond).
+const FOUNTAIN_FRAMES = 500, EFFUSION_FRAMES = 500, EFFUSION_PARCELS = 1;
 
 // --- open: stamp the heated body (chamber + conduit, NO carved mouth) ---
 const ux = Math.cos(angle), uy = Math.sin(angle);
@@ -554,7 +575,8 @@ const fountainId = engine.addPressureSource({
 // Phase 2 — EFFUSION (after FOUNTAIN_FRAMES or the fountain height cap):
 // remove the fountain source, add the same-source extruder with
 //   outletVelocityEfficiency: 0        // surplus stays head: extrude, don't launch
-//   pressureRate/maxPressure: ascent * PARCELS + 12
+//   rate / maxDischargePerFrame: EFFUSION_PARCELS   // ONE. see fact 9 — 3 ponds
+//   pressureRate/maxPressure: ascent * EFFUSION_PARCELS + 12
 //   ventAnchor corridorRadius: 6       // exits at the shoulders, not just the summit
 // The corridor tracks cone growth (axis to any height), so flows spill down
 // the flanks and freeze into new rock. End it at EFFUSION_FRAMES **or its own
@@ -567,16 +589,26 @@ const fountainId = engine.addPressureSource({
 ```
 
 Measured on the published engine, 640×640 temperate world, at all five vent
-angles: fountain discharges ~500 parcels, effusion ~1,000 cells; final cones
-10–30 cells tall, mound-shaped, no spire, all 13 acceptance criteria green.
+angles: final cones 16–27 cells tall on 45–60 cell footprints, height/width
+0.32–0.49 (a 18–26° flank), and the width **decreases on essentially every row
+of height** — longest non-tapering run 1. All acceptance criteria green,
+including the silhouette contract that the earlier 300/3-parcel recipe failed
+at three of five angles.
+
+> **Do not tune the fountain and effusion independently of each other.** They
+> are one balance: the fountain sets the footprint, and the effusion must stay
+> under the drainage rate that footprint's flank can carry. Raise the effusion
+> rate and you get a mesa however good the fountain was.
 
 **Forest** and **Ocean** are one-liners by comparison:
 
 - **Forest.** `setMaterial(x, y, SEED)` is all you need — the seed falls,
-  germinates into a growing tip on contact with `SAND`/`GRASS`, and grows into a
-  tree (trunk → branches → canopy → leaves) with its own genome. `GRASS` placed
-  near water spreads outward on its own to a bounded radius. For a guaranteed
-  instant tree at a spot, use `engine.plant(x, y, TREE_TIP, { energy: 12 })`.
+  germinates into a growing tip on contact with `SAND`/`GRASS`/`TEPHRA` (volcanic
+  ash is fertile once it has cooled), and grows into a tree (trunk → branches →
+  canopy → leaves) with its own genome. `GRASS` placed next to water spreads
+  outward on its own — including across a cone's tephra flanks, so an eruption's
+  scar heals green under a rain cloud. For a guaranteed instant tree at a spot,
+  use `engine.plant(x, y, TREE_TIP, { energy: 12 })`.
 - **Ocean.** `setMaterial(x, y, WATER)` — it flows, levels, and (with heat on)
   freezes near the poles / melts near lava, all natively.
 

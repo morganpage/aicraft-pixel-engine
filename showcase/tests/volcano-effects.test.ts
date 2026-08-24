@@ -2,14 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { PixelEngine } from '../../src/sand';
 import { MaterialType } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
-import { makeRng, stampVolcano, type VolcanoConfig } from '../helpers/volcano';
+import { makeRng, stampVolcano, type VolcanoConfig } from '../../src/volcano';
 import {
   DEFAULT_VOLCANO_CFG as CFG,
   VOLCANO_CX as CX,
   VOLCANO_CY as CY,
   VOLCANO_R as R,
   buildVolcanoPlanet,
-} from '../helpers/volcano-scenario';
+} from '../../src/tests/helpers/volcano-fixtures';
 import {
   createVolcanoEffectsState,
   resetVolcanoEffects,

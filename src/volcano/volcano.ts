@@ -52,8 +52,9 @@
  * split the sections use for `renderer.ts`.
  */
 
-import { type PixelEngine } from '../../src/sand';
-import { MaterialType } from '../../src/materials';
+import { type PixelEngine } from '../sand/index.js';
+import { MaterialType, yieldThicknessAt } from '../materials/index.js';
+import { mulberry32 } from '../rng.js';
 
 /** Geometry of a volcano stamped into a radial-gravity planet. */
 export interface VolcanoConfig {
@@ -197,16 +198,16 @@ export function volcanoGeometryFor(
   };
 }
 
-/** A small deterministic PRNG, kept separate from the engine's own stream. */
-export function makeRng(seed: number): () => number {
-  let s = seed | 0;
-  return () => {
-    s = (s + 0x6d2b79f5) | 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+/**
+ * A deterministic PRNG for the volcano's own decisions, kept separate from the
+ * engine's stream so that jitter, plume scatter, and phase timing do not shift
+ * the draw sequence the simulation depends on.
+ *
+ * Re-exported rather than reimplemented: this used to be a second copy of
+ * mulberry32 sitting a few hundred lines from the engine's, with nothing
+ * checking the two still agreed. See {@link mulberry32}.
+ */
+export const makeRng = mulberry32;
 
 // ---------------------------------------------------------------------------
 // Temperature
@@ -341,40 +342,15 @@ export const VENT_TEMP = 0.95;
  * vent and stacks into a spire. The whole behaviour lives in the *gradient*.
  */
 export function stiffnessForTemp(t: number): number {
-  // A yield thickness of 1 can never be met — a single cell is already one cell
-  // thick — so it means "free to move at any depth", and a flow held there
-  // thins without limit as it spreads: it fans into a half-occupied monolayer
-  // and chills cell-by-cell into a checkerboard of specks across the flank.
-  //
-  // But a *floor* of 2 is the opposite failure, and it is the one that stopped
-  // this volcano having flows at all. Two cells of depth is more than a vent
-  // can deliver onto a slope: everything the effusive phase erupted stalled the
-  // moment it left the crater, ponded there instead, levelled, and froze as a
-  // flat-topped slab across the summit. Nothing ever ran down the cone.
-  //
-  // The resolution is that the fluid window is *narrow and hot*. Only lava
-  // within a few hundredths of vent temperature is free to move at any depth;
-  // by 0.85 it already needs two cells, and it is losing about 0.08 per frame
-  // while exposed. So a flow leaves the vent as a live stream, runs while it is
-  // genuinely molten, and stiffens into the ordinary depth-gated regime within
-  // a handful of cells — a cooling-limited flow with a blunt stalled front,
-  // which is the behaviour the whole yield term exists to produce. It cannot
-  // thin indefinitely, because the temperature that permits it does not last.
-  // The tiers are set against the engine's measured cooling curve rather than
-  // picked by eye. Lava freezes at 0.30 (`LAVA.freezesAt`). A two-cell-thick
-  // flow — the thinnest body that can move at all once it is past the live
-  // window — falls from vent heat to 0.60 in about 14 frames and to 0.30 in
-  // about 36, so tiering the second step at 0.60 buys a tongue roughly a dozen
-  // cells of travel before it stiffens, and the front then stalls well before
-  // the body has set. Tiering it at 0.72, as it was, left only six: every flow
-  // seized within a couple of cells of the crater and the effusive phase read
-  // as a puddle rather than a flow.
-  if (t >= 0.85) return 1; // live: fresh at the vent, free to run
-  if (t >= 0.60) return 2; // mobile
-  if (t >= 0.45) return 3;
-  if (t >= 0.32) return 5; // just above `LAVA.freezesAt` (0.30)
-  return 8; // stiff enough to hold a flow front
+  // Delegates to the material table: `LAVA.yieldThicknessCurve` is the single
+  // definition of this curve, and the movement core reads the same one when a
+  // host has written no explicit override. They used to be two hand-maintained
+  // tier tables — this one, and a bare `yieldThickness: 3` constant in the
+  // material — that disagreed about the cold end by nearly a factor of three.
+  // A host that called this got flows; a host that did not got a chimney.
+  return yieldThicknessAt(MaterialType.LAVA, t);
 }
+
 
 /** Write a cell's yield thickness, allocating the engine's grid on demand. */
 function setStiffness(engine: PixelEngine, x: number, y: number, v: number): void {
@@ -1516,7 +1492,7 @@ export interface VolcanoOptsInputs {
  *
  * This is the single source of truth shared by the browser showcase
  * (`sections/planet.ts`) and the headless test harness
- * (`helpers/volcano-scenario.ts`). The harness passes the production slider
+ * (`src/tests/helpers/volcano-fixtures.ts`). The harness passes the production slider
  * defaults so the golden trajectory tests the volcano users actually run;
  * the showcase passes its live slider values. Keeping both callers on one
  * factory is what prevents the scenario and the shipped behaviour from
@@ -1829,11 +1805,26 @@ export interface VolcanoRuntime {
   capHeight: number;
   /**
    * Optional per-frame instrumentation receiver. When present, each phase of the
-   * step is timed in milliseconds and reported here so the host can attribute
-   * frame cost to the volcano's pre/update/post/heat-sync sub-steps. Left
-   * untouched when absent, so headless callers pay nothing.
+   * step is timed and reported here so the host can attribute frame cost to the
+   * volcano's pre/update/post/heat-sync sub-steps. Left untouched when absent,
+   * so headless callers pay nothing.
+   *
+   * Requires {@link now} — timings without a clock stay zero.
    */
   timings?: VolcanoTimings;
+  /**
+   * The clock instrumentation reads, in milliseconds. **Host-supplied**, and
+   * that is the whole point: this module is part of the deterministic core, so
+   * it may not reach for `performance.now()` or `Date.now()` itself. A browser
+   * host passes `() => clock()`; a headless one passes nothing and
+   * the timing branches never run.
+   *
+   * Reading a wall clock cannot affect the simulation here — every call site is
+   * instrumentation — but the discipline is worth more than the exception. A
+   * module allowed one clock read acquires a second one that does matter, and
+   * the golden trajectories are the thing that would quietly stop being golden.
+   */
+  now?: () => number;
 }
 
 /**
@@ -1857,8 +1848,8 @@ export interface VolcanoTimings {
  * `engine.update()`.
  *
  * This is the **single source of truth** for the per-frame sequence, shared by
- * the browser loop (`sections/planet.ts`) and the headless test harness
- * (`helpers/volcano-scenario.ts`). It reproduces the browser's active/dormant
+ * the browser loop (`showcase/sections/planet.ts`) and the headless test harness
+ * (`src/tests/helpers/volcano-fixtures.ts`). It reproduces the browser's active/dormant
  * transition exactly:
  *
  * - **Active:** `stepVolcanoPre → engine.update() → stepVolcanoPost`, then a
@@ -1888,17 +1879,21 @@ export function stepVolcanoFrame(
   opts: VolcanoStepOptions,
   runtime: VolcanoRuntime,
 ): void {
-  const time = runtime.timings;
-  const tPre = time ? performance.now() : 0;
+  // Instrumentation is live only when the host supplied both a sink and a
+  // clock; otherwise `clock()` is never called and every timing branch folds
+  // away. See VolcanoRuntime.now for why the clock is injected.
+  const time = runtime.now ? runtime.timings : undefined;
+  const clock = runtime.now ?? (() => 0);
+  const tPre = time ? clock() : 0;
   if (runtime.erupting) {
     stepVolcanoPre(engine, cfg, state, rng, opts);
-    if (time) time.preMs = performance.now() - tPre;
-    const tUpd = time ? performance.now() : 0;
+    if (time) time.preMs = clock() - tPre;
+    const tUpd = time ? clock() : 0;
     engine.update();
-    if (time) time.updateMs = performance.now() - tUpd;
-    const tPost = time ? performance.now() : 0;
+    if (time) time.updateMs = clock() - tUpd;
+    const tPost = time ? clock() : 0;
     stepVolcanoPost(engine, cfg, state, rng, opts);
-    if (time) time.postMs = performance.now() - tPost;
+    if (time) time.postMs = clock() - tPost;
     // The eruption cycle runs once: explosive → effusive → repose → done.
     // `phaseFrame === -1` signals completion (set by stepVolcanoPre).
     //
@@ -1943,20 +1938,20 @@ export function stepVolcanoFrame(
         rechargeReservoir(engine, cfg, 'repose');
       }
     }
-    if (time) time.preMs = performance.now() - tPre;
-    const tUpd = time ? performance.now() : 0;
+    if (time) time.preMs = clock() - tPre;
+    const tUpd = time ? clock() : 0;
     engine.update();
-    if (time) time.updateMs = performance.now() - tUpd;
+    if (time) time.updateMs = clock() - tUpd;
   }
   // Every frame, erupting or not: repaint temperature-derived colour/stiffness.
   // Scope the scan to the chunks the heat step just processed: `engine.thermalChunks`
   // holds exactly that set after `update()` returns (see the host contract on
   // syncFromHeat). A settled planet — no thermal chunks active — scans one byte
   // per chunk and no further.
-  const tHeat = time ? performance.now() : 0;
+  const tHeat = time ? clock() : 0;
   syncFromHeat(engine, engine.thermalChunks);
   if (time) {
-    time.heatSyncMs = performance.now() - tHeat;
+    time.heatSyncMs = clock() - tHeat;
     // Dormant frames never call stepVolcanoPost; keep the bucket honest.
     if (!runtime.erupting) time.postMs = 0;
   }

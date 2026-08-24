@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { PixelEngine } from '../sand';
+import {
+  PixelEngine,
+  DEFAULT_VELOCITY_DRAG,
+  VELOCITY_CELL_UNIT,
+  VELOCITY_MAX_STEPS,
+} from '../sand';
 import { MaterialType } from '../materials';
 import { FlatGravity } from '../gravity';
 
@@ -376,5 +381,80 @@ describe('velocity: explosion impulse (Phase 6B)', () => {
     for (let y = 0; y < 11; y++) for (let x = 0; x < 11; x++) e.setMaterial(x, y, MaterialType.ROCK);
     e.explode(5, 5, 4, 7);
     expect(received).toBe(7);
+  });
+});
+
+describe('velocity: drag configuration', () => {
+  it('defaults to DEFAULT_VELOCITY_DRAG', () => {
+    expect(flat(4, 4).velocityDrag).toBe(DEFAULT_VELOCITY_DRAG);
+  });
+
+  it('accepts a custom drag', () => {
+    const e = new PixelEngine({
+      width: 4, height: 4, seed: 1, gravity: new FlatGravity(), velocityDrag: 0.5,
+    });
+    expect(e.velocityDrag).toBe(0.5);
+  });
+
+  it('clamps drag into [0, 1]', () => {
+    // Above 1 the parcel gains energy every frame and the integration diverges;
+    // below 0 it reverses direction every step. Neither is a world anyone means
+    // to ask for, so both are clamped rather than trusted.
+    const fast = new PixelEngine({
+      width: 4, height: 4, seed: 1, gravity: new FlatGravity(), velocityDrag: 4,
+    });
+    expect(fast.velocityDrag).toBe(1);
+    const backwards = new PixelEngine({
+      width: 4, height: 4, seed: 1, gravity: new FlatGravity(), velocityDrag: -2,
+    });
+    expect(backwards.velocityDrag).toBe(0);
+  });
+
+  /**
+   * The regression the Int16 remainders exist for.
+   *
+   * The pass does `rem += v` and then drains whole cells out in units of
+   * VELOCITY_CELL_UNIT, so `|rem|` sits at up to `UNIT - 1` going into the next
+   * frame. With drag 1.0 a parcel holds `|v| = 127`, and `7 + 127 = 134`
+   * overflows an Int8 to -122 — the step count comes out negative, clamps to
+   * -VELOCITY_MAX_STEPS, and the parcel reverses into the blast it came from.
+   *
+   * Launched along -x with no gravity component on that axis, every frame must
+   * move the parcel left or leave it where it is. One step right is the bug.
+   */
+  it('never reverses a parcel at full speed with no drag', () => {
+    const W = 60, H = 9;
+    const e = new PixelEngine({
+      width: W, height: H, seed: 1, gravity: new FlatGravity(), velocityDrag: 1,
+    });
+    for (let x = 0; x < W; x++) e.setMaterial(x, H - 1, MaterialType.WALL);
+    e.setMaterial(W - 2, 1, MaterialType.SAND);
+    // Maximum representable speed, straight along -x.
+    e.setVelocity(W - 2, 1, -127, 0);
+
+    let prevX = W - 2;
+    for (let f = 0; f < 12; f++) {
+      e.update();
+      let x = -1;
+      for (let yy = 0; yy < H - 1 && x < 0; yy++) {
+        for (let xx = 0; xx < W; xx++) {
+          if (e.getMaterial(xx, yy) === MaterialType.SAND) { x = xx; break; }
+        }
+      }
+      if (x < 0) break; // came to rest inside the wall row; nothing left to check
+      expect(x, `frame ${f}: parcel moved right (overflow)`).toBeLessThanOrEqual(prevX);
+      expect(prevX - x, `frame ${f}: exceeded the step cap`)
+        .toBeLessThanOrEqual(VELOCITY_MAX_STEPS);
+      prevX = x;
+    }
+  });
+
+  it('allocates Int16 remainders with room for the peak accumulator', () => {
+    const e = flat(8, 8);
+    e.setVelocity(4, 4, 100, 100);
+    expect(e.velRemX).toBeInstanceOf(Int16Array);
+    expect(e.velRemY).toBeInstanceOf(Int16Array);
+    // 127 (max speed) + UNIT-1 (carried remainder) must be representable.
+    expect(127 + VELOCITY_CELL_UNIT - 1).toBeGreaterThan(127);
   });
 });

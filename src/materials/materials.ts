@@ -290,8 +290,49 @@ export interface MaterialDef {
    * is — was not reachable at any cooling rate.
    *
    * @see PixelEngine.flowThickness for how thickness is measured.
+   * @see yieldThicknessCurve for the temperature-dependent form, which is what
+   *   a melt actually obeys.
    */
   yieldThickness?: number;
+
+  /**
+   * Yield thickness as a function of temperature: `[minTemp, thickness]` tiers,
+   * **hottest first**. The first tier whose `minTemp` the cell meets wins;
+   * below every tier, {@link yieldThickness} applies.
+   *
+   * ## Why a constant is the wrong shape for this
+   *
+   * Yield strength is not a constant of a melt. For lava it climbs by orders of
+   * magnitude over the last couple of hundred degrees before it sets, as
+   * crystals nucleate and lock it up — and everything that makes a flow look
+   * like a flow comes out of that one dependence. Fresh lava at the vent is
+   * nearly fluid and runs downhill; the chilled skin and the flow front stiffen
+   * first, so the front stalls into a blunt snout and the margins set into
+   * levees that channel the still-mobile core behind them; the flow stops at a
+   * finite length set by how far it got before it chilled.
+   *
+   * A single value cannot produce any of that. Held low, lava never stops and
+   * levels into an ocean around the planet; held high, it seizes the instant it
+   * leaves the vent and stacks into a spire.
+   *
+   * ## The spire, specifically
+   *
+   * This field exists because the constant had a silent, ugly failure mode. A
+   * host that enabled heat but never wrote {@link PixelEngine.stiffnessGrid}
+   * got lava pinned at `yieldThickness: 3` — meaning a parcel needed three
+   * cells of depth before it could shear sideways *at all*. On a volcano's
+   * summit no parcel is ever three cells deep, so extruded lava could not move,
+   * froze exactly where it landed, and the next parcel stacked on the last.
+   * The result was a straight-sided chimney precisely as wide as the vent
+   * corridor, which passed every height-and-volume test written for it. See
+   * `showcase/tests/godgame-volcano.scenario.test.ts`.
+   *
+   * The curve is consulted only when {@link PixelEngine.heatGrid} is live and
+   * the cell has no explicit `stiffnessGrid` override, so a host that writes
+   * its own rheology still wins, and a world without heat behaves exactly as
+   * before.
+   */
+  yieldThicknessCurve?: readonly (readonly [minTemp: number, thickness: number])[];
 
   /**
    * Hydraulic head lost per routed cell when this material moves under a
@@ -519,7 +560,23 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   // front once it thins. This is the value for lava with no temperature behind
   // it — a host tracking heat overrides it per cell via `stiffnessGrid`, since
   // the real quantity climbs steeply as the melt cools.
-  [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5, yieldThickness: 3, spawnTemp: 1.0, conductivity: 0.6, emissivity: 0.13, freezesAt: 0.30, freezesInto: MaterialType.ROCK, pressureResistance: 0.15, fragmentsAt: 0.65, fragmentsInto: MaterialType.TEPHRA },
+  // `yieldThicknessCurve` is the load-bearing one; `yieldThickness: 3` is only
+  // the no-heat fallback. The tiers are set against the engine's measured
+  // cooling curve, not picked by eye:
+  //
+  //  - A thickness of 1 can never gate anything — one cell is already one cell
+  //    thick — so the top tier means "free to move at any depth". Only lava
+  //    within ~0.15 of vent temperature gets it, and a cell loses about 0.08
+  //    per frame while exposed, so the live window lasts a couple of frames:
+  //    long enough to leave the vent as a stream, not long enough to thin into
+  //    a monolayer.
+  //  - Lava freezes at 0.30. A two-cell-thick flow falls from vent heat to 0.60
+  //    in ~14 frames and to 0.30 in ~36, so tiering the second step at 0.60
+  //    buys a tongue roughly a dozen cells of travel before it stiffens, and
+  //    the front stalls well before the body has set. At 0.72 — tried — every
+  //    flow seized within a couple of cells of the crater.
+  //  - The cold tier is 8, not 3: stiff enough to hold a flow front.
+  [MaterialType.LAVA]: { id: MaterialType.LAVA, name: 'Lava', color: [255, 80, 0, 255], density: 8, isLiquid: true, isGas: false, flammability: 0, friction: 0.5, yieldThickness: 3, yieldThicknessCurve: [[0.85, 1], [0.60, 2], [0.45, 3], [0.32, 5], [0, 8]], spawnTemp: 1.0, conductivity: 0.6, emissivity: 0.13, freezesAt: 0.30, freezesInto: MaterialType.ROCK, pressureResistance: 0.15, fragmentsAt: 0.65, fragmentsInto: MaterialType.TEPHRA },
   [MaterialType.ROCK]: { id: MaterialType.ROCK, name: 'Rock', color: [80, 80, 80, 255], density: 100, isLiquid: false, isGas: false, flammability: 0, friction: 0.9, isStatic: true, conductivity: 0.2, emissivity: 0.15, pressureStrength: 15 },
   [MaterialType.STEAM]: { id: MaterialType.STEAM, name: 'Steam', color: [200, 200, 200, 150], density: -1, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 0.75, conductivity: 0.4, emissivity: 0.05, freezesAt: 0.20, freezesInto: MaterialType.WATER },
   [MaterialType.FIRE]: { id: MaterialType.FIRE, name: 'Fire', color: [255, 150, 0, 255], density: -2, isLiquid: false, isGas: true, flammability: 0, friction: 0.1, spawnTemp: 1.0, heatSource: true, conductivity: 0.8, emissivity: 0.10 },
@@ -563,7 +620,12 @@ export const Materials: Record<MaterialType, MaterialDef> = {
       into: MaterialType.GRASS,
       needs: [MaterialType.WATER],
       range: 6,
-      intoMaterial: [MaterialType.SAND, MaterialType.EMPTY],
+      // TEPHRA is fertile: volcanic ash weathers into the richest soils, so a
+      // cooled cone's flanks green over like any other ground. The
+      // temperature window keeps fresh, still-hot ejecta sterile — and turns
+      // grass off entirely in frozen worlds.
+      intoMaterial: [MaterialType.SAND, MaterialType.TEPHRA, MaterialType.EMPTY],
+      tempRange: [0.05, 0.65],
       // Upper hemisphere only, so a lawn creeps sideways and up over obstacles
       // instead of tunnelling into the soil, and `needsFooting` keeps it on the
       // surface rather than climbing into the air.
@@ -576,17 +638,21 @@ export const Materials: Record<MaterialType, MaterialDef> = {
 
   // Falls like a powder until it lands on something it can root in, then
   // germinates. Deliberately not static: dispersal is half of what a seed is.
-  // Its density must stay below SAND's 10. At 12 it buried itself inside a
-  // painted soil mound; the new tip was boxed in by sand and terminated as a
-  // five-leaf speck instead of ever producing a trunk. Nine still falls through
-  // water, but comes to rest on the soil surface where a shoot has open space.
+  // Its density must stay below SAND's 10 and at TEPHRA's 7: at 12 it buried
+  // itself inside a painted soil mound, and at 9 it sank out of sight into
+  // loose ash before it could sprout. Seven rests on tephra (equal density
+  // does not displace) and still falls through water, coming to rest on the
+  // soil surface where a shoot has open space.
   [MaterialType.SEED]: {
     id: MaterialType.SEED, name: 'Seed', color: [180, 140, 60, 255],
-    density: 9, isLiquid: false, isGas: false, flammability: 50, friction: 0.6,
+    density: 7, isLiquid: false, isGas: false, flammability: 50, friction: 0.6,
     conductivity: 0.2, emissivity: 0.10,
     growth: {
       kind: 'aggregate',
-      contact: [MaterialType.SAND, MaterialType.GRASS],
+      // TEPHRA counts as soil: volcanic ash is fertile ground, once it has
+      // cooled (see the temperature window).
+      contact: [MaterialType.SAND, MaterialType.GRASS, MaterialType.TEPHRA],
+      tempRange: [0.05, 0.65],
       into: MaterialType.TREE_TIP,
       chance: 0.25,
       // 10, not 26. Energy is the trunk length in cells, and the showcase's
@@ -806,6 +872,37 @@ export const hasPressureStrength: readonly boolean[] = materialDefs.map(
 export const hasFragmentation: readonly boolean[] = materialDefs.map(
   (d) => d.fragmentsAt !== undefined
 );
+
+/**
+ * Whether each material has a {@link MaterialDef.yieldThicknessCurve}, indexed
+ * by id. Asked once per lateral-flow test in the movement core, so it is an
+ * array read rather than a property probe.
+ */
+export const hasYieldCurve: readonly boolean[] = materialDefs.map(
+  (d) => d.yieldThicknessCurve !== undefined
+);
+
+/**
+ * The yield thickness of `mat` at temperature `temp`, in cells.
+ *
+ * The single definition of the rheology curve, shared by the movement core's
+ * flow gate and by any host that wants to write the same values into
+ * {@link PixelEngine.stiffnessGrid} itself. It used to be duplicated: the
+ * engine read a constant while the volcano helper hardcoded an unrelated tier
+ * table, and the two disagreed about the cold end by a factor of nearly three.
+ *
+ * Materials with no curve return their constant {@link MaterialDef.yieldThickness}
+ * (or 0, meaning "no yield gate at all").
+ */
+export function yieldThicknessAt(mat: MaterialType, temp: number): number {
+  const def = materialDefs[mat];
+  const curve = def.yieldThicknessCurve;
+  if (curve === undefined) return def.yieldThickness ?? 0;
+  for (let i = 0; i < curve.length; i++) {
+    if (temp >= curve[i][0]) return curve[i][1];
+  }
+  return def.yieldThickness ?? 0;
+}
 
 /**
  * The set of materials that count as load-bearing terrain solids.

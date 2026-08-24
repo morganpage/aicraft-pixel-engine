@@ -6,16 +6,37 @@ Inspired by Noita / Worms-style destructible-terrain sims. Extracted from the `a
 
 ## What it does
 
-- **Falling-sand simulation.** A typed-array pixel grid (`Uint8Array`) of materials — sand, tephra, water, lava, oil, acid, fire, smoke, steam, gas, rock, wood, ice, walls. Density-driven displacement, granular flow, liquid leveling, gas rising.
+### Simulation core
+
+- **Falling-sand simulation.** A typed-array pixel grid (`Uint8Array`) of 23 materials — sand, tephra, water, lava, oil, acid, fire, smoke, steam, flammable gas, rock, wood, ice, walls, plus the life materials (grass, seed, tree tip, leaf, fern tip, frond, spore, coral). Density-driven displacement, granular flow, liquid leveling, gas rising.
 - **Material interactions.** Lava + water → rock + steam. Acid dissolves solids. Fire spreads via flammability and is extinguished by water. Flammable gas ignites and explodes. Ice melts near heat.
-- **Destructible terrain + explosions.** Carve circles out of walls/rock, scatter colored debris as sand particles, ignite fire/smoke cores.
+- **Destructible terrain + explosions.** Carve circles out of walls/rock, scatter colored debris as ballistic particles, ignite fire/smoke cores.
 - **Pluggable gravity models.** Movement rules ask "which way is down here?" instead of assuming `+Y`.
   - `FlatGravity` (default) — classic top-down gravity, byte-identical to a flat-world sim.
   - `RadialGravity` — gravity toward a single planet center. For **Reus / Godfinger-style circular-planet god games**.
 - **Deterministic.** Seeded mulberry32 RNG; same seed + same inputs → identical grid evolution. Validated by golden tests under both gravity models.
-- **Active-chunk optimization.** Only simulate cells in 32×32 chunks flagged active, with border propagation so flow across chunk edges keeps regions alive.
+
+### Physical systems (all opt-in — a world that never uses one pays nothing)
+
+- **Heat and climate.** Turn on with `enableHeat: true`. Every thermal material conducts to its neighbours, radiates to the environment through exposed faces, and phase-changes: lava → rock, water → steam / ice, steam → water, ice → water. `FIRE` is an infinite heat source; `LAVA` is a finite body that cools. `ambientTemperature` is the climate dial — turn it down and the oceans freeze on their own.
+- **Growth.** Three rule kinds: `spread` (grass/moss — isotropic, moisture-gated, with a travel `range`), `tip` (trees/ferns — a directed, stateful growing point that leaves a trunk and branches behind it), and `aggregate` (seeds germinating, spores accreting onto coral). Growth is gravity-relative, so on a planet a tree grows radially outward. Tips always die, so a forest converges instead of consuming the grid.
+- **Pressure transport.** `addPressureSource` routes a liquid (v1: lava only) through its connected body to a real boundary outlet via a Dijkstra search, accounting for gravitational head and per-material resistance. Blocked sources accrue pressure and can fracture solids. `injectLiquid` is the one-shot version. This is the volcano engine.
+- **Velocity field.** `setVelocity` / `applyImpulse` give a cell a sub-cell velocity that integrates ballistically across frames under gravity and drag. Explosions and pressure outlets use it; hosts can use it for anything.
+- **Fragmentation.** An airborne lava cell that cools past its `fragmentsAt` threshold while still in flight becomes granular `TEPHRA`, which piles at its angle of repose and builds a cone. Grounded cells never fragment — they freeze to `ROCK`.
+- **Yield strength.** Lava is a Bingham plastic: it flows only while thick enough, stopping at a blunt front, which is why it looks like lava and not like orange water. Override per-cell via `engine.stiffnessGrid` as the melt cools.
+
+### Volcano subsystem (`aicraft-pixel-engine` → `src/volcano/`)
+
+- **A complete eruption cycle**, composed from the primitives above rather than bolted on beside them: `stampVolcano` cuts a chamber and conduit into a planet, `stepVolcanoFrame` runs one frame of the explosive → effusive → repose cycle, and the plumbing maintenance (`rechargeReservoir`, `remeltConduit`, `assimilateTephra`) keeps a vent usable between episodes.
+- **Temperature-driven rheology.** `stiffnessForTemp` maps a lava cell's heat onto its yield thickness and `syncFromHeat` writes it back each frame, so a flow runs while molten, stalls into a blunt front as it chills, and sets into rock — the curve that makes lava read as lava.
+- Ash plumes, vent glow, and screen shake are **not** here; they are host-side renderables that never touch the grid, and this library ships no renderer. See `showcase/helpers/volcano-effects.ts` for a worked example.
+
+### Host-facing plumbing
+
+- **Active-chunk optimization.** Only simulate cells in 32×32 chunks flagged active, with border propagation so flow across chunk edges keeps regions alive. The heat field keeps its own independent chunk set, so a motionless flow still cools.
 - **Render-dirty tracking.** Consumers ask `consumeRenderDirtyChunks()` to know which regions of the grid changed since the last frame.
-- **Settle detection.** Turn-based games can `beginSettle()` and wait until the grid calms (or times out).
+- **Settle detection.** Turn-based games can `beginSettle()` and wait until the grid calms (or times out). Tunable per-engine via `settleStableThreshold` / `settleTimeoutFrames` / `settleSwapThreshold`.
+- **Bulk stamping.** `beginBulk()` / `endBulk()` skip per-cell bookkeeping while building a large world; `stampDisc()` is the brush primitive for everything smaller.
 
 ## What it does NOT do (v1)
 
@@ -55,6 +76,12 @@ npm install aicraft-pixel-engine
 ```ts
 import { PixelEngine, FlatGravity } from 'aicraft-pixel-engine';
 ```
+
+**ESM only.** The package is `"type": "module"` and its `exports` map publishes
+no `require` condition, so `require('aicraft-pixel-engine')` fails with
+`ERR_REQUIRE_ESM` on Node. Use `import`, or `await import()` from CommonJS.
+Only the package root (`.`) is exported — deep subpaths like
+`aicraft-pixel-engine/src/sand` are not part of the public surface.
 
 ## Quick start
 
@@ -107,11 +134,23 @@ src/
 ├── materials/   # MaterialType enum + MaterialDef table (pure data)
 ├── gravity/     # GravityModel seam: FlatGravity (default), RadialGravity (planets)
 ├── sand/        # PixelEngine core + neighbor frame (the gravity-relative movement seam)
+├── volcano/     # Opt-in subsystem: eruption cycle composed from the core's primitives
+├── rng.ts       # mulberry32, shared by the engine stream and host side-streams
 ├── index.ts     # top-level barrel
-└── tests/       # vitest suites
+└── tests/       # vitest suites (+ tests/helpers/ fixtures, never shipped)
 ```
 
+`volcano/` is the one **subsystem** rather than a core module: nothing in
+`sand/`, `materials/`, or `gravity/` imports it, so a world that never builds a
+volcano never loads it. It composes pressure sources, the heat field,
+fragmentation, `stiffnessGrid`, and the velocity field into an eruption that
+ascends a conduit, fountains ballistically, and stacks a cone that stops
+growing — the arrangement that is hard to rediscover from the primitives.
+
 **Layer discipline** (mirrors `aicraft-engine`): the entire v1 library is the *deterministic core* — pure functions, no DOM, no `Math.random`, no `Date.now`, no side effects. This keeps it fast to test in Node and safe to run headless or in a worker.
+
+End-to-end wiring — install options, the render loop, input handling, and the
+per-system recipes — is in [`docs/integration.md`](./docs/integration.md).
 
 ## Game prompts
 

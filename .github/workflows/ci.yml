@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same ref makes the in-flight run irrelevant. The scenario
+# job is the long pole, so cancelling it back is worth real minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The fast gate: both typechecks and both fast suites, in the order that
+  # fails soonest. Everything here finishes in well under a minute.
+  verify:
+    name: Typecheck + fast tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+
+  # The slow gate, split out so a broken typecheck reports in seconds rather
+  # than waiting behind ~2.5 minutes of full-planet eruptions.
+  scenario:
+    name: Scenario suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run showcase:test:scenario
+
+  # Proves the published artifact actually emits. `npm run build` is the only
+  # script that writes dist/, and nothing else in CI would notice it breaking.
+  package:
+    name: Build dist + pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack --dry-run
+      - name: Showcase production build
+        run: npm run showcase:build

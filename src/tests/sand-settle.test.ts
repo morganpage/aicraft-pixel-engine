@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { PixelEngine, SETTLE_STABLE_THRESHOLD, SETTLE_TIMEOUT_FRAMES } from '../sand';
+import {
+  PixelEngine,
+  SETTLE_STABLE_THRESHOLD,
+  SETTLE_TIMEOUT_FRAMES,
+  SETTLE_SWAP_THRESHOLD,
+} from '../sand';
 import { MaterialType } from '../materials';
 import { FlatGravity } from '../gravity';
 
@@ -53,5 +58,76 @@ describe('settle detection', () => {
     expect(e.settleFrameCount).toBe(1);
     e.update();
     expect(e.settleFrameCount).toBe(2);
+  });
+
+  /**
+   * The completion reason is recorded, not re-derived.
+   *
+   * `settleTimedOut` used to return `settled && frameCount >= TIMEOUT`. The two
+   * completion conditions are checked with `||`, so a world that goes quiet on
+   * exactly the timeout frame satisfies both — and the derived form reported
+   * the quiet world as having given up. Here the timeout is tuned so natural
+   * stability lands precisely on it.
+   */
+  it('reports natural stability, not timeout, when both land on the same frame', () => {
+    const e = new PixelEngine({
+      width: 8, height: 8, seed: 1, gravity: new FlatGravity(),
+      // An empty grid is quiet from frame 1, so stability completes on frame
+      // `settleStableThreshold`. Setting the timeout to the same number makes
+      // both conditions true on that frame.
+      settleStableThreshold: 4,
+      settleTimeoutFrames: 4,
+    });
+    e.beginSettle();
+    while (e.isSettling) e.update();
+    expect(e.settleFrameCount).toBe(4);
+    expect(e.isSettled).toBe(true);
+    expect(e.settleTimedOut).toBe(false);
+  });
+
+  it('reports a timeout when the grid never goes quiet', () => {
+    const e = new PixelEngine({
+      width: 32, height: 32, seed: 1, gravity: new FlatGravity(),
+      settleTimeoutFrames: 12,
+      // Nothing counts as quiet, so only the timeout can complete the settle.
+      settleSwapThreshold: 0,
+      settleStableThreshold: 4,
+    });
+    e.beginSettle();
+    while (e.isSettling) e.update();
+    expect(e.settleFrameCount).toBe(12);
+    expect(e.isSettled).toBe(true);
+    expect(e.settleTimedOut).toBe(true);
+  });
+
+  it('beginSettle clears a previous run\'s timeout flag', () => {
+    const e = new PixelEngine({
+      width: 8, height: 8, seed: 1, gravity: new FlatGravity(),
+      settleTimeoutFrames: 2, settleSwapThreshold: 0, settleStableThreshold: 4,
+    });
+    e.beginSettle();
+    while (e.isSettling) e.update();
+    expect(e.settleTimedOut).toBe(true);
+    e.beginSettle();
+    expect(e.settleTimedOut).toBe(false);
+  });
+
+  it('defaults the settle knobs to the exported constants', () => {
+    const e = new PixelEngine({ width: 4, height: 4, seed: 1, gravity: new FlatGravity() });
+    expect(e.settleStableThreshold).toBe(SETTLE_STABLE_THRESHOLD);
+    expect(e.settleTimeoutFrames).toBe(SETTLE_TIMEOUT_FRAMES);
+    expect(e.settleSwapThreshold).toBe(SETTLE_SWAP_THRESHOLD);
+  });
+
+  it('scales the settle window for a large world', () => {
+    // The point of the options: a big planet is still shuffling a few cells
+    // long after a sandbox has gone quiet, and 600 frames is not always enough.
+    const e = new PixelEngine({
+      width: 4, height: 4, seed: 1, gravity: new FlatGravity(),
+      settleTimeoutFrames: 5000, settleStableThreshold: 40, settleSwapThreshold: 24,
+    });
+    expect(e.settleTimeoutFrames).toBe(5000);
+    expect(e.settleStableThreshold).toBe(40);
+    expect(e.settleSwapThreshold).toBe(24);
   });
 });

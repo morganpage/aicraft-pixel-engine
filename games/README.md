@@ -13,6 +13,21 @@ package.json) — and every import it claims compiles against the published
 `0.1.2` surface. The brief was validated end-to-end by building the game from
 it against the npm package and testing every power in a browser.
 
+> **Pin status.** The brief deliberately still says `0.1.2`, which is what is on
+> npm today. `0.2.0` is prepared in [CHANGELOG.md](../CHANGELOG.md) but
+> unpublished, and re-pinning a brief to a version an agent cannot install would
+> break every build made from it. When `0.2.0` ships, two parts of §8.2 collapse:
+>
+> - the hand-rolled bounds-checked disc loops become `engine.stampDisc(...)`;
+> - the hand-rolled magma chamber + conduit + two-phase eruption recipe — the
+>   part currently written out as prose and kept in sync with
+>   `showcase/tests/godgame-volcano.scenario.test.ts` by hand — becomes
+>   `stampVolcano` + `createVolcanoState` + `stepVolcanoFrame` from the engine's
+>   own `volcano` subsystem, which is now library code with its own tests.
+>
+> That is the whole reason the subsystem moved out of the showcase: a recipe a
+> brief has to *describe* is a recipe that drifts.
+
 For a maximum-quality run, [god-game-gauntlet-prompt.txt](./god-game-gauntlet-prompt.txt)
 is a launcher prompt: it points the agent at the hosted brief and adds a
 sub-agent fan-out loop with a harsh visual critic that keeps iterating until
@@ -128,6 +143,12 @@ use):
 - **Deterministic** — seeded RNG (`engine.random()`, never `Math.random()`).
   Same seed + same inputs → identical evolution.
 - **Active-chunk optimization** — only 32×32 chunks with activity are simulated.
+- **Volcano subsystem** (`0.2.0`+) — the eruption cycle itself, composed from
+  the primitives above: `stampVolcano` cuts a chamber and conduit,
+  `stepVolcanoFrame` runs one frame of explosive → effusive → repose, and
+  `syncFromHeat` maps each lava cell's temperature onto its yield thickness so
+  a flow runs while molten and stalls into a blunt front as it chills. Lives at
+  `src/volcano/`; nothing in the core imports it.
 
 ## Reference — engine limits (the boundaries of the sandbox)
 
@@ -139,4 +160,7 @@ use):
 - **No buoyancy for gases.** Gases rise away from gravity and exit the grid —
   hence clouds must be host-tracked, not a gas material. (Steam is the
   exception: it rises, cools, and condenses back to water natively.)
-- **No rendering.** You draw every pixel.
+- **No rendering.** You draw every pixel. This is also why ash plumes, vent
+  glow, and screen shake are *not* in the volcano subsystem — they are
+  renderable entities, and the engine ships no renderer. See
+  `showcase/helpers/volcano-effects.ts` for a worked host-side implementation.

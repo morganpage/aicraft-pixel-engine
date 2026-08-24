@@ -111,6 +111,29 @@ describe('materials table', () => {
     }
   });
 
+  /**
+   * The invariant every hot loop in the engine rests on.
+   *
+   * `materialDefs` is built as `Object.values(Materials).sort(by id)`, so
+   * `materialDefs[i] === Materials[i]` only holds while the ids are contiguous
+   * from 0 with no gaps. The engine indexes it by raw material id straight out
+   * of the `Uint8Array` grid — `materialDefs[mat].density`, `.isLiquid`,
+   * `.flammability` — thousands of times a frame, with no bounds or identity
+   * check anywhere.
+   *
+   * Reserve a gap in the enum (say, jumping 22 -> 30 to leave room for a future
+   * family) and every material above the gap silently resolves to the wrong
+   * definition: sand reads as water, rock reads as steam. Nothing throws. This
+   * test is the thing that fails instead.
+   */
+  it('materialDefs is indexable by material id (no gaps in the enum)', () => {
+    expect(materialDefs).toHaveLength(IDS.length);
+    for (let i = 0; i < materialDefs.length; i++) {
+      expect(materialDefs[i].id, `materialDefs[${i}].id`).toBe(i);
+      expect(materialDefs[i]).toBe(Materials[i as MaterialType]);
+    }
+  });
+
   it('colors are 4-tuples [r,g,b,a]', () => {
     for (const d of materialDefs) {
       expect(d.color).toHaveLength(4);

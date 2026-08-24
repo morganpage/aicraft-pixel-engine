@@ -35,7 +35,7 @@ import {
   type VolcanoStepOptions,
   type VolcanoRuntime,
   type VolcanoTimings,
-} from '../helpers/volcano';
+} from '../../src/volcano';
 import {
   placeCloud,
   stepCloud,
@@ -1152,7 +1152,13 @@ export function initPlanet(container: HTMLElement): void {
     const effectMode: VolcanoEffectMode = erupting ? volcanoState.phase : stoppedEffectMode;
     // Reset the per-frame volcano sub-step buckets; stepVolcanoFrame fills them.
     volcanoTimings.preMs = volcanoTimings.updateMs = volcanoTimings.postMs = volcanoTimings.heatSyncMs = 0;
-    const runtime: VolcanoRuntime = { erupting, capHeight, timings: volcanoTimings };
+    // The clock is injected: `src/volcano` is part of the deterministic core
+    // and does not read a wall clock itself. The browser host has one, so the
+    // perf readout below gets real numbers; the headless harness passes none
+    // and the timing branches never run.
+    const runtime: VolcanoRuntime = {
+      erupting, capHeight, timings: volcanoTimings, now: () => performance.now(),
+    };
     stepVolcanoFrame(engine, volcanoCfg, volcanoState, volcanoRng, volcanoOpts(), runtime);
     if (erupting && !runtime.erupting) {
       // The controller just completed the eruption. goDormant handles the

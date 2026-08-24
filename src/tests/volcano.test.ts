@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { PixelEngine } from '../../src/sand';
-import { MaterialType, Materials } from '../../src/materials';
-import { RadialGravity, FlatGravity } from '../../src/gravity';
+import { PixelEngine } from '../sand';
+import { MaterialType, Materials } from '../materials';
+import { RadialGravity, FlatGravity } from '../gravity';
 import {
   stampVolcano,
   syncFromHeat,
@@ -19,7 +19,7 @@ import {
   TEMP_STEPS,
   TEPHRA_RAMP,
   TEPHRA_STEPS,
-} from '../helpers/volcano';
+} from '../volcano';
 import {
   DEFAULT_VOLCANO_CFG as CFG,
   VOLCANO_SIZE as SIZE,
@@ -28,7 +28,7 @@ import {
   VOLCANO_R as R,
   buildVolcanoPlanet,
   countMaterial,
-} from '../helpers/volcano-scenario';
+} from './helpers/volcano-fixtures';
 
 /**
  * Fast volcano contracts.

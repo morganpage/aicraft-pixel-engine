@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { PixelEngine } from '../../src/sand';
 import { MaterialType } from '../../src/materials';
 import { RadialGravity } from '../../src/gravity';
-import { makeRng } from '../helpers/volcano';
+import { makeRng } from '../../src/volcano';
 import {
   placeCloud,
   stepCloud,

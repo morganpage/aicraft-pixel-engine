@@ -7,6 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **The volcano silhouette contract** — `measureVolcanoShape` /
+  `assertVolcanoShape` (`src/tests/helpers/volcano-fixtures.ts`), with
+  `src/tests/volcano-shape.test.ts` guarding the library subsystem and a new
+  suite guarding the god-game recipe.
+
+  Every volcano assertion in this repo measured **magnitude**: height, volume,
+  ejecta spread, new rock, centre-above-shoulders, does it settle. A player
+  screenshot showed all thirteen passing on a straight-sided grey chimney with
+  a magma blob at its foot — because a chimney standing on a skirt satisfies
+  every one of them. It is tall. It has volume. Its centre is above its
+  shoulders. What nothing measured is **taper**.
+
+  The metric works in the vent frame — height above the surface against tangent
+  offset — and reports the longest run of rows over which the width fails to
+  decrease. A cone loses width on essentially every row and scores 0-1. The
+  shipped recipe scored **11, 11 and 6 at three of five vent angles**; at due
+  north it held a constant width of 16 for eleven consecutive rows. It also
+  catches overhangs (a bulb re-widens, which no granular pile does), flanks too
+  steep to stand, and material floating free of the planet.
+
+  The metric is itself calibrated against synthetic edifices whose answer is
+  known by construction — cone passes; chimney, mesa, bulb-on-a-stalk and
+  needle each fail with the specific diagnosis. A shape test nobody has
+  calibrated is a shape test that quietly passes everything.
+
+- **`MaterialDef.yieldThicknessCurve`** — yield thickness as a function of
+  temperature, `[minTemp, thickness]` tiers. Consulted by the movement core
+  when the heat field is live and the cell has no explicit `stiffnessGrid`
+  override, so a host that writes its own rheology still wins and a world
+  without heat is untouched. `LAVA` declares the curve.
+
+  This closes a silent footgun. Yield strength is not a constant of a melt —
+  for lava it climbs by orders of magnitude as it crystallizes, and that one
+  dependence is what makes a flow blunt-fronted, levee-bounded and
+  finite-length. The engine shipped a bare `yieldThickness: 3` and *documented*
+  that hosts should write `stiffnessGrid` from temperature, but a host that
+  did not got lava needing three cells of depth before it could shear sideways
+  at all. On a volcano summit no parcel is ever three cells deep, so extruded
+  lava could not move, froze where it landed, and the next parcel stacked on
+  the last. `stiffnessForTemp` in the volcano subsystem now delegates to the
+  material curve, so the two tier tables that used to disagree about the cold
+  end by a factor of nearly three are one table.
+
+### Fixed
+- **The god-game volcano built a chimney instead of a cone** at three of five
+  vent angles. Two causes, both now measured rather than guessed:
+
+  - **Effusion delivery rate.** A lava pool levels to an equipotential, which
+    on a radial-gravity planet is a spherical shell — a **flat top**. Whether
+    a summit ponds or drains is a race between delivery rate and how fast a
+    flow runs down the flank and stiffens. At 3 parcels/frame the summit was
+    refilled faster than it drained, never fell below the hot end of the yield
+    curve (0.85, where the gate is off entirely), and froze as a slab: width
+    pinned at 74 cells for fifteen consecutive rows. Isolated by running each
+    phase alone — fountain-only scored 1, effusion-only scored 14. Now 1
+    parcel/frame, which drops the worst non-tapering run from 13 rows to 1.
+  - **Fountain duration.** Tephra is granular and finds its angle of repose, so
+    the fountain is the phase that builds a *cone*; frozen lava sets where it
+    stops, so the effusion only adds rock to one. At 300 frames the footprint
+    was still narrow when the effusion took over and the edifice stood at a
+    0.57 height/width ratio — a ~48-degree flank. 500 frames brings it to 0.48
+    at the same 24-cell target height.
+
+  Final cones across all five vent angles: 16-27 cells tall on 45-60 cell
+  footprints, height/width 0.32-0.49, longest non-tapering run 1. The brief
+  (`games/god-game.md` §8.2) carries both numbers and the reasoning.
+
+### Added
+- **Volcanic ash is fertile.** `TEPHRA` now counts as soil for both life
+  rules: grass creeps onto a cooled cone's flanks (`GRASS.growth.intoMaterial`)
+  and seeds germinate on it (`SEED.growth.contact`), so an eruption's scar
+  greens over by the same primary succession it would in nature — a rain cloud
+  over fresh ash becomes a meadow. Both rules gained `tempRange: [0.05, 0.65]`
+  (the gate existed in the growth pass; this is its first use): still-hot
+  ejecta stays sterile, and frozen worlds grow nothing. Seeds also dropped
+  from density 9 to 7 — at 9 they sank out of sight into loose ash (density 7)
+  before they could sprout; at 7 they rest on tephra and still fall through
+  water. Five tests in `src/tests/tephra-fertility.test.ts`.
+
+## [0.2.0] — 2026-08-24
+
+### Added
+- **The volcano subsystem is now part of the library** (`src/volcano/`, exported
+  from the package root). It was `showcase/helpers/volcano.ts` — demo code by
+  location, general-purpose by content: ~2,000 lines composing pressure
+  sources, the heat field, fragmentation, `stiffnessGrid` and the velocity
+  field into an eruption that ascends a conduit, fountains ballistically,
+  fragments into tephra, and stacks a cone that stops growing. Three things
+  were wrong with that address. It carried **its own copy of the engine's
+  mulberry32**, with nothing checking the two still agreed. The engine
+  documented `stiffnessGrid` as "a host that tracks temperature writes it
+  here" while the only such host was unpublished. And the god-game brief had to
+  encode the whole eruption recipe **as prose**, manually kept in sync with a
+  test that re-derived it by hand. Public surface: `stampVolcano`,
+  `stepVolcanoFrame` / `stepVolcanoPre` / `stepVolcanoPost`,
+  `createVolcanoState`, `buildVolcanoOpts`, `syncFromHeat`, `stiffnessForTemp`,
+  `rechargeReservoir`, `remeltConduit`, `assimilateTephra`, `emitPlume`,
+  `erupt`, the geometry helpers, and the incandescence/tephra palettes.
+  Nothing in `sand/`, `materials/` or `gravity/` imports it, so a world that
+  never builds a volcano never loads it.
+- **`src/rng.ts` — `mulberry32`, `mulberry32Next`, `mulberry32Value`.** One
+  implementation of the generator, now used by both `PixelEngine.random()`
+  (which keeps its state as an inspectable field, for a future mid-stream
+  save/resume) and by host side-streams like the volcano's, which want the
+  closure form. `makeRng` is an alias of `mulberry32`, kept for the volcano's
+  callers.
+- **Settle detection is tunable per-engine**: `settleStableThreshold`,
+  `settleTimeoutFrames`, and `settleSwapThreshold` options, with
+  `SETTLE_SWAP_THRESHOLD` exported alongside the two existing constants. A
+  1000×1000 planet takes proportionally longer to quiet down than a 200×150
+  sandbox, and the swap threshold — previously a bare `5` in the middle of
+  `update()` — scales with a world's residual churn.
+- **`velocityDrag` option**, clamped to `[0, 1]`. `DEFAULT_VELOCITY_DRAG` was
+  already exported, implying tunability the constructor did not offer.
+- **`DEFAULT_GROWTH_INTERVAL` and `DEFAULT_LIQUID_DISPERSION` are exported.**
+  Both were referenced from public JSDoc `{@link}`s that consumers could not
+  resolve, because the symbols were module-private.
+- **`VELOCITY_MAX_STEPS` and `VELOCITY_REMAINDER_HEADROOM` are exported**, the
+  latter documenting the arithmetic that forces the remainder accumulators to
+  be 16-bit.
+- **CI** (`.github/workflows/ci.yml`) and an `npm run verify` gate: both
+  typechecks and both fast suites, in fail-soonest order. A separate job runs
+  the scenario suite, and a third builds `dist/`, packs, and builds the
+  showcase — so the published artifact is proven to emit. Nothing enforced any
+  of this before; the working tree had a red `showcase:typecheck` while every
+  test suite was green.
+- **A `materialDefs` contiguity test.** Every hot loop indexes `materialDefs`
+  by raw material id, which only resolves correctly while the `MaterialType`
+  ids are gapless from 0. Reserve a gap and sand would silently read as water,
+  with nothing thrown. The test fails instead.
 - **The god-game volcano acceptance scenario** (`showcase/tests/godgame-volcano.scenario.test.ts`,
   runs with `showcase:test:scenario`). Defines a good volcano as nine measurable
   criteria — buried magma chamber, sustained vent activity, ballistic ejecta,
@@ -46,6 +176,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   paint-style host was re-writing the same bounds-checked disc loop by hand.
   For a large one-off world stamp, `beginBulk()`/`setMaterial`/`endBulk()`
   remains the fast path.
+
+### Fixed
+- **`explode()` with a zero or negative radius.** `falloff = 1 - dist/radius`
+  is `NaN` at radius 0, so every threshold test read false: solids at the
+  centre survived while non-solids were deleted *and* scattered as debris, and
+  a 3-cell fire core spawned regardless because its radius has a floor. A
+  negative radius skipped the carve loop and still lit the core. Now a no-op.
+- **`settleTimedOut` reported a false timeout.** It re-derived the reason as
+  `settled && frameCount >= TIMEOUT`, but the two completion conditions are
+  checked with `||` — so a world reaching natural stability on exactly the
+  timeout frame satisfied both and was reported as having given up. The reason
+  is now recorded at completion, and natural stability wins the tie.
+- **The velocity remainder accumulators are `Int16Array`, not `Int8Array`.**
+  The pass does `rem += v` and drains whole cells out, leaving `|rem| ≤ 7`; at
+  `|v| = 127` that peaks at 134, which does not fit in an Int8. The wrap is a
+  **sign flip**, not a rounding error: 134 stores as −122, the step count comes
+  out −15, clamps to −4, and the parcel flies backwards out of the explosion
+  that launched it. Safety previously rested entirely on the drag constant
+  (`trunc(127 × 0.92) = 116`, so `7 + 116 = 123` squeaked under) — an invariant
+  resting on a tuning value the new `velocityDrag` option now invites hosts to
+  change. Regression-tested at `velocityDrag: 1`.
+- **`liquidDispersion`'s documented default was wrong** — the JSDoc said 32,
+  the constant is 16, and the constant's own note argues *for* 16 over 32 on
+  radial gravity.
+- **`runVelocityStep`'s ordering rationale was backwards**, claiming the pass
+  runs before `clearUpdatedInActiveChunks` when that is `update()`'s first
+  statement. The real reason (stale flags in chunks that were not active) was
+  already documented correctly a few lines below.
+
+### Removed
+- **An empty `if` block on every `setMaterial` call** — two `Set` lookups per
+  call in the library's hottest write path, guarding a body that did nothing.
+  The intent it recorded (a terrain-dirty flag for a future rigid-body layer)
+  is now a comment, which records it just as well for free.
+- **`void probe;` in `runVelocityStep`** — a binding held solely so a `void`
+  statement could silence `noUnusedLocals`.
+- **`flowRun`'s `ddx`/`ddy` parameters**, unconditionally overwritten by
+  `fillNeighborFrame` before first use on every iteration. `noUnusedParameters`
+  could not see it because the initialiser counts as a read.
+- **`performance.now()` from the volcano module.** Now that it is library code
+  it may not read a wall clock; instrumentation takes an injected
+  `VolcanoRuntime.now`, which the browser host supplies and headless callers
+  omit.
+
+### Changed
+- **Scripts renamed.** `build` was `tsc --noEmit` (a typecheck) while
+  `build:dist` was the actual build. Now `typecheck` and `build`. `prepack`
+  and `prepublishOnly` updated; `prepublishOnly` runs the full `verify` gate.
+- **`.claude/launch.json` is no longer gitignored.** It is shared project
+  config (how to run the showcase dev server); only `settings.local.json` is
+  per-machine.
+- **README** now documents the heat/climate field, growth, pressure transport,
+  the velocity field, fragmentation, yield strength, and the volcano
+  subsystem — six systems it omitted entirely — plus the eight life materials,
+  the ESM-only constraint, and a link to `docs/integration.md`.
 
 ## [0.1.2] — 2026-08-06
 

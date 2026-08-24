@@ -9,6 +9,8 @@ export {
   hasPressure,
   hasPressureStrength,
   hasFragmentation,
+  hasYieldCurve,
+  yieldThicknessAt,
   TERRAIN_SOLIDS,
   isTerrainSolid,
   type MaterialDef,

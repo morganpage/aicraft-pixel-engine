@@ -28,7 +28,7 @@ import {
   summitRadius,
   type EruptionPhase,
   type VolcanoConfig,
-} from './volcano';
+} from '../../src/volcano';
 
 /**
  * The mode driving effects for a tick.

@@ -42,6 +42,10 @@ Add a `README.md` at the copy root noting the canonical upstream so re-syncs are
 
 The library is publishable, but doing so adds a `dependencies` entry to the consumer's `package.json`. Sibling AI Craft games deliberately keep zero `dependencies` as a minimalist invariant; for those, use Option A or B. This option is fine for external consumers.
 
+**ESM only.** The package is `"type": "module"` with no `require` condition in its `exports` map, so `require('aicraft-pixel-engine')` fails with `ERR_REQUIRE_ESM` on Node. Use `import`, or `await import()` from CommonJS.
+
+**Root barrel only.** `exports` publishes a single `.` entry. Deep subpaths (`aicraft-pixel-engine/src/sand`) are not part of the public surface and will not resolve — import everything from the package root.
+
 ---
 
 ## 2. The mental model
@@ -480,7 +484,7 @@ full design, including the "As built" notes on what the implementation learned.
 engine.explode(centerX, centerY, radius, force);
 ```
 
-`explode` carves a circle: walls/rock within `falloff > 0.7` are cleared, within `> 0.3` are pulverized into colored sand debris. Debris is launched from its origin cell with a velocity impulse scaled by `force` — greater force sends debris further along ballistic arcs before drag and gravity win. A fire/smoke core ignites in the inner 40% of the radius. The optional explosion hook (set via engine config) receives the explosion metadata.
+A `radius` of zero or less is a no-op. `explode` carves a circle: walls/rock within `falloff > 0.7` are cleared, within `> 0.3` are pulverized into colored sand debris. Debris is launched from its origin cell with a velocity impulse scaled by `force` — greater force sends debris further along ballistic arcs before drag and gravity win. A fire/smoke core ignites in the inner 40% of the radius. The optional explosion hook (set via engine config) receives the explosion metadata.
 
 The `force` parameter scales the impulse magnitude: `force=3` (the deferred-explosion default) produces gentle scatter; `force=9` produces violent ballistic debris. Before the velocity field existed, debris was teleported to a guessed destination; now it travels a real arc under gravity and drag (see [§5b](#5b-velocity-and-impulse)).
 
@@ -526,6 +530,38 @@ Each frame the velocity pass (which runs before pressure and the checkerboard) i
 **Fragmentation.** LAVA sets `fragmentsAt: 0.65` — above `freezesAt: 0.30`. When a ballistic lava cell (one with velocity) cools below this threshold during flight, it transforms into TEPHRA rather than waiting to land and freeze to ROCK. The granular product keeps the parcel's velocity and temperature, then settles above denser molten LAVA to build a tapering cone. Grounded lava (no velocity) freezes via `freezesAt` as before — fragmentation is for airborne ejecta only.
 
 `engine.velocityMovesLastFrame` and `engine.activeVelocityCount` are the diagnostics, paralleling `swapsLastFrame`.
+
+---
+
+## 6b. Volcano — the one composed subsystem
+
+Everything above is a primitive. `src/volcano/` is the exception: a subsystem that arranges pressure sources, the heat field, fragmentation, `stiffnessGrid`, and the velocity field into a working eruption. It is exported from the package root and imports nothing from the core in reverse, so a world that never builds a volcano never loads it.
+
+```ts
+import {
+  stampVolcano, createVolcanoState, stepVolcanoFrame,
+  buildVolcanoOpts, volcanoGeometryFor, makeRng,
+  type VolcanoConfig, type VolcanoRuntime,
+} from 'aicraft-pixel-engine';
+
+const cfg: VolcanoConfig = { /* centre, planetRadius, ventAngle, chamberDepth, ... */ };
+stampVolcano(engine, cfg);                 // cut the chamber + conduit
+const state = createVolcanoState();
+const rng = makeRng(1234);                 // side-stream: does not shift engine.random()
+const opts = buildVolcanoOpts(/* inputs */);
+const runtime: VolcanoRuntime = { erupting: true, capHeight: 20 };
+
+// Once per frame, instead of engine.update():
+stepVolcanoFrame(engine, cfg, state, rng, opts, runtime);
+```
+
+`stepVolcanoFrame` **calls `engine.update()` itself** — do not call both. It runs `stepVolcanoPre → update → stepVolcanoPost` while erupting, maintains the plumbing while dormant, and syncs temperature-derived colour and rheology every frame either way.
+
+Three things worth knowing:
+
+- **`syncFromHeat` is what makes lava look like lava.** It maps each cell's temperature onto its yield thickness, so a flow runs while molten, stiffens as it chills, and stalls into a blunt front. `stepVolcanoFrame` calls it for you; call it yourself if you drive the phases manually.
+- **Instrumentation takes an injected clock.** The subsystem is part of the deterministic core and reads no wall clock. For per-frame timings, pass `now: () => performance.now()` and a `timings` sink on the runtime; omit both and every timing branch folds away.
+- **No plume, glow, or shake.** Those are renderable entities, and this library ships no renderer. `showcase/helpers/volcano-effects.ts` is a complete worked implementation to copy.
 
 ---
 

@@ -10,6 +10,37 @@ function filledWithWall(): PixelEngine {
 }
 
 describe('explode', () => {
+  /**
+   * A degenerate radius used to produce a degenerate blast rather than nothing.
+   *
+   * `falloff = 1 - dist / radius` is `NaN` at `radius === 0`, and every
+   * threshold test against NaN reads false — so the carve loop fell through to
+   * the scatter path (deleting the centre cell and launching it as debris)
+   * while solids at the same cell survived, and the fire core spawned anyway
+   * because its radius has a floor of 3. A negative radius skipped the carve
+   * loop entirely and still lit a 3-cell fireball.
+   */
+  it('is a no-op at zero or negative radius', () => {
+    for (const r of [0, -1, -8]) {
+      const e = filledWithWall();
+      const before = Uint8Array.from(e.grid);
+      let fired = false;
+      e.explode(5, 5, r, 5);
+      expect(fired, `hook for radius ${r}`).toBe(false);
+      expect(e.grid, `grid unchanged for radius ${r}`).toEqual(before);
+    }
+  });
+
+  it('does not light a fire core when the radius is non-positive', () => {
+    // The fire core has a radius floor of 3, so it was the part that fired even
+    // when the blast itself carved nothing.
+    const e = new PixelEngine({ width: 11, height: 11, seed: 1, gravity: new FlatGravity() });
+    e.explode(5, 5, 0, 5);
+    for (let i = 0; i < e.grid.length; i++) {
+      expect(e.grid[i]).toBe(MaterialType.EMPTY);
+    }
+  });
+
   it('fires the onExplode hook with metadata', () => {
     let fired: { x: number; y: number; r: number; f: number } | null = null;
     const e = new PixelEngine({

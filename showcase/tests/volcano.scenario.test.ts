@@ -18,7 +18,7 @@ import {
   buildVolcanoOpts,
   DEFAULT_VOLCANO_INPUTS,
   type VolcanoRuntime,
-} from '../helpers/volcano';
+} from '../../src/volcano';
 import {
   DEFAULT_VOLCANO_CFG as CFG,
   VOLCANO_SIZE as SIZE,
@@ -38,7 +38,7 @@ import {
   edificeProfile,
   heightProfile,
   type VolcanoSnapshot,
-} from '../helpers/volcano-scenario';
+} from '../../src/tests/helpers/volcano-fixtures';
 
 /**
  * Slow volcano scenarios — the full 220×220 shipping-planet eruption.

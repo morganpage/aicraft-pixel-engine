@@ -27,7 +27,6 @@ import {
   MaterialType,
   Materials,
   materialDefs,
-  isTerrainSolid,
   isThermal,
   isImmobile,
   needsSupport,
@@ -35,6 +34,8 @@ import {
   hasPressure,
   hasPressureStrength,
   hasFragmentation,
+  hasYieldCurve,
+  yieldThicknessAt,
   type Octant,
   type SpreadRule,
   type TipRule,
@@ -43,6 +44,7 @@ import {
 import { FlatGravity, type GravityModel } from '../gravity/index.js';
 import type { CellOffset, NeighborFrame } from './types.js';
 import { fillNeighborFrame, octantOffset } from './neighbors.js';
+import { mulberry32Next, mulberry32Value } from '../rng.js';
 
 /** Default simulation seed. */
 const DEFAULT_SEED = 12345;
@@ -68,7 +70,7 @@ const DEFAULT_CHUNK_SIZE = 32;
  * first non-passable cell, so a higher value only costs while the liquid is
  * genuinely in motion with open space ahead.
  */
-const DEFAULT_LIQUID_DISPERSION = 16;
+export const DEFAULT_LIQUID_DISPERSION = 16;
 
 /**
  * How far the levelling pass looks along the surface for a lower resting
@@ -146,7 +148,7 @@ export const CONDUCTION_MAX = 0.2;
  * two seconds to grow. Legible rather than instant is the whole point: growth
  * that resolves in a frame reads as a stamp, not as something alive.
  */
-const DEFAULT_GROWTH_INTERVAL = 4;
+export const DEFAULT_GROWTH_INTERVAL = 4;
 
 /**
  * Cap on the exponential backoff a saturated spread cell applies to itself, in
@@ -212,11 +214,30 @@ export function unpackGrowth(word: number): {
  */
 export const INSULATED_EXPOSURE = 0.02;
 
-/** How many stable frames the grid must be quiet before settle completes. */
+/**
+ * Default number of consecutive quiet frames before settle completes. Override
+ * per-engine with {@link PixelEngineOptions.settleStableThreshold}.
+ */
 export const SETTLE_STABLE_THRESHOLD = 10;
 
-/** Maximum frames {@link beginSettle} will run before forcing completion. */
+/**
+ * Default ceiling on frames {@link PixelEngine.beginSettle} will run before
+ * forcing completion. Override per-engine with
+ * {@link PixelEngineOptions.settleTimeoutFrames} — a 1000x1000 planet needs
+ * longer to quiet down than a 200x150 sandbox.
+ */
 export const SETTLE_TIMEOUT_FRAMES = 600;
+
+/**
+ * Swaps-per-frame below which the grid counts as quiet for settle purposes.
+ *
+ * Not zero, deliberately: a large world almost always has one or two cells
+ * still shuffling at any instant (a grain rocking on a slope, a gas cell
+ * leaving the grid), and waiting for an exact zero would mean a turn-based
+ * host never gets its turn back. Override with
+ * {@link PixelEngineOptions.settleSwapThreshold}.
+ */
+export const SETTLE_SWAP_THRESHOLD = 5;
 
 /**
  * Default ceiling on visited cells per pressure-routed volume. Sized for
@@ -237,7 +258,8 @@ export const DEFAULT_FRACTURE_PER_FRAME = 1;
 // one cell of displacement per frame. A value of 12 with a unit of 8 means 1.5
 // cells/frame — the half-cell carries in a per-cell remainder accumulator so
 // small lateral components are not silently truncated away. All values are
-// signed Int8, clamped to ±127; drag reduces them toward zero each frame.
+// signed Int8, clamped to ±127; drag reduces them toward zero each frame. The
+// remainders are Int16 rather than Int8 — see VELOCITY_REMAINDER_HEADROOM.
 
 /** Fixed-point unit: a velocity of this many sub-cells = one cell/frame. */
 export const VELOCITY_CELL_UNIT = 8;
@@ -246,8 +268,44 @@ export const VELOCITY_CELL_UNIT = 8;
  * Per-frame velocity retention (drag). Each frame both components are multiplied
  * by this factor, so 0.92 halves speed in ~8 frames. Global in Phase 6A;
  * per-material drag (lava losing momentum faster than tephra) is a 6B extension.
+ *
+ * Settable per-engine via {@link PixelEngineOptions.velocityDrag}, including
+ * `1.0` for a frictionless world — which is why the remainder accumulators are
+ * Int16. See {@link VELOCITY_REMAINDER_HEADROOM}.
  */
 export const DEFAULT_VELOCITY_DRAG = 0.92;
+
+/**
+ * Why {@link PixelEngine.velRemX} is an `Int16Array` and not an `Int8Array`.
+ *
+ * Each frame the pass does `rem += v`, then drains whole cells out of `rem` in
+ * units of {@link VELOCITY_CELL_UNIT}, leaving `|rem| <= UNIT - 1 = 7`. With
+ * `|v| <= 127` the accumulator therefore peaks at `7 + 127 = 134` — which does
+ * not fit in an Int8, and the wrap is not a rounding error but a **sign flip**:
+ * 134 stores as -122, the step count comes out as -15, clamps to
+ * -{@link VELOCITY_MAX_STEPS}, and the parcel flies backwards out of an
+ * explosion.
+ *
+ * At the shipped drag of 0.92 the post-drag magnitude caps at
+ * `trunc(127 * 0.92) = 116`, so `7 + 116 = 123` squeaks under 127 and an Int8
+ * happens to survive. That is an invariant resting entirely on a tuning
+ * constant a host is invited to change, which is not an invariant. Int16 costs
+ * one extra byte per cell on a field that is only allocated once something is
+ * actually in flight, and makes `velocityDrag: 1.0` merely fast instead of
+ * wrong.
+ */
+export const VELOCITY_REMAINDER_HEADROOM = 134;
+
+/**
+ * Maximum whole cells a velocity-bearing parcel may traverse in one frame.
+ *
+ * A speed cap, not a precision limit: without it a single strongly impulsed
+ * cell could cross the whole grid in a frame, tunnelling through every
+ * collision test on the way. Surplus displacement is discarded rather than
+ * carried forward — the parcel is moving faster than the simulation resolves,
+ * and banking the excess would only produce a lurch on a later frame.
+ */
+export const VELOCITY_MAX_STEPS = 4;
 
 /**
  * Fixed-point gravity acceleration per frame², in sub-cell units. Tuned so a
@@ -514,7 +572,10 @@ export interface PixelEngineOptions {
    * from, in cells. Higher values level a pool flatter at the cost of a
    * longer per-cell scan while the liquid is in motion. The scan exits early
    * once it hits a non-passable cell, so cost is only paid by liquid that is
-   * genuinely in motion with open space ahead. Default 32.
+   * genuinely in motion with open space ahead. Default
+   * {@link DEFAULT_LIQUID_DISPERSION} (16) — higher buys flatness under flat
+   * gravity but costs a quiet planet under radial, which is the trade the
+   * constant's own note works through.
    */
   liquidDispersion?: number;
   /**
@@ -569,6 +630,32 @@ export interface PixelEngineOptions {
    * weakened source stops breaking until it has accumulated more.
    */
   fracturePerFrame?: number;
+  /**
+   * Per-frame velocity retention for ballistic cells, 0-1. Default
+   * {@link DEFAULT_VELOCITY_DRAG} (0.92).
+   *
+   * `1.0` is legal and means a frictionless world: a parcel keeps its speed
+   * until it collides or gravity turns it around. Values above 1 are clamped
+   * to 1, since a drag that adds energy every frame diverges.
+   */
+  velocityDrag?: number;
+  /**
+   * Consecutive quiet frames required before {@link PixelEngine.beginSettle}
+   * reports settled. Default {@link SETTLE_STABLE_THRESHOLD} (10).
+   */
+  settleStableThreshold?: number;
+  /**
+   * Frames after which {@link PixelEngine.beginSettle} gives up and completes
+   * anyway. Default {@link SETTLE_TIMEOUT_FRAMES} (600). Raise it for a large
+   * world, which takes proportionally longer to quiet down.
+   */
+  settleTimeoutFrames?: number;
+  /**
+   * Swaps per frame below which the grid counts as quiet. Default
+   * {@link SETTLE_SWAP_THRESHOLD} (5). Scale it with world size: the residual
+   * churn of a settled world grows with its surface area.
+   */
+  settleSwapThreshold?: number;
 }
 
 /**
@@ -794,6 +881,14 @@ export class PixelEngine {
   private _settling = false;
   private _settled = false;
   private _stableFrames = 0;
+  /**
+   * How the last settle finished. Recorded when it completes rather than
+   * re-derived from the frame count afterwards: the two completion conditions
+   * are checked with `||`, so a world that reaches natural stability on exactly
+   * the timeout frame satisfies both, and a derived check would report the
+   * quiet world as having timed out.
+   */
+  private _settleTimedOut = false;
 
   private _renderDirtyAll = true;
   /**
@@ -927,9 +1022,9 @@ export class PixelEngine {
    * every frame and silently zeroing small lateral components. The remainder
    * carries the fractional part forward.
    */
-  velRemX: Int8Array | null = null;
+  velRemX: Int16Array | null = null;
   /** Sub-cell displacement remainder for Y. */
-  velRemY: Int8Array | null = null;
+  velRemY: Int16Array | null = null;
   /**
    * Indices of cells with nonzero velocity — the velocity pass's work list.
    * Maintained on write (add on impulse, remove when drag zeroes velocity), so
@@ -940,6 +1035,12 @@ export class PixelEngine {
   readonly velCells: Set<number> = new Set();
   /** Per-frame velocity drag, applied to both components each step. */
   readonly velocityDrag: number;
+  /** Consecutive quiet frames required to complete a settle. */
+  readonly settleStableThreshold: number;
+  /** Frames after which a settle completes regardless of activity. */
+  readonly settleTimeoutFrames: number;
+  /** Swaps per frame below which the grid counts as quiet. */
+  readonly settleSwapThreshold: number;
 
   constructor(options: PixelEngineOptions) {
     const { width, height } = options;
@@ -963,7 +1064,12 @@ export class PixelEngine {
     this.growthInterval = Math.max(1, options.growthInterval ?? DEFAULT_GROWTH_INTERVAL);
     this.pressureVisitLimit = Math.max(1, options.pressureVisitLimit ?? DEFAULT_PRESSURE_VISIT_LIMIT);
     this.fracturePerFrame = Math.max(0, options.fracturePerFrame ?? DEFAULT_FRACTURE_PER_FRAME);
-    this.velocityDrag = DEFAULT_VELOCITY_DRAG;
+    // Clamped to [0, 1]: a drag above 1 adds energy every frame and diverges,
+    // and a negative one flips the parcel's direction each step.
+    this.velocityDrag = Math.max(0, Math.min(1, options.velocityDrag ?? DEFAULT_VELOCITY_DRAG));
+    this.settleStableThreshold = Math.max(1, options.settleStableThreshold ?? SETTLE_STABLE_THRESHOLD);
+    this.settleTimeoutFrames = Math.max(1, options.settleTimeoutFrames ?? SETTLE_TIMEOUT_FRAMES);
+    this.settleSwapThreshold = Math.max(0, options.settleSwapThreshold ?? SETTLE_SWAP_THRESHOLD);
     this._onExplode = options.onExplode ?? (() => {});
     this._ambientTemperature = options.ambientTemperature ?? DEFAULT_AMBIENT_TEMPERATURE;
 
@@ -1069,12 +1175,18 @@ export class PixelEngine {
     return materialDefs[this.grid[idx]].spawnTemp ?? this.ambientTemperature;
   }
 
-  /** Seeded mulberry32-style PRNG. Use this — never `Math.random()`. */
+  /**
+   * Seeded mulberry32 PRNG. Use this — never `Math.random()`.
+   *
+   * The state is a field rather than a closure variable so it can be read and
+   * restored, which is what a mid-stream save/resume would need. The mixing
+   * itself lives in {@link mulberry32}'s module, so the engine's stream and any
+   * host side-stream are the same algorithm by construction rather than by two
+   * copies staying in agreement.
+   */
   random(): number {
-    this._rngState = (this._rngState + 0x6d2b79f5) | 0;
-    let t = Math.imul(this._rngState ^ (this._rngState >>> 15), 1 | this._rngState);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    this._rngState = mulberry32Next(this._rngState);
+    return mulberry32Value(this._rngState);
   }
 
   /** Reset the grid to empty and wake every chunk. */
@@ -1189,7 +1301,18 @@ export class PixelEngine {
     return this.grid[this.getIndex(x, y)] as MaterialType;
   }
 
-  /** Set the material at `(x, y)`, tracking terrain-dirty and render-dirty. */
+  /**
+   * Set the material at `(x, y)`, tracking terrain-dirty and render-dirty.
+   *
+   * Wakes the chunk and flags it render-dirty **even when the material is
+   * unchanged**, and that is deliberate rather than an oversight: the pressure
+   * pass re-writes its source cell with the material already there, and relies
+   * on the wake to keep the conduit simulating. The cost lands on hosts that
+   * re-stamp static regions every frame — those chunks never sleep, and
+   * {@link beginSettle} on such a world never reports quiet. A host doing that
+   * should test the material first and skip the call, which is strictly
+   * cheaper than the early-out this method could do on its own.
+   */
   setMaterial(x: number, y: number, mat: MaterialType): void {
     if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
     const idx = this.getIndex(x, y);
@@ -1205,10 +1328,12 @@ export class PixelEngine {
       return;
     }
     const oldMat = this.grid[idx];
-    if (isTerrainSolid(oldMat) || isTerrainSolid(mat)) {
-      // v1 has no rigid-body terrain to rebuild, but we keep the semantic
-      // flag available for a future layer / for consumer inspection.
-    }
+    // NOTE: v1 has no rigid-body terrain to rebuild, so no terrain-dirty flag is
+    // raised here. A future rigid-body layer wanting one would test
+    // `isTerrainSolid(oldMat) || isTerrainSolid(mat)` at this point. It is not
+    // pre-wired: this is the hottest write path in the library, and two Set
+    // lookups per call to set a flag nothing reads is a real cost for a
+    // hypothetical consumer.
     if (oldMat !== mat) {
       if (this.colorGrid) this.colorGrid[idx] = 0;
       // A cell that has become a different material carries none of the old
@@ -1552,7 +1677,6 @@ export class PixelEngine {
   private flowRun(
     x: number, y: number, mover: number,
     ldx: number, ldy: number,
-    ddx: number, ddy: number,
     goLeft: boolean,
   ): number {
     const moverDensity = materialDefs[mover].density;
@@ -1561,7 +1685,10 @@ export class PixelEngine {
     const pf = this._probeFrame;
     let tx = x, ty = y;
     let sx = ldx, sy = ldy; // step direction, re-derived each cell
-    let dx = ddx, dy = ddy; // down direction, re-derived each cell
+    // The "down" the descent test uses. Not seeded from the source cell's
+    // frame: the walk re-derives it at every probe cell before the first read,
+    // so a starting value would never be observed.
+    let dx = 0, dy = 0;
     for (let d = 1; d <= this.liquidDispersion; d++) {
       tx += sx; ty += sy;
       if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) return 0;
@@ -1631,11 +1758,24 @@ export class PixelEngine {
    * previous behavior exactly.
    */
   private belowYield(x: number, y: number, mat: number, dDX: number, dDY: number): boolean {
-    // Per-cell stiffness wins over the material constant when the host supplies
-    // it; 0 means "not set".
-    const yt =
-      (this.stiffnessGrid ? this.stiffnessGrid[this.getIndex(x, y)] : 0) ||
-      materialDefs[mat].yieldThickness;
+    const idx = this.getIndex(x, y);
+    // Three sources, in descending priority:
+    //
+    //  1. An explicit `stiffnessGrid` override. The host has said exactly what
+    //     this parcel's rheology is; nothing second-guesses it. 0 = unset.
+    //  2. The material's temperature curve, if it declares one and the heat
+    //     field is live. This is what a melt actually obeys — see
+    //     `MaterialDef.yieldThicknessCurve`, and note that the failure mode of
+    //     *not* consulting it is a volcano that builds a chimney instead of a
+    //     cone, because summit lava is never deep enough to clear a constant.
+    //  3. The material constant, for a world with no heat field at all. Such a
+    //     world behaves exactly as it did before the curve existed.
+    let yt = this.stiffnessGrid ? this.stiffnessGrid[idx] : 0;
+    if (!yt) {
+      yt = this.heatGrid !== null && hasYieldCurve[mat]
+        ? yieldThicknessAt(mat as MaterialType, this.heatGrid[idx])
+        : materialDefs[mat].yieldThickness ?? 0;
+    }
     if (!yt) return false;
     return this.flowThickness(x, y, mat, dDX, dDY, yt) < yt;
   }
@@ -2150,8 +2290,10 @@ export class PixelEngine {
     const n = this.width * this.height;
     this.velX = new Int8Array(n);
     this.velY = new Int8Array(n);
-    this.velRemX = new Int8Array(n);
-    this.velRemY = new Int8Array(n);
+    // Int16, not Int8: the accumulator peaks above 127 at full speed with no
+    // drag. See VELOCITY_REMAINDER_HEADROOM for the arithmetic.
+    this.velRemX = new Int16Array(n);
+    this.velRemY = new Int16Array(n);
   }
 
   /**
@@ -2257,6 +2399,19 @@ export class PixelEngine {
    * cannot appear in a single frame. Sorting by index rather than relying on
    * `Set` insertion order means growth is reproducible from a *serialized
    * grid*, not merely from an identical run.
+   *
+   * ## The cost, and what would replace it
+   *
+   * That is an allocation plus an O(n log n) sort every {@link growthInterval}
+   * frames, with `n` the number of living cells — cheap on a scattered forest,
+   * measurable on a fully vegetated planet. If it ever shows up in a profile,
+   * the replacement is a chunk-bucketed insertion-ordered list rather than a
+   * plain `Set`: bucket membership by chunk index and keep each bucket ordered
+   * on insert, and iteration is already in index order with nothing to sort.
+   * What must survive any such change is the property the sort is here for —
+   * iteration order derivable from the *grid*, not from the history of
+   * insertions — since that is what makes a loaded save grow like the world
+   * that was saved.
    */
   private runGrowth(): void {
     // Before any RNG draw: a world with nothing alive in it must not perturb
@@ -2919,7 +3074,7 @@ export class PixelEngine {
       // A world with a tree still growing in it is not settled, even if nothing
       // is moving. Backoff dormancy is what keeps this from being a trap: a
       // mature field emits no growth events, so it still reaches a dead stop.
-      const gridStable = this._swapsThisFrame < 5
+      const gridStable = this._swapsThisFrame < this.settleSwapThreshold
         && this._growthEventsThisFrame === 0
         && this._velocityMovesThisFrame === 0;
       if (gridStable) {
@@ -2927,10 +3082,12 @@ export class PixelEngine {
       } else {
         this._stableFrames = 0;
       }
-      if (
-        this._stableFrames >= SETTLE_STABLE_THRESHOLD ||
-        this._settleFrameCount >= SETTLE_TIMEOUT_FRAMES
-      ) {
+      const quiet = this._stableFrames >= this.settleStableThreshold;
+      const expired = this._settleFrameCount >= this.settleTimeoutFrames;
+      if (quiet || expired) {
+        // Natural stability wins the tie. Both conditions can hold on the same
+        // frame, and a world that actually went quiet has not timed out.
+        this._settleTimedOut = expired && !quiet;
         this._settled = true;
         this._settling = false;
       }
@@ -2949,10 +3106,10 @@ export class PixelEngine {
    * Advance every velocity-bearing cell one frame: integrate gravity and drag,
    * accumulate sub-cell remainder, and move the cell along its velocity vector.
    *
-   * Runs before pressure so that a cell impulsed last frame (e.g. at a pressure
-   * outlet) moves before `clearUpdatedInActiveChunks` resets the processed flags
-   * for this frame. Each velocity-driven swap sets `updated=1` on both cells, so
-   * the checkerboard does not re-gravitate the cell this frame — the same
+   * Runs before the pressure and checkerboard passes so a cell impulsed last
+   * frame (e.g. at a pressure outlet) gets its move in before anything else
+   * claims it. Each velocity-driven swap sets `updated=1` on both cells, so the
+   * checkerboard does not re-gravitate the cell this frame — the same
    * discipline the pressure pass uses.
    *
    * Collision rule (V1): a velocity move that hits a non-displaceable cell stops
@@ -2969,7 +3126,6 @@ export class PixelEngine {
     const updated = this.updated;
     const drag = this.velocityDrag;
     const frame = this._frame;
-    const probe = this._probeFrame;
 
     // Snapshot the active set in ascending-index order. A cell that moves during
     // the pass lands at a new index; the snapshot prevents re-processing it.
@@ -3011,7 +3167,9 @@ export class PixelEngine {
       ry[curIdx] -= stepsY * VELOCITY_CELL_UNIT;
 
       // Clamp step count so a single cell cannot traverse the whole grid.
-      const maxSteps = 4;
+      // The remainder was already debited for the unclamped count: surplus
+      // displacement is discarded, not banked. See VELOCITY_MAX_STEPS.
+      const maxSteps = VELOCITY_MAX_STEPS;
       if (stepsX > maxSteps) stepsX = maxSteps;
       if (stepsX < -maxSteps) stepsX = -maxSteps;
       if (stepsY > maxSteps) stepsY = maxSteps;
@@ -3086,7 +3244,6 @@ export class PixelEngine {
         rx[curIdx] = 0; ry[curIdx] = 0;
       }
     }
-    void probe;
   }
 
   // --------------------------------------------------------------- pressure
@@ -4276,8 +4433,8 @@ export class PixelEngine {
                   // dithering. No RNG: the rule is fully deterministic. Offsets
                   // are gravity-relative, so this works unchanged under any
                   // GravityModel. Gases keep their own rising logic.
-                  const leftRun = this.flowRun(x, y, mat, lDX, lDY, dDX, dDY, true);
-                  const rightRun = this.flowRun(x, y, mat, rDX, rDY, dDX, dDY, false);
+                  const leftRun = this.flowRun(x, y, mat, lDX, lDY, true);
+                  const rightRun = this.flowRun(x, y, mat, rDX, rDY, false);
                   let chosen: 'L' | 'R' | null = null;
                   // Potential gate: a "level" step must not carry the liquid
                   // uphill. The level axis is quantized to 8 compass
@@ -4505,6 +4662,12 @@ export class PixelEngine {
    * no-op.
    */
   explode(centerX: number, centerY: number, radius: number, force = 5): void {
+    // A non-positive radius is a no-op, not a degenerate blast. Without this,
+    // `radius = 0` makes every `falloff` NaN (`1 - 0/0`), so every threshold
+    // test reads false: solids survive, non-solids are deleted *and* scattered,
+    // and the fire core still spawns because its radius has a floor of 3. A
+    // negative radius skips the carve loop but likewise still lights the core.
+    if (radius <= 0) return;
     const r2 = radius * radius;
     const scattered: { mat: MaterialType; dx: number; dy: number; color?: number }[] = [];
 
@@ -4644,6 +4807,7 @@ export class PixelEngine {
     this._settled = false;
     this._settleFrameCount = 0;
     this._stableFrames = 0;
+    this._settleTimedOut = false;
   }
 
   /** True once settle has completed (stable or timed out). */
@@ -4663,7 +4827,7 @@ export class PixelEngine {
 
   /** True if settle completed by timeout (rather than natural stability). */
   get settleTimedOut(): boolean {
-    return this._settled && this._settleFrameCount >= SETTLE_TIMEOUT_FRAMES;
+    return this._settled && this._settleTimedOut;
   }
 
   /** Swaps performed during the most recent {@link update}. */

@@ -18,13 +18,21 @@ Commands are run from the **repo root** (`aicraft-pixel-engine/`):
 | `npm run showcase:test` | Vitest run of the showcase's **fast** DOM-free pure-logic suite (`showcase/tests/*.test.ts`, excluding `*.scenario.test.ts`) — ~2s, the normal feedback loop |
 | `npm run showcase:test:watch` | Same fast suite in watch mode |
 | `npm run showcase:test:scenario` | The **slow** scenario suite (`showcase/tests/*.scenario.test.ts`): the multi-thousand-frame full-planet volcano simulations. Runs the golden trajectory once (~22s) plus standalone scenarios. |
-| `npm run showcase:test:all` | Both suites, fast then scenario — use in CI. |
+| `npm run showcase:test:all` | Both suites, fast then scenario. |
+
+From the repo root, `npm run verify` runs both typechecks and both fast suites — the gate CI enforces on every push. `npm run verify:full` adds the scenario suite (~2.5 min).
 
 The showcase has its own `showcase/tsconfig.json`, `showcase/vite.config.ts`, and `showcase/vitest.config.ts`, separate from the root library toolchain. The `vite/client` ambient types provide browser-API typing.
 
-The showcase's DOM-coupled section code (`sections/*.ts`) imports browser APIs (`document`, `canvas`, pointer events) and cannot be unit-tested under the project's Node-only Vitest setup without adding `jsdom` (forbidden by the zero-deps invariant). Instead, the pure logic the sections actually use — the grid→pixels renderer, the viewport math, the cloud and volcano host logic — is extracted into `helpers/*.ts` and tested in `tests/*.test.ts`.
+The showcase's DOM-coupled section code (`sections/*.ts`) imports browser APIs (`document`, `canvas`, pointer events) and cannot be unit-tested under the project's Node-only Vitest setup without adding `jsdom` (forbidden by the zero-deps invariant). Instead, the pure logic the sections actually use — the grid→pixels renderer, the viewport math, the cloud logic, and the volcano's atmospheric effects — is extracted into `helpers/*.ts` and tested in `tests/*.test.ts`.
 
-The volcano showcase's host logic is split across two test files. Fast contracts (`tests/volcano.test.ts`) cover tiny-grid and pure-function behaviour and run in milliseconds. The full 220×220 shipping-planet eruption is a slow, multi-thousand-frame simulation, so it lives in `tests/volcano.scenario.test.ts` and is excluded from the default `showcase:test` run — run it explicitly via `showcase:test:scenario`. The scenario file shares a single deterministic golden trajectory across all its read-only assertions via `helpers/volcano-scenario.ts`, instead of each test re-simulating the eruption from scratch.
+### Where the volcano lives now
+
+The volcano **simulation** is no longer a showcase helper: it moved into the library at `src/volcano/` and is exported from the package root. It was never demo code — it composes engine primitives and touches nothing but the grid. Its fast contracts moved with it (`src/tests/volcano.test.ts`, in `npm test`), as did the shared fixtures and golden-trajectory harness (`src/tests/helpers/volcano-fixtures.ts`).
+
+What stays here is the part that really is the host's: `helpers/volcano-effects.ts` — ash puffs, vent glow, eruption flash, screen shake. Those are renderable entities the host tracks and draws; nothing they do can touch `grid`, `heatGrid`, `colorGrid`, or `stiffnessGrid`, which is what keeps the golden trajectory byte-identical between the browser and the headless harness.
+
+The full 220×220 shipping-planet eruptions remain in this tier, because the split there is by **cost**, not by layer: they are multi-thousand-frame simulations, so they live in `tests/*.scenario.test.ts`, are excluded from the default `showcase:test` run, and execute via `showcase:test:scenario`. They share a single deterministic golden trajectory across all their read-only assertions rather than each re-simulating the eruption from scratch.
 
 ---
 

@@ -6,12 +6,12 @@ import {
   stampVolcano,
   volcanoGeometryFor,
   type VolcanoConfig,
-} from '../helpers/volcano';
+} from '../../src/volcano';
 import {
   runVolcanoTrajectory,
   edificeProfile,
   engineFromSnapshot,
-} from '../helpers/volcano-scenario';
+} from '../../src/tests/helpers/volcano-fixtures';
 
 /**
  * High-resolution cone-formation regression.
