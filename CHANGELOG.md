@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   chimney, not a cone); and a two-phase fountain→effusion schedule. Measured
   on the due-north cardinal vent: ~524 fountain parcels, ~1,000 effusion
   cells, 11/11 criteria green; the previous recipes failed 8/11, 3/11 and 4/11.
+  **Strengthened after a player screenshot showed a runaway spire** the
+  original criteria missed: added 6d (max final height ≤34 — no runaway
+  needle), 6e (centre ≤18 cells over the shoulders), and **five-angle
+  coverage** (N/E/S/W + diagonal), because the eruption's granular fate is
+  angle-dependent. The spire reproduced at one angle (74 cells — the effusive
+  phase extruding onto a narrow summit where fully-exposed lava freezes
+  faster than it flows); the fix caps the effusion's height too, widens its
+  outlet corridor to the cone's shoulders, and widens the throat remelt band
+  to keep those shoulder outlets open. All 13 criteria now pass at every
+  angle.
 - **`engine.stampDisc(cx, cy, radius, mat, opts?)` — the brush primitive.**
   Stamps a filled Euclidean disc of material through the full `setMaterial`
   bookkeeping (wake + render-dirty + heat ride-along), bounds-clipped, and

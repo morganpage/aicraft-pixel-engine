@@ -25,12 +25,23 @@ import { RadialGravity } from '../../src/gravity';
  *     max height ≥10 cells above the original surface, ≥8 of 11 tangent bins
  *     (4-cell width) rise ≥4 cells (a mound, not a spike), and ≥250 cells of
  *     cone volume (tephra + frozen rock + lava above the old surface).
+ *  6d. NO SPIRE — the final edifice's max height is ≤34 cells (a runaway
+ *     needle is a defect, not a volcano: the effusive phase extruding onto a
+ *     narrow summit stacks frozen lava into a tower for its whole duration).
+ *  6e. NO NEEDLE — the centre column (|tangent| ≤ 2) towers at most 18 cells
+ *     over the shoulders (|tangent| 8–14). A steep cinder-cone profile is
+ *     legitimate; the pathological spire (measured: centre 60+ over its
+ *     shoulders) fails this with 3× margin.
  *  7. NEW LAND — final ROCK count exceeds the initial by ≥150 (frozen lava
  *     became terrain).
  *  8. SETTLES — at the final frame ≤12 LAVA cells remain above the surface
  *     (the eruption ends; the land stays).
  *  9. DETERMINISM — a second run of the same recipe produces a byte-identical
  *     grid at frame 600.
+ * 10. EVERY ANGLE — criteria 1–8 must hold at five vent angles (N, E, S, W,
+ *     and a diagonal), because corridor rounding makes the granular fate of
+ *     the eruption angle-dependent: a recipe that only works facing north is
+ *     not a recipe.
  *
  * The recipe helper below is the brief's §8.2 verbatim. When tuning changes
  * the recipe, brief and helper must move together — that coupling is the
@@ -40,7 +51,9 @@ import { RadialGravity } from '../../src/gravity';
 const SIZE = 640;
 const CX = 320, CY = 320;
 const R = 205; // PLANET_R
-const ANGLE = -Math.PI / 2; // due north — the cardinal angle that was the dead-vent case
+// Five vent angles: the four cardinals plus a diagonal. Rounding of the
+// corridor/stamp geometry differs per angle, and so does the eruption's fate.
+const ANGLES = [-Math.PI / 2, 0, Math.PI / 2, Math.PI, -Math.PI * 3 / 4];
 const FRAMES = 1800;
 const CHECK_EVERY = 60;
 
@@ -132,7 +145,7 @@ function openVolcano(engine: PixelEngine, angle: number): number {
     maxPending: 5,
     maxDischargePerFrame: PARCELS,
     outletVelocityEfficiency: 0.7,
-    outletLateralSpread: 0.55,
+    outletLateralSpread: 0.65,
     temperature: 1.0,
     ventAnchor: { cx: CX, cy: CY, angle, corridorRadius: 3 },
     fracture: { minSealedFrames: 6, pressureRate: 3, maxPressure: 18 },
@@ -148,8 +161,11 @@ function openVolcano(engine: PixelEngine, angle: number): number {
  */
 function remeltThroat(engine: PixelEngine, angle: number) {
   const ux = Math.cos(angle), uy = Math.sin(angle);
+  // |w| ≤ 6 covers the throat AND the shoulder outlets the effusive phase is
+  // meant to use — if only the summit stays open, extrusion stacks centrally
+  // into a tower (the needle defect).
   for (let t = -8; t <= 16; t++) {
-    for (let w = -2; w <= 2; w++) {
+    for (let w = -6; w <= 6; w++) {
       const x = Math.round(CX + ux * (R - t) - uy * w);
       const y = Math.round(CY + uy * (R - t) + ux * w);
       if (x < 0 || x >= SIZE || y < 0 || y >= SIZE) continue;
@@ -192,10 +208,12 @@ function edificeHeight(engine: PixelEngine, angle: number): number {
 function createVolcanoController(engine: PixelEngine, angle: number) {
   let fountainId = openVolcano(engine, angle);
   let effusionId: number | null = null;
-  let started = false;
+  let phase: 'fountain' | 'effusion' | 'done' = 'fountain';
+  let bornAt = 0;
   const ascent = Math.ceil((CHAMBER_DEPTH + CONE_TARGET + CHAMBER_R) * 1.2);
   const switchToEffusion = () => {
-    started = true;
+    phase = 'effusion';
+    bornAt = 0; // effusion ages from its own start
     engine.removePressureSource(fountainId);
     const ux = Math.cos(angle), uy = Math.sin(angle);
     const chx = Math.round(CX + ux * (R - CHAMBER_DEPTH));
@@ -203,8 +221,10 @@ function createVolcanoController(engine: PixelEngine, angle: number) {
     // Phase 2: extrusion. Same ascent-dimensioned head (refilled in full
     // each frame, sized for PARCELS flows) but ZERO velocity efficiency —
     // surplus stays head, so lava wells out and runs downslope instead of
-    // launching, and freezes into new rock. The corridor tracks the cone's
-    // growth (axis to any height), so flows spill from the summit downslope.
+    // launching, and freezes into new rock. The corridor is WIDER than the
+    // fountain's: extrusion may exit at the cone's shoulders, not only the
+    // summit — on a narrow summit a summit-only outlet stacks frozen lava
+    // into a tower for the whole phase (measured: a 74-cell needle).
     effusionId = engine.addPressureSource({
       x: chx, y: chy,
       material: MaterialType.LAVA,
@@ -216,29 +236,43 @@ function createVolcanoController(engine: PixelEngine, angle: number) {
       outletVelocityEfficiency: 0,
       outletLateralSpread: 0.25,
       temperature: 1.0,
-      ventAnchor: { cx: CX, cy: CY, angle, corridorRadius: 3 },
+      ventAnchor: { cx: CX, cy: CY, angle, corridorRadius: 6 },
       fracture: { minSealedFrames: 6, pressureRate: 3, maxPressure: 18 },
     });
+  };
+  const endEruption = () => {
+    phase = 'done';
+    if (effusionId !== null) {
+      engine.removePressureSource(effusionId);
+      effusionId = null;
+    }
   };
   return {
     step(frame: number) {
       // Keep the throat clear of fallback tephra while the volcano runs.
-      if (frame % 20 === 0 && frame <= FOUNTAIN_FRAMES + EFFUSION_FRAMES) {
+      if (phase !== 'done' && frame % 20 === 0 && frame <= FOUNTAIN_FRAMES + EFFUSION_FRAMES) {
         remeltThroat(engine, angle);
       }
-      if (!started) {
+      if (phase === 'fountain') {
         // Cut the fountain at the scheduled end OR when the edifice reaches
-        // the cap — whichever comes first. An uncapped fountain builds a
-        // chimney, not a cone.
+        // the cap — whichever comes first. Checked every 5 frames: at 3
+        // parcels/frame a 15-frame interval overshoots the cap by ~45 cells.
+        // The fountain cap sits well under CONE_TARGET so the widening
+        // effusive phase, not the height-building fountain, finishes the cone.
         if (frame >= FOUNTAIN_FRAMES) {
           switchToEffusion();
-        } else if (frame % 15 === 0 && edificeHeight(engine, angle) >= CONE_TARGET - 2) {
+        } else if (frame % 5 === 0 && edificeHeight(engine, angle) >= CONE_TARGET - 2) {
           switchToEffusion();
         }
-      }
-      if (started && effusionId !== null && frame >= FOUNTAIN_FRAMES + EFFUSION_FRAMES) {
-        engine.removePressureSource(effusionId);
-        effusionId = null;
+      } else if (phase === 'effusion') {
+        bornAt++;
+        // The effusion is capped TOO: extruding onto a narrow summit stacks
+        // a frozen tower; end the eruption instead. Its flank flows happen
+        // early; the late central stacking is what the cap exists to cut.
+        if (bornAt >= EFFUSION_FRAMES ||
+            (bornAt % 5 === 0 && edificeHeight(engine, angle) >= CONE_TARGET + 2)) {
+          endEruption();
+        }
       }
     },
   };
@@ -254,6 +288,7 @@ interface VolcanoMetrics {
   coneBinsRaised: number;      // criterion 6b
   coneBins: number[];          // diagnostic: per-bin max height
   coneVolume: number;          // criterion 6c
+  needleDelta: number;         // criterion 6e: centre column over shoulders
   rockGain: number;            // criterion 7
   finalSurfaceLava: number;    // criterion 8
 }
@@ -263,6 +298,7 @@ function measure(engine: PixelEngine, ux: number, uy: number, initialRock: numbe
   let chamberDeepLava = 0, airborneHighLava = 0, tephra = 0, tephraSpread = 0, rock = 0;
   let surfaceLava = 0;
   let coneMaxHeight = 0, coneVolume = 0;
+  let needleMax = 0, shoulderMax = 0;
   const BINS = 11, BIN_W = 4;
   const binHeights = new Array<number>(BINS).fill(0);
 
@@ -291,6 +327,8 @@ function measure(engine: PixelEngine, ux: number, uy: number, initialRock: numbe
         const h = rad - R;
         if (h > coneMaxHeight) coneMaxHeight = h;
         coneVolume++;
+        if (Math.abs(s) <= 2) { if (h > needleMax) needleMax = h; }
+        else if (Math.abs(s) >= 8 && Math.abs(s) <= 14) { if (h > shoulderMax) shoulderMax = h; }
         const bin = Math.floor((s + 22) / BIN_W);
         if (bin >= 0 && bin < BINS && h > binHeights[bin]) binHeights[bin] = h;
       }
@@ -306,6 +344,7 @@ function measure(engine: PixelEngine, ux: number, uy: number, initialRock: numbe
     coneBinsRaised: binHeights.filter((h) => h >= 4).length,
     coneBins: binHeights,
     coneVolume,
+    needleDelta: needleMax - shoulderMax,
     rockGain: rock - initialRock,
     finalSurfaceLava: final ? surfaceLava : 0,
   };
@@ -316,69 +355,87 @@ function best<T>(samples: T[], pick: (m: T) => number): number {
 }
 
 describe('god-game volcano acceptance (brief §8.2 recipe)', () => {
-  let metrics: VolcanoMetrics[] = [];
-  let initialRock = 0;
+  // metrics[angleIdx] = the checkpoint series for that vent angle.
+  const runs: VolcanoMetrics[][] = ANGLES.map(() => []);
 
   beforeAll(() => {
-    const engine = buildWorld();
-    // measure() with baseline 0 reports rockGain = total rock count.
-    initialRock = measure(engine, Math.cos(ANGLE), Math.sin(ANGLE), 0, false).rockGain;
-    const volcano = createVolcanoController(engine, ANGLE);
-    for (let f = 1; f <= FRAMES; f++) {
-      volcano.step(f);
-      engine.update();
-      if (f % CHECK_EVERY === 0) {
-        metrics.push(measure(engine, Math.cos(ANGLE), Math.sin(ANGLE), initialRock, f === FRAMES));
+    ANGLES.forEach((angle, i) => {
+      const engine = buildWorld();
+      // measure() with baseline 0 reports rockGain = total rock count.
+      const initialRock = measure(engine, Math.cos(angle), Math.sin(angle), 0, false).rockGain;
+      const volcano = createVolcanoController(engine, angle);
+      for (let f = 1; f <= FRAMES; f++) {
+        volcano.step(f);
+        engine.update();
+        if (f % CHECK_EVERY === 0) {
+          runs[i].push(measure(engine, Math.cos(angle), Math.sin(angle), initialRock, f === FRAMES));
+        }
       }
+    });
+  }, 300_000);
+
+  // Per-angle helpers: the criteria must hold at EVERY angle.
+  const bestAll = (pick: (m: VolcanoMetrics) => number): number[] =>
+    runs.map((metrics) => best(metrics, pick));
+  const finalAll = (pick: (m: VolcanoMetrics) => number): number[] =>
+    runs.map((metrics) => pick(metrics[metrics.length - 1]));
+
+  it('1. has a buried magma chamber (≥150 deep lava cells, every angle)', () => {
+    for (const v of bestAll((m) => m.chamberDeepLava)) expect(v).toBeGreaterThanOrEqual(150);
+  });
+
+  it('2. sustains vent activity (≥5 surface lava cells at ≥3 checkpoints, every angle)', () => {
+    for (const metrics of runs) {
+      const checkpoints = metrics.reduce((acc, m) => acc + m.surfaceLavaCheckpoints, 0);
+      expect(checkpoints).toBeGreaterThanOrEqual(3);
     }
-  }, 120_000);
-
-  it('1. has a buried magma chamber (≥150 deep lava cells)', () => {
-    expect(best(metrics, (m) => m.chamberDeepLava)).toBeGreaterThanOrEqual(150);
   });
 
-  it('2. sustains vent activity (≥5 surface lava cells at ≥3 checkpoints)', () => {
-    const checkpoints = metrics.reduce((acc, m) => acc + m.surfaceLavaCheckpoints, 0);
-    expect(checkpoints).toBeGreaterThanOrEqual(3);
+  it('3. throws ballistic ejecta (≥8 lava cells ≥8 above the surface, every angle)', () => {
+    for (const v of bestAll((m) => m.airborneHighLava)) expect(v).toBeGreaterThanOrEqual(8);
   });
 
-  it('3. throws ballistic ejecta (≥8 lava cells ≥8 cells above the surface)', () => {
-    expect(best(metrics, (m) => m.airborneHighLava)).toBeGreaterThanOrEqual(8);
+  it('4. fragments ejecta into tephra (≥150 cells, every angle)', () => {
+    for (const v of bestAll((m) => m.tephra)) expect(v).toBeGreaterThanOrEqual(150);
   });
 
-  it('4. fragments ejecta into tephra (≥150 cells)', () => {
-    expect(best(metrics, (m) => m.tephra)).toBeGreaterThanOrEqual(150);
+  it('5. spreads ejecta across the flanks (≥25 tephra cells ≥10 off-axis, every angle)', () => {
+    for (const v of bestAll((m) => m.tephraSpread)) expect(v).toBeGreaterThanOrEqual(25);
   });
 
-  it('5. spreads ejecta across the flanks (≥25 tephra cells ≥10 off-axis)', () => {
-    expect(best(metrics, (m) => m.tephraSpread)).toBeGreaterThanOrEqual(25);
+  it('6a. builds a cone at least 10 cells tall (every angle)', () => {
+    for (const v of finalAll((m) => m.coneMaxHeight)) expect(v).toBeGreaterThanOrEqual(10);
   });
 
-  it('6a. builds a cone at least 10 cells tall', () => {
-    expect(metrics[metrics.length - 1].coneMaxHeight).toBeGreaterThanOrEqual(10);
+  it('6b. builds a mound, not a spike (≥8 of 11 tangent bins raised ≥4, every angle)', () => {
+    for (const v of finalAll((m) => m.coneBinsRaised)) expect(v).toBeGreaterThanOrEqual(8);
   });
 
-  it('6b. builds a mound, not a spike (≥8 of 11 tangent bins raised ≥4)', () => {
-    expect(metrics[metrics.length - 1].coneBinsRaised).toBeGreaterThanOrEqual(8);
+  it('6c. builds ≥250 cells of cone volume (every angle)', () => {
+    for (const v of finalAll((m) => m.coneVolume)) expect(v).toBeGreaterThanOrEqual(250);
   });
 
-  it('6c. builds ≥250 cells of cone volume', () => {
-    expect(metrics[metrics.length - 1].coneVolume).toBeGreaterThanOrEqual(250);
+  it('6d. builds no spire (max final height ≤34 cells, every angle)', () => {
+    for (const v of finalAll((m) => m.coneMaxHeight)) expect(v).toBeLessThanOrEqual(34);
   });
 
-  it('7. freezes into new land (rock gain ≥150)', () => {
-    expect(metrics[metrics.length - 1].rockGain).toBeGreaterThanOrEqual(150);
+  it('6e. builds no needle (centre ≤18 cells over shoulders, every angle)', () => {
+    for (const v of finalAll((m) => m.needleDelta)) expect(v).toBeLessThanOrEqual(18);
   });
 
-  it('8. settles: ≤12 lava cells above the surface at the end', () => {
-    expect(metrics[metrics.length - 1].finalSurfaceLava).toBeLessThanOrEqual(12);
+  it('7. freezes into new land (rock gain ≥150, every angle)', () => {
+    for (const v of finalAll((m) => m.rockGain)) expect(v).toBeGreaterThanOrEqual(150);
+  });
+
+  it('8. settles: ≤12 lava cells above the surface at the end (every angle)', () => {
+    for (const v of finalAll((m) => m.finalSurfaceLava)) expect(v).toBeLessThanOrEqual(12);
   });
 
   it('9. is deterministic (byte-identical grid at frame 600)', () => {
     const a = buildWorld();
     const b = buildWorld();
-    const va = createVolcanoController(a, ANGLE);
-    const vb = createVolcanoController(b, ANGLE);
+    const va = createVolcanoController(a, ANGLES[0]);
+    const vb = createVolcanoController(b, ANGLES[0]);
     for (let f = 1; f <= 600; f++) { va.step(f); vb.step(f); a.update(); b.update(); }
     expect(Array.from(a.grid)).toEqual(Array.from(b.grid));
   }, 60_000);

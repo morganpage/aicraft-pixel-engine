@@ -474,11 +474,15 @@ in the engine repo defines a good volcano as: a buried magma chamber (≥150
 deep lava cells), sustained vent activity, ballistic ejecta (≥8 lava cells 8+
 above the surface), fragmentation into a tephra fan (≥150 cells, ≥25 landing
 10+ cells off-axis), a cone ≥10 tall that is a mound (≥8 of 11 tangent bins
-raised) with ≥250 cells of volume, ≥150 cells of new rock, an eruption that
-settles, and byte-determinism. If you change the recipe, change the test with
-it — the test failing is how the previous three recipes were caught.
+raised) with ≥250 cells of volume, **no spire** (max final height ≤34 cells),
+**no needle** (centre ≤18 cells over the shoulders — the runaway-tower
+defect), ≥150 cells of new rock, an eruption that settles, byte-determinism —
+**and all of it at five vent angles** (N/E/S/W + diagonal), because corridor
+rounding makes the eruption's fate angle-dependent. If you change the recipe,
+change the test with it — the test failing is how the previous four recipes
+were caught.
 
-Five measured facts the recipe must respect:
+Seven measured facts the recipe must respect:
 
 1. **A bare `addPressureSource` at the surface is a cold squib** (~20 lava
    cells, frozen shut within seconds on a temperate planet).
@@ -491,22 +495,24 @@ Five measured facts the recipe must respect:
    source cell (measured: effusion discharged zero for 500 frames). Let the
    source seal behind rock and **fracture its own vent open** — fracture
    pressure 18 beats rock strength 15.
-5. **Remelt fallback tephra out of the throat** (the narrow corridor: crater +
-   upper conduit) every ~20 frames while the volcano runs, or the vent plugs
-   and dies mid-eruption.
-
-And two dimensioning rules (from the showcase's tuned model):
-
-- **Head is refilled in full every frame** (`pressureRate = maxPressure`) and
-  must afford `parcels` launches, each costing the **ascent climb** —
-  `(chamber depth + cone target + chamber radius) × 1.2` head units — plus the
-  surplus that Torricelli-converts to launch speed (`speed = √(2·surplus)·efficiency`).
-  A head budget sized for one launch throttles the jet to ~1 parcel/frame
-  however high `rate` is set.
-- **Cap the edifice height** host-side (the engine has no `maxHeight` because
-  nothing removes material): an uncapped fountain builds a 66-cell chimney,
-  not a cone. Measure the height in built solids only (tephra/frozen rock) —
-  the lava jet itself is not edifice.
+5. **Remelt fallback tephra out of the throat** every ~20 frames while the
+   volcano runs, over a band wide enough to cover the **shoulder outlets**
+   (|tangent| ≤ 6), not just the summit channel — if only the summit stays
+   open, extrusion stacks a tower.
+6. **Cap the edifice height host-side in BOTH phases** (the engine has no
+   `maxHeight` because nothing removes material), checked every 5 frames — at
+   3 parcels/frame a 15-frame interval overshoots by ~45 cells. An uncapped
+   fountain builds a 66-cell chimney; an uncapped **effusion** builds a
+   74-cell needle (extruded lava on a narrow summit is fully exposed, cools
+   ~0.08/frame, and freezes in place faster than it can flow). Measure the
+   height in built solids only (tephra/frozen rock) — the lava jet itself is
+   not edifice.
+7. **Head is refilled in full every frame** (`pressureRate = maxPressure`) and
+   must afford `parcels` launches, each costing the **ascent climb** —
+   `(chamber depth + cone target + chamber radius) × 1.2` head units — plus the
+   surplus that Torricelli-converts to launch speed
+   (`speed = √(2·surplus)·efficiency`). A head budget sized for one launch
+   throttles the jet to ~1 parcel/frame however high `rate` is set.
 
 The shape that passes all criteria is a two-phase eruption:
 
@@ -539,30 +545,30 @@ const fountainId = engine.addPressureSource({
   maxPressure: (ascent + SURPLUS) * PARCELS,
   maxPending: 5, maxDischargePerFrame: PARCELS,
   outletVelocityEfficiency: 0.7,
-  outletLateralSpread: 0.55,       // fan the ejecta into a cone, not a spike
+  outletLateralSpread: 0.65,       // fan the ejecta into a cone, not a spike
   temperature: 1.0,
   ventAnchor: { cx, cy, angle, corridorRadius: 3 },
   fracture: { minSealedFrames: 6, pressureRate: 3, maxPressure: 18 },
 });
 
-// Phase 2 — EFFUSION (after FOUNTAIN_FRAMES or the height cap): remove the
-// fountain source, add the same-source extruder with
+// Phase 2 — EFFUSION (after FOUNTAIN_FRAMES or the fountain height cap):
+// remove the fountain source, add the same-source extruder with
 //   outletVelocityEfficiency: 0        // surplus stays head: extrude, don't launch
 //   pressureRate/maxPressure: ascent * PARCELS + 12
-// The corridor tracks cone growth (axis to any height), so flows spill from
-// the summit and freeze into new rock down the flanks.
-// After EFFUSION_FRAMES more, remove it — the eruption settles into land.
+//   ventAnchor corridorRadius: 6       // exits at the shoulders, not just the summit
+// The corridor tracks cone growth (axis to any height), so flows spill down
+// the flanks and freeze into new rock. End it at EFFUSION_FRAMES **or its own
+// height cap** (solids ≥ CONE_TARGET + 2, checked every 5 frames) — the
+// effusion's late central stacking is the needle defect.
 
 // While either phase runs, every 20 frames:
-// remeltThroat() — any TEPHRA in the |tangent| ≤ 2 strip from 8 above the
-// surface to 16 below becomes LAVA at heat 1.0 (fact 5).
+// remeltThroat() — any TEPHRA in the |tangent| ≤ 6 band from 8 above the
+// surface to 16 below becomes LAVA at heat 1.0 (facts 5).
 ```
 
-Measured on the published engine, 640×640 temperate world, due-north vent:
-fountain discharges ~524 parcels, effusion ~1,000 cells; final cone ~11-22
-cells tall, all 11 acceptance criteria green. End an eruption early with
-`engine.removePressureSource(id)`; a live source's `pending` and
-`availablePressure` are readable via `getPressureSourceState(id)`.
+Measured on the published engine, 640×640 temperate world, at all five vent
+angles: fountain discharges ~500 parcels, effusion ~1,000 cells; final cones
+10–30 cells tall, mound-shaped, no spire, all 13 acceptance criteria green.
 
 **Forest** and **Ocean** are one-liners by comparison:
 
