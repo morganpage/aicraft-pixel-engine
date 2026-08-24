@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`engine.stampDisc(cx, cy, radius, mat, opts?)` — the brush primitive.**
+  Stamps a filled Euclidean disc of material through the full `setMaterial`
+  bookkeeping (wake + render-dirty + heat ride-along), bounds-clipped, and
+  returns the number of cells written. By default it paints only `EMPTY` cells
+  — god-game brush semantics, so painting over terrain never carves into it;
+  pass `{ overwrite: true }` for `setMaterial` semantics. Pure function of its
+  arguments (no RNG, no frame state). Extracted from the god-game build: every
+  paint-style host was re-writing the same bounds-checked disc loop by hand.
+  For a large one-off world stamp, `beginBulk()`/`setMaterial`/`endBulk()`
+  remains the fast path.
+
 ## [0.1.2] — 2026-08-06
 
 ### Changed

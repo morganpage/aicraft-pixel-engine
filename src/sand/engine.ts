@@ -1245,6 +1245,44 @@ export class PixelEngine {
   }
 
   /**
+   * Stamp a filled disc of `mat` centred on the cell `(cx, cy)` with Euclidean
+   * `radius` — the brush primitive every paint-style host otherwise re-writes
+   * by hand. Cells outside the grid are clipped, not wrapped.
+   *
+   * By default the stamp paints like a god-game brush: it fills only `EMPTY`
+   * cells, so painting over terrain never carves into it. Pass
+   * `{ overwrite: true }` for `{@link setMaterial}` semantics (replace
+   * whatever is there).
+   *
+   * Pure function of the arguments — no RNG, no frame state — so the same
+   * stamp always writes the same cells. Each write goes through the full
+   * {@link setMaterial} bookkeeping (wake + render-dirty + heat ride-along),
+   * so painted cells start simulating immediately. For a large one-off world
+   * stamp (thousands of cells, once), prefer `beginBulk()` + `setMaterial` +
+   * `endBulk()`, which skips the per-cell work and recovers it in one pass.
+   *
+   * @returns the number of cells actually written (clipped or skipped cells
+   *   do not count).
+   */
+  stampDisc(cx: number, cy: number, radius: number, mat: MaterialType, opts?: { overwrite?: boolean }): number {
+    if (radius < 0) return 0;
+    const r2 = radius * radius;
+    const overwrite = opts?.overwrite ?? false;
+    let written = 0;
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (dx * dx + dy * dy > r2) continue;
+        const x = cx + dx, y = cy + dy;
+        if (x < 0 || x >= this.width || y < 0 || y >= this.height) continue;
+        if (!overwrite && this.getMaterial(x, y) !== MaterialType.EMPTY) continue;
+        this.setMaterial(x, y, mat);
+        written++;
+      }
+    }
+    return written;
+  }
+
+  /**
    * Swap the materials at two cells. Keeps `colorGrid` (if present) in sync,
    * marks both cells processed-this-frame, wakes chunks, and flags render
    * dirtiness. Terrain-dirty is tracked when a structural solid moves.

@@ -8,8 +8,10 @@ imports everything from the engine and writes no re-implementations of what the
 engine already provides.
 
 [god-game.md](./god-game.md) pins `aicraft-pixel-engine@0.1.2` — a version, not
-a range — and every import it claims compiles against the published `0.1.2`
-surface.
+a range (install with `npm install --save-exact`, or npm writes `^0.1.2` into
+package.json) — and every import it claims compiles against the published
+`0.1.2` surface. The brief was validated end-to-end by building the game from
+it against the npm package and testing every power in a browser.
 
 For a maximum-quality run, [god-game-gauntlet-prompt.txt](./god-game-gauntlet-prompt.txt)
 is a launcher prompt: it points the agent at the hosted brief and adds a
@@ -33,6 +35,11 @@ The common contract every prompt here enforces:
   box stays square (no stretching), repaint honours
   `consumeRenderDirtyChunks()` (mind the `putImageData` dirty-offset trap), and
   the camera is a `ctx` transform that never touches the engine.
+- **Pointer-capture hygiene** — canvas games that `setPointerCapture` must also
+  stop painting/panning on window-level `pointerup` / `pointercancel` / `blur`
+  and release the capture; a pointer stream that ends without a clean
+  `pointerup` on the captured element otherwise leaves the canvas swallowing
+  every later click (observed in the wild during the god-game build).
 - **Root-barrel imports only** from the npm package — the `exports` map
   publishes a single `.` entry; deep subpaths like `aicraft-pixel-engine/src/…`
   are not part of the public surface.

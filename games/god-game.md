@@ -36,8 +36,12 @@ the forbidden-pattern checks.
 ```bash
 npm create vite@latest god-game -- --template vanilla-ts
 cd god-game
-npm install aicraft-pixel-engine@0.1.2
+npm install --save-exact aicraft-pixel-engine@0.1.2
 ```
+
+(`--save-exact` matters: a plain `npm install pkg@0.1.2` writes `"^0.1.2"` to
+package.json, and the brief targets the `0.1.2` API exactly — a version, not
+a range.)
 
 - **TypeScript**, strict. **Vite** dev server + build. Single `<canvas>` in
   `index.html`.
@@ -264,6 +268,17 @@ canvas.addEventListener('wheel', (e) => {
 // Middle-mouse drag, or space + left drag — pick one and stay consistent.
 ```
 
+> **⚠️ Pointer-capture hygiene — read this if you call `setPointerCapture`.**
+> The natural pattern (capture on `pointerdown`, stop painting/panning on the
+> canvas's `pointerup`) hangs when a pointer stream ends without a clean
+> `pointerup` on the captured element — synthetic/automated drags, alt-tab
+> mid-drag, some touch drivers. The canvas then keeps capture forever: the
+> brush keeps pouring at the last cell and every later click (toolbar
+> included) is swallowed. This was observed in the wild during the reference
+> build. Harden it: also stop on **window-level** `pointerup`, `pointercancel`,
+> and `blur`, and call `releasePointerCapture(id)` (in a `try`/`catch`) when
+> you stop.
+
 Brush radii and cloud placement use grid coordinates, so they automatically scale
 correctly with zoom without extra work.
 
@@ -280,8 +295,11 @@ correctly with zoom without extra work.
 
 `engine.consumeRenderDirtyChunks()` returns a `Uint8Array` with one byte per
 32×32 chunk; a non-zero byte means that chunk's pixels changed this frame and
-need repainting. The structure is an offscreen canvas at grid resolution that
-you write into and then blit through the camera:
+need repainting. The **first call after construction (or `clear()`) reports
+every chunk dirty** — the engine hands you your initial full paint for free,
+so the loop below is all you need; there is no separate boot-paint path. The
+structure is an offscreen canvas at grid resolution that you write into and
+then blit through the camera:
 
 ```ts
 const CHUNK = engine.CHUNK_SIZE;          // 32
