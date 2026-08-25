@@ -4,6 +4,185 @@ All notable changes to **aicraft-pixel-engine** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-08-25
+
+### Changed — behavior
+
+- **`needsSupport` is now an *anchored* test, not an adjacency test.** A
+  `needsSupport` cell stands only if it is cardinally connected, through
+  structural cells, to something that can bear load without needing support
+  itself. New public method: `PixelEngine.isAnchored(x, y)`.
+
+  The old rule asked whether *any* of the four cardinal neighbours was
+  structural — and since WOOD is itself structural, and the test looked **up**
+  as readily as down, two stacked WOOD cells each cited the other as their
+  support and hung in open air forever. Measured against 0.2.1: a single
+  airborne WOOD cell fell correctly; a pair never moved again; a tree grown in
+  open sky kept its full 37-cell trunk and 58-cell canopy after 800 ticks.
+  Mutual support is not support. This is what made "trees growing in the air"
+  *persist* once they existed.
+
+  Two material sets keep the check honest, and conflating them breaks the
+  engine in opposite directions. Load travels **through** `isStructuralMat`
+  (WALL/ROCK/ICE/WOOD); it rests **on** `canAnchor` — any solid that is not
+  itself `needsSupport` and does not opt out via the new
+  `MaterialDef.bearsLoad`. `canAnchor` deliberately includes SAND (a tree
+  planted in soil has nothing structural anywhere near its base; require
+  structure and every tree collapses on sprout) and deliberately excludes
+  LEAF, FROND, TREE_TIP, FERN_TIP, CORAL and SEED (`bearsLoad: false`) —
+  foliage is held up by the very thing it would be vouching for, so letting it
+  anchor brings the same circularity back one material along.
+
+  Implementation is a bounded cardinal flood memoized against a `_supportEpoch`
+  counter bumped by structural writes, `swap`, `endBulk` and `clear`. The
+  verdict is written for every cell a flood visits, so the cost is one flood
+  per connected structure per structural change, not one per cell per frame.
+  A structure exceeding `MAX_SUPPORT_FLOOD` (4096 cells) reports anchored
+  without completing the search — failing toward "stays put", because dropping
+  a large structure because a search ran out of budget is a far worse artifact
+  than leaving one improbable span standing.
+
+  Worlds evolve differently under this rule, which is why it is a minor bump
+  and not a patch: a trunk whose base burns away now comes down.
+
+- **`PixelEngine.plant()` returns `boolean`** (was `void`): `true` if the cell
+  was written, `false` if the plant was refused.
+
+### Added
+
+- **`TipRule.rooted`** — refuse to establish a tip unless the cell it is
+  planted in has ground under it, gravity-relative. Set on `TREE_TIP` and
+  `FERN_TIP`.
+
+  A tip material is `isStatic`, so nothing makes it fall, and nothing in the
+  growth pass asked what was underneath it. `plant(x, y, TREE_TIP)` therefore
+  grew a complete tree wherever it was called, sky included — a god-game brush
+  that scattered tips across the cursor disc put a full trunk and canopy in
+  orbit beside the planet, reported as "trees growing in the air". `plant()`
+  now checks rootedness **before writing anything**, so a refused plant leaves
+  the grid exactly as it found it and the host can fall back to scattering a
+  `SEED` without first undoing a stray tip.
+
+  The check is at establishment, not per advance, and that placement is the
+  design: a tip leaves trunk behind it and climbs, so after its first step the
+  cell under it is its own stem; and a limb running level or downward has open
+  sky beneath it by design, so a per-advance test would prune exactly the
+  branches that make a tree read as a tree. Rootedness is a property of where
+  the plant *started*, settled once and inherited by every branch.
+
+  The SEED → TREE_TIP path is rooted by construction (an `AggregateRule` seed
+  germinates only on soil contact), so this changes nothing for hosts that
+  scatter seeds — which is the shape the brief now teaches.
+
+- **`MaterialDef.bearsLoad`** — opt a solid out of counting as ground. See
+  the `needsSupport` note above.
+
+- **`isStructuralMat` and `canAnchor`** lookup tables, exported from the
+  materials barrel. `isStructural()` now reads the table rather than an
+  inline id-comparison chain that had to be kept in sync by hand.
+
+- **`src/tests/sand-support.test.ts`** — 18 tests pinning both halves: the
+  airborne-pair collapse, wood on sand, wood on grass, cantilevers, cutting a
+  span's footing, leaves not anchoring, the grid edge as bedrock, memo
+  invalidation, and the rooting gate (including on a `RadialGravity` planet).
+
+- **`recipes/legged-walkers.ts`** — the bridge from `recipes/surface-walkers.ts`
+  onto the full slime-knight rig in `games/assets/slime-rig/`.
+
+  The reference god-game build's creatures were a ~2,200-line procedural rig
+  with two-bone IK legs, spring antennae and a morphing mouth. When the
+  creature *behavior* was promoted into `surface-walkers.ts`, the rig was not:
+  it stayed a copy-in asset whose README said to write "a thin adapter" and did
+  not ship one. So the forty lines of coupling that made it work had to be
+  re-derived by every build, and none of them did. This recipe is those forty
+  lines: the polar↔rig-canvas transform (translate to the foot point, rotate so
+  local +Y points at the core, scale, re-centre by `-HERO_CANVAS_SIZE/2,
+  -HERO_GROUND_Y`), the grid-px→canvas-px `walkDx` conversion with the phase
+  gain, and the per-tick cancel of the rig's own canvas traversal. The rig is
+  typed structurally, so the recipe typechecks in CI with no dependency on
+  `aicraft-engine`; `recipes/tests/legged-walkers-compile.ts` checks the
+  interface against the real rig so it cannot drift.
+
+### Changed — recipes
+
+- **`recipes/surface-walkers.ts` is now behaviour-only**; its
+  `drawSurfaceWalkers` is documented as a **bring-up placeholder that must not
+  ship**. The creature that ships is the rig, via `legged-walkers.ts`.
+
+  The look this recipe shipped first was a body with an eye on it, described in
+  its own header as "minimal — swap in a richer rig later". Nobody ever did.
+  Two independent builds shipped creatures a reviewer summed up as *"the
+  walkers have no legs, not really walkers then are they"* — one by copying
+  this file, one by reinventing it from the same prose.
+
+  The placeholder was given legs (two-bone IK, distance-driven stride, idle
+  stance blend, per-walker limb shades from the body colour) so that a host
+  wiring things up in order does not have a blob on screen at any point. But
+  legs alone were never the fix: all three of those properties already exist,
+  done properly, in `aicraft-engine` as `solveLimb`,
+  `advanceLocomotionByDisplacement` and `blendLocomotionToStance`. The
+  placeholder re-derives them worse, has no antennae, breathing, mouth or
+  generated palette, and now says so in its own docblock.
+
+  New `Walker` fields: `locomotion`, `limbNear`, `limbFar`. `FEAR_STARE` and
+  `FEAR_FLEE` are now exported, so `legged-walkers.ts` maps the same thresholds
+  onto gaze and mouth instead of keeping a second copy that drifts.
+
+- **`recipes/fixed-tick-clock.ts`** — documents the driver, not just the
+  accumulator. A later build reimplemented the accumulator arithmetic exactly
+  right and hung it off `requestAnimationFrame`; rAF does not fire *at all*
+  while `document.hidden`, where `setInterval` merely slows to ~1 Hz, so the
+  world froze completely whenever the tab was not frontmost — and the game
+  became unverifiable in a headless browser, where the page is hidden by
+  definition and every screenshot showed the boot frame.
+
+### Changed — the god-game brief (`games/god-game.md`)
+
+Every change below traces to something a build got wrong by following the
+brief as written:
+
+- **§3 and §8** no longer advertise `plant(x, y, TREE_TIP, { energy })` as
+  "an instant tree" with no caveat. That one table row is what a build put
+  inside its brush loop.
+- **New §8.6** — the forest power in full: scatter `SEED`, honour `plant()`'s
+  `false` return, keep energy modest.
+- **§1 now requires two packages.** `aicraft-engine@0.22.0` was listed as an
+  optional extra for "the slime rig in §8.5"; it is now a required runtime
+  dependency with its own row in the stack table, because it is where all
+  creature animation lives.
+- **§3** gains two architecture rows: creature *behaviour* (the walkers recipe)
+  and creature *animation* (`aicraft-engine`, named symbol by symbol).
+- **§8.5 rewritten around one rule: the animation comes from
+  `aicraft-engine`, and that is not negotiable.** The two-look table is gone —
+  there is one creature, the slime rig, reached through `legged-walkers.ts` in
+  four calls. A table maps each visible quality (bending knees, no
+  foot-skating, settling feet, trailing antennae, breathing, per-individual
+  colour) to the library symbol that produces it, so the cost of skipping the
+  dependency is concrete: reimplementing a 2,500-line animation library by
+  hand. `drawSurfaceWalkers` is named as a bring-up placeholder that must not
+  survive to the finished build.
+- **§9.1** — two new acceptance criteria: the creatures are *the rig* (checked
+  by name — `drawRiggedWalkers` must appear, `drawSurfaceWalkers` must not),
+  and seeds scattered over open sky grow nothing.
+- **§9.2 restructured** — was forbidden-patterns only. Now leads with
+  **§9.2.1 Required**: `src/recipes/` must exist, contain the copied files, and
+  be imported. The failed build was 746 lines in a single `main.ts` with no
+  `src/recipes/` at all; it used none of the six recipes and independently
+  reproduced four of the bugs they exist to prevent. The required list now
+  covers all seven copy-in files and greps that **both** packages are pinned
+  and imported. New forbidden entries: rAF driving `engine.update()`,
+  unchecked `plant()` under a brush, any hand-rolled IK solver / gait phase /
+  spring chain / palette generator, and `drawSurfaceWalkers` in the shipped
+  render path.
+- **§10** — new **step 0: install both packages and copy all seven recipe
+  files in before writing any game code**. Step 10 wires the walker behaviour
+  behind the placeholder look; **step 11 replaces it with the rig in the same
+  sitting**, and says explicitly that step 10 is not a finished feature. A
+  build that reaches for the recipes "later" never does.
+- **§12** — trap 5 gains the rAF clause; new traps 13 (never `plant()` into
+  unconfirmed ground), 14 (creature animation is `aicraft-engine`'s, not
+  yours) and 15 (copy the recipes at step 0).
+
 ## [0.2.1] — 2026-08-25
 
 ### Added

@@ -7,15 +7,18 @@ to a coding agent (Claude / Cursor / etc.) and it produces a runnable game that
 imports everything from the engine and writes no re-implementations of what the
 engine already provides.
 
-[god-game.md](./god-game.md) pins `aicraft-pixel-engine@0.2.0` — a version,
-not a range (install with `npm install --save-exact`, or npm writes `^0.2.0`
-into package.json) — and every import it claims compiles against the `0.2.0`
-surface. The brief was validated end-to-end by building the game from it
+[god-game.md](./god-game.md) pins two packages exactly — `aicraft-pixel-engine@0.3.0`
+for the world and `aicraft-engine@0.22.0` for the creatures (install with
+`npm install --save-exact`, or npm writes `^` ranges into package.json) — and
+every import it claims compiles against those surfaces. The brief was validated end-to-end by building the game from it
 against the package and testing every power in a browser; its volcano section
 calls the library's tested eruption subsystem rather than re-deriving one.
 
-> **0.2.0 is live on the npm registry** (`latest`) —
-> `npm install --save-exact aicraft-pixel-engine@0.2.0` works as written.
+> **0.3.0 is live on the npm registry** (`latest`) — the brief's install line
+> works as written. Do not fall back to 0.2.x: on those versions `plant()`
+> grows trees in mid-air (§8.6) and `needsSupport` lets a trunk hold itself up.
+> The creature half of the brief also needs `aicraft-engine@0.22.0` (§8.5);
+> both are pinned exactly.
 
 For a maximum-quality run, [god-game-gauntlet-prompt.txt](./god-game-gauntlet-prompt.txt)
 is a launcher prompt: it points the agent at the hosted brief and adds a

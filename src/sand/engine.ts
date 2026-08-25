@@ -30,6 +30,8 @@ import {
   isThermal,
   isImmobile,
   needsSupport,
+  isStructuralMat,
+  canAnchor,
   hasGrowth,
   hasPressure,
   hasPressureStrength,
@@ -48,6 +50,21 @@ import { mulberry32Next, mulberry32Value } from '../rng.js';
 
 /** Default simulation seed. */
 const DEFAULT_SEED = 12345;
+
+/**
+ * Cells one {@link PixelEngine.isAnchored} flood may visit before it gives up
+ * and reports "anchored".
+ *
+ * Sized against the thing the check actually protects: a tree. The tallest
+ * plant the growth rules can build is a 127-energy tip with two generations of
+ * limbs and foliage — comfortably under a thousand cells — so 4096 clears any
+ * real structure by a wide margin while bounding the worst case a host can
+ * provoke by hand-stamping a grid-spanning WOOD lattice. Erring toward
+ * "anchored" is the safe direction: an improbable span left standing is a far
+ * milder artifact than a large structure dropping because a search ran out of
+ * budget.
+ */
+const MAX_SUPPORT_FLOOD = 4096;
 
 /** Active/render-chunk size, in cells. */
 const DEFAULT_CHUNK_SIZE = 32;
@@ -953,6 +970,36 @@ export class PixelEngine {
    */
   private readonly _growthTouched: Set<number> = new Set();
 
+  // ------------------------------------------------------------------ support
+  //
+  // State for {@link isAnchored}. Lazily allocated — a world that never places
+  // a `needsSupport` material pays nothing for any of it.
+
+  /**
+   * Per-cell memo for {@link isAnchored}: 0 unknown, 1 anchored, 2 floating.
+   * Valid only where {@link _supportStamp} matches {@link _supportEpoch}.
+   */
+  private _supportState: Uint8Array | null = null;
+  /** Epoch each memo entry was written in. See {@link _supportEpoch}. */
+  private _supportStamp: Uint32Array | null = null;
+  /**
+   * Bumped whenever the structural skeleton changes — any write that adds or
+   * removes an {@link isStructuralMat} cell. Every memo entry stamped with an
+   * older epoch is stale.
+   *
+   * A global counter rather than per-chunk invalidation, and deliberately:
+   * support is a *reachability* property, so knocking a rock out of one chunk
+   * can unsupport a span many chunks away, and there is no local rule that
+   * catches that. The cost this would imply — refloading every trunk on every
+   * structural write — does not materialise, because a flood memoizes its
+   * verdict for every cell it visits: one flood per connected structure per
+   * epoch, not one per cell.
+   */
+  private _supportEpoch = 1;
+  /** Reused BFS frontier, so a support flood allocates nothing. */
+  private readonly _supportQueue: number[] = [];
+  private readonly _supportSeen: number[] = [];
+
   // ----------------------------------------------------------------- pressure
   //
   // All pressure state is lazily allocated on the first `injectLiquid`, so a
@@ -1196,6 +1243,7 @@ export class PixelEngine {
     if (this.stiffnessGrid) this.stiffnessGrid.fill(0);
     if (this.growthGrid) this.growthGrid.fill(0);
     this.growthCells.clear();
+    this._supportEpoch++;
     // Pressure sources and queued injections are host-authored state that must
     // not survive a clear: a source left alive would pump into the empty grid
     // next frame, creating material from nothing.
@@ -1296,13 +1344,119 @@ export class PixelEngine {
   /** True if `(x, y)` is a load-bearing structural solid (WOOD/WALL/ROCK/ICE). Out of bounds = solid. */
   isStructural(x: number, y: number): boolean {
     if (x < 0 || x >= this.width || y < 0 || y >= this.height) return true;
-    const mat = this.grid[this.getIndex(x, y)];
-    return (
-      mat === MaterialType.WOOD ||
-      mat === MaterialType.WALL ||
-      mat === MaterialType.ROCK ||
-      mat === MaterialType.ICE
-    );
+    return isStructuralMat[this.grid[this.getIndex(x, y)]];
+  }
+
+  /**
+   * True if `(x, y)` is connected to ground — cardinally, through structural
+   * cells, to something that can bear load without needing support itself.
+   *
+   * ## The failure it replaces
+   *
+   * {@link MaterialDef.needsSupport} used to be a one-hop neighbour test: a
+   * cell stood if any of its four cardinal neighbours was structural. Since
+   * WOOD is *itself* structural and the test looked **up** as readily as down,
+   * two stacked WOOD cells each answered "yes, the other one is holding me" and
+   * a trunk with nothing beneath it hung in the air forever. Measured against
+   * 0.2.1: a single airborne WOOD cell fell correctly, a pair never moved
+   * again, and a tree planted in open sky kept its full 37-cell trunk and
+   * 58-cell canopy after 800 ticks. Mutual support is not support.
+   *
+   * ## What "ground" means here
+   *
+   * Two different questions, two different material sets, and conflating them
+   * breaks the engine in opposite directions:
+   *
+   *  - Load travels **through** {@link isStructuralMat} cells — rock, wall,
+   *    ice, wood. A span is made of those.
+   *  - Load ultimately rests **on** {@link canAnchor} cells — any solid that is
+   *    not itself `needsSupport`, which crucially includes SAND. Trees grow in
+   *    soil; require structure underfoot and every tree in the game collapses
+   *    the frame it sprouts.
+   *
+   * Out of bounds anchors, matching {@link getMaterial}'s
+   * out-of-bounds-is-WALL convention, so a structure running off the grid edge
+   * does not unravel.
+   *
+   * ## Cost
+   *
+   * A bounded cardinal flood, memoized per epoch (see {@link _supportEpoch}).
+   * The verdict is written for **every cell the flood visits**, so resolving
+   * one cell of a trunk resolves the whole trunk: the work is one flood per
+   * connected structure per structural change, not one per cell per frame.
+   * A structure larger than {@link MAX_SUPPORT_FLOOD} cells is reported
+   * anchored without completing the search — failing toward "stays put",
+   * because dropping a cathedral because the search ran out of budget is a far
+   * worse artifact than leaving one improbable span standing.
+   */
+  isAnchored(x: number, y: number): boolean {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return true;
+    const start = this.getIndex(x, y);
+    if (!isStructuralMat[this.grid[start]]) return canAnchor[this.grid[start]];
+
+    let state = this._supportState;
+    let stamp = this._supportStamp;
+    if (state === null || stamp === null) {
+      const n = this.width * this.height;
+      state = this._supportState = new Uint8Array(n);
+      stamp = this._supportStamp = new Uint32Array(n);
+    }
+    const epoch = this._supportEpoch;
+    if (stamp[start] === epoch) return state[start] === 1;
+
+    const queue = this._supportQueue;
+    const seen = this._supportSeen;
+    queue.length = 0;
+    seen.length = 0;
+    queue.push(start);
+    // Mark on push, not on pop: the memo doubles as the visited set, so a cell
+    // reached twice is not queued twice. `seen` records what to rewrite once
+    // the verdict is known.
+    stamp[start] = epoch;
+    state[start] = 2;
+    seen.push(start);
+
+    let anchored = false;
+    let head = 0;
+    while (head < queue.length) {
+      const idx = queue[head++];
+      const cx = idx % this.width;
+      const cy = (idx - cx) / this.width;
+      for (let d = 0; d < 4; d++) {
+        const nx = cx + (d === 0 ? -1 : d === 1 ? 1 : 0);
+        const ny = cy + (d === 2 ? -1 : d === 3 ? 1 : 0);
+        if (nx < 0 || nx >= this.width || ny < 0 || ny >= this.height) {
+          anchored = true;               // the grid edge is bedrock
+          break;
+        }
+        const nIdx = ny * this.width + nx;
+        const nMat = this.grid[nIdx];
+        if (canAnchor[nMat]) {
+          // Ground. Note this fires for ROCK and WALL too, which are both
+          // conductors and anchors — a trunk touching rock stops here.
+          anchored = true;
+          break;
+        }
+        if (!isStructuralMat[nMat]) continue;   // empty, liquid, gas: no path
+        if (stamp[nIdx] === epoch && state[nIdx] !== 0) {
+          // Already decided this epoch. An anchored neighbour anchors us too;
+          // a floating one is either still in this flood or a settled verdict,
+          // and either way there is nothing to gain by re-walking it.
+          if (state[nIdx] === 1) { anchored = true; break; }
+          continue;
+        }
+        stamp[nIdx] = epoch;
+        state[nIdx] = 2;
+        seen.push(nIdx);
+        queue.push(nIdx);
+      }
+      if (anchored) break;
+      if (seen.length >= MAX_SUPPORT_FLOOD) { anchored = true; break; }
+    }
+
+    const verdict = anchored ? 1 : 2;
+    for (let i = 0; i < seen.length; i++) state[seen[i]] = verdict;
+    return anchored;
   }
 
   /** Material at `(x, y)`. Out of bounds reports as WALL. */
@@ -1345,6 +1499,9 @@ export class PixelEngine {
     // lookups per call to set a flag nothing reads is a real cost for a
     // hypothetical consumer.
     if (oldMat !== mat) {
+      // The structural skeleton changed shape, so every memoized support
+      // verdict is now suspect. One counter bump; the floods are lazy.
+      if (isStructuralMat[oldMat] || isStructuralMat[mat]) this._supportEpoch++;
       if (this.colorGrid) this.colorGrid[idx] = 0;
       // A cell that has become a different material carries none of the old
       // one's rheology.
@@ -1431,6 +1588,10 @@ export class PixelEngine {
     const m2 = this.grid[idx2];
     this.grid[idx1] = m2;
     this.grid[idx2] = m1;
+    // A falling trunk cell relocates the structural skeleton just as surely as
+    // a setMaterial write does, so the support memo has to be invalidated here
+    // too — otherwise a collapse stops one cell in and re-freezes.
+    if (isStructuralMat[m1] !== isStructuralMat[m2]) this._supportEpoch++;
     this.updated[idx1] = 1;
     this.updated[idx2] = 1;
     const v1 = this.liquidVel[idx1];
@@ -2314,24 +2475,52 @@ export class PixelEngine {
    * first tick. Spread and aggregate materials need no state, so for those this
    * is just {@link setMaterial}.
    *
+   * **A {@link TipRule.rooted} material needs ground under it** — gravity-
+   * relative, and {@link canAnchor} decides what counts (soil and rock do;
+   * open sky, water and other plants do not). Asked to plant one in midair,
+   * this writes nothing and returns `false`. That guard exists because the
+   * obvious call — `plant(x, y, TREE_TIP)` under a paint brush — grew a
+   * complete tree wherever the cursor happened to be, sky included.
+   *
+   * The paint-brush shape a host actually wants is: scatter `SEED` across the
+   * brush, which falls and germinates on soil by itself, and reserve `plant()`
+   * for the cell you have already confirmed is ground. `false` is the signal
+   * to fall back to the seed.
+   *
    * @param energy  Growth budget, 0–127. Roughly the trunk length in cells.
    * @param dir     Initial heading as a gravity-relative octant. Default 0 (up,
    *                which on a planet means radially outward).
    * @param variant Genome, 0–15. Default: rolled from the engine RNG.
+   * @returns `true` if the cell was written; `false` if the plant was refused
+   *   (out of bounds, or a `rooted` tip with nothing beneath it).
    */
   plant(
     x: number,
     y: number,
     mat: MaterialType,
     opts?: { energy?: number; dir?: Octant; variant?: number },
-  ): void {
-    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return;
-    this.setMaterial(x, y, mat);
+  ): boolean {
+    if (x < 0 || x >= this.width || y < 0 || y >= this.height) return false;
     const rule = materialDefs[mat].growth;
-    if (rule === undefined || rule.kind !== 'tip') return;
+    // Rootedness is decided before anything is written, so a refused plant
+    // leaves the grid exactly as it found it — a host can fall back to
+    // scattering a SEED at the same cell without first undoing a stray tip.
+    if (rule !== undefined && rule.kind === 'tip' && rule.rooted === true) {
+      fillNeighborFrame(x, y, this.gravity, this._growthFrame);
+      const bx = x + this._growthFrame.down.dx;
+      const by = y + this._growthFrame.down.dy;
+      const below =
+        bx < 0 || bx >= this.width || by < 0 || by >= this.height
+          ? MaterialType.WALL                     // off-grid is bedrock
+          : this.grid[this.getIndex(bx, by)];
+      if (!canAnchor[below]) return false;
+    }
+    this.setMaterial(x, y, mat);
+    if (rule === undefined || rule.kind !== 'tip') return true;
     const g = this.allocGrowth();
     const variant = opts?.variant ?? Math.floor(this.random() * 16);
     g[this.getIndex(x, y)] = packGrowth(opts?.energy ?? 12, opts?.dir ?? 0, 0, variant);
+    return true;
   }
 
   /** Growth state at `(x, y)`, or `null` if the cell has none. */
@@ -4283,12 +4472,12 @@ export class PixelEngine {
               if (needsSupport[mat]) {
                 // Cardinal only, and deliberately so: a diagonally-braced cell
                 // falls. This was WOOD's private rule before LEAF needed it.
-                const hasSupport =
-                  this.isStructural(x, y - 1) ||
-                  this.isStructural(x, y + 1) ||
-                  this.isStructural(x - 1, y) ||
-                  this.isStructural(x + 1, y);
-                if (hasSupport) continue;
+                //
+                // Anchored, not adjacent: the old one-hop test asked only
+                // whether *some* cardinal neighbour was structural, and since
+                // WOOD is structural, two stacked trunk cells held each other
+                // up in open sky forever. See isAnchored.
+                if (this.isAnchored(x, y)) continue;
               }
 
               const def = materialDefs[mat];
@@ -4875,6 +5064,9 @@ export class PixelEngine {
   endBulk(): void {
     if (!this._bulk) return;
     this._bulk = false;
+    // The bulk path skips setMaterial's bookkeeping, the support-epoch bump
+    // included, and a planet disc is nothing but structural writes.
+    this._supportEpoch++;
     this.markAllDirty();
   }
 

@@ -1,4 +1,4 @@
-# God Game — a circular-planet terraforming toy on `aicraft-pixel-engine@0.2.0`
+# God Game — a circular-planet terraforming toy on `aicraft-pixel-engine@0.3.0`
 
 > Paste this entire document to a coding agent (Claude / Cursor / etc.). It is a complete, self-contained build brief: concept, engine wiring, rendering discipline, god-power specs, acceptance criteria, and build order. The agent should produce a single runnable Vite + plain-TypeScript browser game that imports everything from `aicraft-pixel-engine` (the npm package) and writes **no** re-implementations of what the engine already provides.
 
@@ -26,7 +26,7 @@ hint), and milestone toasts — no score screen, no levels, no menus.
 
 **Target a playable MVP in one sitting, not a polished product.**
 
-**Non-negotiable: build the entire game on top of `aicraft-pixel-engine@0.2.0`.**
+**Non-negotiable: build the entire game on top of `aicraft-pixel-engine@0.3.0`.**
 Do not add a physics library, hand-roll temperature, growth, or pressure, or
 write your own falling-sand rules — those are all in the engine. See §9.2 for
 the forbidden-pattern checks.
@@ -38,17 +38,35 @@ the forbidden-pattern checks.
 ```bash
 npm create vite@latest god-game -- --template vanilla-ts
 cd god-game
-npm install --save-exact aicraft-pixel-engine@0.2.0
+npm install --save-exact aicraft-pixel-engine@0.3.0 aicraft-engine@0.22.0
 ```
 
-(`--save-exact` matters: a plain `npm install pkg@0.2.0` writes `"^0.2.0"` to
-package.json, and the brief targets the `0.2.0` API exactly — a version, not
-a range.)
+(`--save-exact` matters: a plain `npm install pkg@0.3.0` writes `"^0.3.0"` to
+package.json, and the brief targets these APIs exactly — versions, not
+ranges. 0.3.0 is where tree rooting and anchored structural support landed;
+on 0.2.x, `plant()` grows trees in mid-air — see §8.6.)
 
 - **TypeScript**, strict. **Vite** dev server + build. Single `<canvas>` in
   `index.html`.
-- **`aicraft-pixel-engine` is your only *required* runtime dependency** (the
-  optional slime rig in §8.5 adds `aicraft-engine`). Import from the
+- **Two required runtime dependencies, and both are required.**
+
+  | Package | Owns | Used by |
+  |---|---|---|
+  | `aicraft-pixel-engine@0.3.0` | The world: falling-sand simulation, radial gravity, heat, growth, pressure, the volcano subsystem | everything in §4–§8.4, §8.6 |
+  | `aicraft-engine@0.22.0` | The creatures: inverse kinematics, gait, spring chains, jump, breathing, palette generation | §8.5 |
+
+  `aicraft-engine` used to be listed here as optional. It is not optional, and
+  calling it optional is how two builds shipped creatures that were rejected on
+  sight. Its `animation` module is ~2,500 lines of locomotion, IK, foot-plant,
+  spring and squash-stretch code, and **every part of what makes a creature
+  read as alive comes out of it** — `solveLimb` bends the knees,
+  `advanceLocomotionByDisplacement` syncs the stride to ground covered,
+  `blendLocomotionToStance` settles the feet when it stops,
+  `advanceSpringChain` whips the antennae, `breathe` makes it breathe,
+  `generatePalette` makes every individual a different colour. A build that
+  skips this dependency is a build that hand-rolls all of that badly. See §8.5.
+
+  Import from the
   **root barrel only** — the published package exposes a single `.` entry:
   ```ts
   // The public API — all from the package root.
@@ -104,9 +122,11 @@ a range.)
 | Climate & thermodynamics | `enableHeat: true` + `ambientTemperature` — native conduction, radiation, phase change (§4) |
 | Ocean | `setMaterial(x, y, WATER)` — flows, levels into seas, freezes/melts with the climate |
 | Rain clouds | Host-tracked entity + `setMaterial(x, y, WATER)` per tick — **the one power that needs host logic** (§8.1) |
-| Forest | `setMaterial(x, y, SEED)` + native growth rules; `plant(x, y, TREE_TIP, { energy })` for an instant tree |
+| Forest | `setMaterial(x, y, SEED)` + native growth rules. `plant(x, y, TREE_TIP, { energy })` grows an instant tree **only where there is ground under the cell** — it returns `false` and writes nothing otherwise (§8.6) |
 | Volcano | The library subsystem: `volcanoGeometryFor` → `stampVolcano` → `stepVolcanoFrame` (+ `createVolcanoState`, `buildVolcanoOpts`, `makeRng`) — the tested cone-building eruption (§8.2) |
 | Lightning smite | Host-drawn arcing bolt + `explode(x, y, r)` (which owns the fire core) (§8.3) |
+| Creatures — behaviour | Polar surface walkers: `recipes/surface-walkers.ts` (footing, swimming, hazards, fear, boot spawn) (§8.5) |
+| Creatures — animation | **`aicraft-engine`**: `solveLimb`, `advanceLocomotionByDisplacement`, `evaluateLocomotion`, `blendLocomotionToStance`, `blendAirborneTuck`, `advanceJump`, `advanceSpringChain`, `breathe`, `generatePalette`. Composed by the slime rig, bridged by `recipes/legged-walkers.ts`. **Required, not optional** (§8.5) |
 | Game feel | Census HUD (`engine.grid` scan, 1/s), milestone toasts, day/night tint (§8.4) |
 | Rendering | `grid`, `colorGrid`, `consumeRenderDirtyChunks()`, `CHUNK_SIZE` (§5, §7) |
 | Reproducibility | `engine.random()` — seeded; never `Math.random` for grid decisions |
@@ -416,7 +436,7 @@ distinct; six is plenty:
 | **Raise Land** | Drop sand/rock at the cursor; it piles up into hills/mountains under gravity. | `setMaterial(x, y, SAND)` or `ROCK` with a brush radius |
 | **Summon Cloud** | Paint a cloud above the surface that rains water and shrinks as it empties. | Spawn a host-tracked cloud; each tick emit `WATER` at its base |
 | **Ocean** | Pour water; it flows and levels into seas around the planet. | `setMaterial(x, y, WATER)` |
-| **Forest** | Scatter `SEED` that falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. | `engine.plant(...)` / `setMaterial(x, y, SEED)` |
+| **Forest** | Scatter `SEED` across the brush; it falls, germinates on soil, and grows into a tree. `GRASS` creeps outward from water on its own. Reserve `plant()` for a cell you have confirmed is ground (§8.6). | `setMaterial(x, y, SEED)`; `engine.plant(...)` for a checked cell |
 | **Volcano** | Open a magma vent: lava is pressure-fed up a conduit, ejects from the summit, flows downslope, and cools to rock. Ejecta fragments into tephra and builds a cone — then, once cooled, the ash greens over. | `stampVolcano` + `stepVolcanoFrame` (the library's tested eruption subsystem) |
 | **Smite** | Lightning bolt strikes the cursor: a jagged flash, an ignition at the impact, and a small scorch. | Host-drawn bolt (one-frame visual) + `setMaterial(x, y, FIRE)` / `engine.explode(x, y, r)` at the strike point |
 
@@ -662,15 +682,74 @@ host-side; none touch the engine beyond reads.
  a live volcano keeps them scared and at a distance. Fear is an event-driven
  scalar with decay — read the strike/vent state your power code already has.
 
- The reference build's creature art is a ~2,200-line procedural rig (gazing
- eye, blinking, mouth morphs, antenna physics) shipped as a copy-in asset:
- [`games/assets/slime-rig/`](./assets/slime-rig/). It builds on the sibling
- package's animation primitives, so using it means one extra dependency:
- `npm install --save-exact aicraft-engine` (its `solveLimb`,
- `advanceSpringChain` and palette helpers — see the rig's README). Compose
- the rig; do not reinvent it. A minimal slime (body + eye + hop — as baked
- into the walkers recipe below) satisfies the acceptance criteria; the rig
- is polish.
+ #### The animation comes from `aicraft-engine`. This is not negotiable.
+
+ Creature animation is **not yours to write**. It is a solved problem living
+ in `aicraft-engine`, and the only acceptable creature in this build is the
+ slime rig composed on top of it. Three files, all copy-in, plus one
+ dependency:
+
+ ```
+ src/recipes/surface-walkers.ts   behaviour: footing, fear, spawn contract
+ src/recipes/legged-walkers.ts    the bridge (polar frame ↔ rig canvas)
+ src/recipes/slime-knight.ts      the rig: proportions, palette, drawing
+         ↓ imports 22 symbols
+ aicraft-engine@0.22.0            ALL of the motion
+ ```
+
+ ```ts
+ import * as rig from './recipes/slime-knight';
+ import { createSurfaceWalkers, stepSurfaceWalkers } from './recipes/surface-walkers';
+ import { createRiggedWalkers, stepRiggedWalkers, drawRiggedWalkers } from './recipes/legged-walkers';
+
+ const pop    = createSurfaceWalkers(engine, { centerX: CX, centerY: CY, seed: SEED });
+ const rigged = createRiggedWalkers(pop, rig);
+
+ // per tick
+ stepSurfaceWalkers(engine, pop, { strikes, vents }, tick);
+ stepRiggedWalkers(pop, rigged, rig);
+
+ // per frame, under the camera transform
+ drawRiggedWalkers(ctx, pop, rigged, rig, tick);
+ ```
+
+ That is the whole integration. It is four calls.
+
+ #### Why the rule is this blunt
+
+ This is the single most reliable way this build has failed, twice: creatures
+ drawn as an ellipse with an eye, sliding along the surface. The reviewer's
+ verdict both times was *"the walkers have no legs, not really walkers then
+ are they"*. Both builds had correct footing and fear behaviour behind the
+ blob; it rescued nothing.
+
+ The reason both builds landed there is that the brief used to call
+ `aicraft-engine` optional and describe a blob as sufficient. It is neither.
+ Here is what the dependency actually gives you, and what you are otherwise
+ signing up to reimplement:
+
+ | You see | `aicraft-engine` symbol |
+ |---|---|
+ | Knees that bend, feet that reach the ground | `solveLimb` |
+ | Stride synced to ground covered — no foot-skating | `advanceLocomotionByDisplacement`, `evaluateLocomotion`, `DEFAULT_GAIT` |
+ | Feet settling into a stance instead of freezing mid-step | `blendLocomotionToStance` |
+ | Legs tucking in the air, landing squat | `advanceJump`, `evaluateJump`, `blendAirborneTuck` |
+ | Antennae that whip and trail | `advanceSpringChain` |
+ | A body that breathes while idle | `breathe` |
+ | Every individual a different colour | `generatePalette` |
+
+ Every one of those is load-bearing, and every one of them is subtle enough
+ that a hand-rolled version looks wrong without the author being able to say
+ why. Foot-skating in particular is invisible in a still screenshot and
+ obvious in motion — which is how it survives a screenshot-based QA pass.
+
+ #### The one look that is not the rig
+
+ `recipes/surface-walkers.ts` also exports `drawSurfaceWalkers`, a minimal
+ legged placeholder with no dependencies. It exists so you can see *something*
+ on screen at step 10 before wiring the rig at step 11. **It must not appear in
+ the finished build** — §9.2.2 greps for it. It re-derives, worse, three things
+ `aicraft-engine` already does properly.
 
  **Spawn contract — walkers are present from boot.** Spawn ≈16 creatures
  at world creation with staggered timers so the population is established
@@ -682,9 +761,61 @@ host-side; none touch the engine beyond reads.
  but its floor is never zero, and respawn after death uses the same
  any-walkable-footing rule. The reference behavior ships as
  [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts) — footing,
- swimming, hazards, fear (freeze-stare → flee), and a minimal body + eye +
- hop look, with the spawn contract pinned by tests. Copy it and feed it
- your strike and vent state.
+ swimming, hazards, fear (freeze-stare → flee), with the spawn contract
+ pinned by tests. Copy it and feed it your strike and vent state; the rig
+ draws it.
+
+### 8.6 Forest: seeds fall, tips must already be standing on something
+
+The forest brush has exactly one trap in it, and a previous build walked
+straight into it: scattering `TREE_TIP` directly across the brush disc grew
+**complete trees hanging in open sky** beside the planet. Two engine
+properties combined to produce that, and both are fixed as of 0.3.0 — but the
+shape of the power still matters, so build it this way:
+
+```ts
+// The brush: scatter SEED into empty cells. That is the whole power.
+// SEED falls under gravity and germinates ONLY on contact with soil
+// (SAND / GRASS / TEPHRA), so rooting is guaranteed by construction and
+// there is nothing for the host to check.
+for (const [x, y] of brushCells(gx, gy, radius)) {
+  if (engine.getMaterial(x, y) !== MaterialType.EMPTY) continue;
+  engine.setMaterial(x, y, MaterialType.SEED);
+}
+```
+
+`plant(x, y, TREE_TIP, { energy })` still exists and is still the way to get
+an instant, fully-grown tree — a starter world, a milestone, a cheat key.
+**It now refuses a cell with no ground under it and returns `false`**,
+writing nothing, so the failure is a no-op rather than a grove in orbit.
+Treat the return value as the signal to fall back:
+
+```ts
+// Instant tree where the ground allows it; a seed to sit and wait where it
+// does not. Never assume plant() succeeded.
+if (!engine.plant(x, y, MaterialType.TREE_TIP, { energy: 14 })) {
+  engine.setMaterial(x, y, MaterialType.SEED);
+}
+```
+
+Two things worth knowing about why this was possible at all, because they
+shape what to expect from the engine elsewhere:
+
+- **Tip materials are `isStatic`.** Nothing makes them fall, so a tip placed
+  in the sky simply grew from there. Rooting is checked once, when the tip is
+  established — not per advance, because a limb running level or downward has
+  open sky beneath it by design, and a per-advance test would prune exactly
+  the branches that make a tree read as a tree.
+- **`needsSupport` is now *anchored*, not adjacent.** It used to ask only
+  whether some cardinal neighbour was structural — and since WOOD is itself
+  structural, two stacked trunk cells each cited the other and floated
+  forever. It now traces connectivity through structure to actual ground
+  (`engine.isAnchored`), so a trunk whose base burns away comes down.
+
+Keep energy modest. Energy is roughly the trunk length in cells, and the
+tuned default (10, from the SEED germination rule) puts a tree at about a
+fifth of a 66-cell planet's radius. Numbers in the 20s produce beanstalks.
+
 
 ---
 
@@ -703,12 +834,61 @@ A single page where, within a few minutes of loading, a player can:
 - [ ] See creatures walking the surface within seconds of loading — on the
   bare-rock world, before any gardening — and watch them freeze, stare, and
   flee when you smite near them (§8.5).
+- [ ] See that those creatures are **the `aicraft-engine` slime rig** — not a
+  stand-in. Zoom in: IK legs with knees that bend and feet that plant, a
+  stride that advances with ground covered (walk alongside one and watch for
+  foot-skating), antennae that trail and settle, a mouth that turns nervous
+  when you smite, and a different colour on every individual. `grep -rn
+  "drawRiggedWalkers" src/` must hit; `grep -rn "drawSurfaceWalkers" src/`
+  must not. Shipping a hand-rolled creature is the most common way this build
+  has failed (§8.5).
+- [ ] Scatter seeds over open sky and see **nothing grow there** — no trunk,
+  no canopy, no floating grove. Every tree in the world is standing on
+  ground (§8.6).
 - There is **no UI beyond the toolbar**. No score, no levels, no menus. The
   simulation reacting to the player *is* the game.
 
-### 9.2 Forbidden patterns — do NOT
+### 9.2 Static checks — required files, then forbidden patterns
 
-Static checks (grep the game source) must find:
+This is the only section of the brief written to be **mechanically verified**.
+Run it as a grep over the game source before declaring any stage done.
+
+#### 9.2.1 Required — the recipes must actually be in the tree
+
+The last failed build was **746 lines in a single `main.ts`, with no
+`src/recipes/` directory at all**. It used none of the six recipes: it
+reinvented the camera, the dirty-chunk painter, the census, the tick clock and
+the walkers, and reproduced — independently, from the same prose — the exact
+bugs each recipe exists to prevent. Asking nicely ("copy it and feed it your
+strike state") is not a check, so here is the check:
+
+```bash
+# Every one of these must exist and be non-empty.
+ls src/recipes/{fixed-tick-clock,radial-camera,dirty-chunk-renderer,census}.ts
+ls src/recipes/{surface-walkers,legged-walkers,slime-knight}.ts
+
+# ...and the game must actually import them, not just carry them.
+grep -rn "from './recipes/" src/ | sort
+
+# Both dependencies must be pinned exactly, and BOTH must be reachable from
+# the source. aicraft-engine is what animates the creatures (§8.5) — a build
+# that installs it and never imports it has hand-rolled the creatures.
+grep -E '"aicraft-(pixel-)?engine"' package.json
+grep -rn "aicraft-engine" src/ | head
+
+# The rig must be the thing on screen.
+grep -rn "drawRiggedWalkers" src/
+```
+
+A from-scratch reimplementation of something a recipe already does is a
+**failed stage**, not a stylistic choice. If a recipe genuinely does not fit,
+say so explicitly in a comment naming what it could not do — do not silently
+re-sketch it.
+
+The one structural rule that follows: **a multi-file `src/`**. If the whole
+game is one file, the recipes are not in it.
+
+#### 9.2.2 Forbidden — greps that must come back empty
 
 - **No physics library** (no `planck`/matter.js). The engine has no rigid bodies
   and isn't trying to. Trees, buildings, creatures are pixels, not
@@ -727,6 +907,20 @@ Static checks (grep the game source) must find:
   keep the CSS box square (§5). A stretched backing store turns the circular
   planet into an ellipse and breaks the mouse-to-grid mapping.
 - **No `Math.random` / `Date.now` feeding the grid** — §2 applies.
+- **No `requestAnimationFrame` driving `engine.update()`.** Render from rAF if
+  you like; the simulation runs on the `setInterval` accumulator, or the world
+  stops dead in a hidden tab (§12.5).
+- **No bare `engine.plant(...)` under a paint brush.** Either scatter `SEED`,
+  or check `plant()`'s return value — an unchecked `plant()` across a brush
+  disc is how trees ended up growing in the sky (§8.6).
+- **No hand-rolled creature animation.** No local IK solver, no gait phase
+  maths, no spring chain, no palette generator. All of it is in
+  `aicraft-engine` and composed by the rig (§8.5). Greps that must come back
+  empty: a local `solveKnee`/`solveLimb` definition, `Math.acos` or
+  `Math.atan2` inside a creature draw path, a hand-written `strideLength`.
+- **No `drawSurfaceWalkers` in the finished build.** It is the bring-up
+  placeholder from step 10, not a shippable look; step 11 replaces it with
+  `drawRiggedWalkers` (§8.5).
 
 ---
 
@@ -734,10 +928,23 @@ Static checks (grep the game source) must find:
 
 Build in this order:
 
+0. **Copy the recipes in first, before writing any game code.** Install both
+   dependencies (§1), create `src/recipes/`, and copy in
+   `fixed-tick-clock.ts`, `radial-camera.ts`, `dirty-chunk-renderer.ts`,
+   `census.ts`, `surface-walkers.ts` and `legged-walkers.ts` from the engine
+   repo's `recipes/`, plus `slime-knight.ts` from `games/assets/slime-rig/`.
+   Change each file's import from `'../src/index.js'` to
+   `'aicraft-pixel-engine'`. This is step 0 and not a late step for a measured
+   reason: a build that reaches for them later never does, and re-derives
+   every bug they document instead (§9.2.1). **Goal: `ls src/recipes/`
+   returns seven files and `tsc --noEmit` is clean.**
 1. Vite + TS scaffold, install the engine, stamp the planet disc, render raw
-   grid colors in a `setInterval` loop. Use the dirty-chunk repaint from §7
-   (and mind the `putImageData` warning) — a full-canvas
-   `putImageData(img, 0, 0)` also works to start. **Goal: see a grey disc.**
+   grid colors driven by `startFixedTickClock` from the recipe — a
+   `setInterval` accumulator, never `requestAnimationFrame` (§12.5). Use the
+   dirty-chunk repaint from §7 (and mind the `putImageData` warning) — a
+   full-canvas `putImageData(img, 0, 0)` also works to start. **Goal: see a
+   grey disc, and see it still simulating after the tab has been in the
+   background for a minute.**
 2. Add mouse→grid + a sand brush; drag to drop sand that piles on the surface.
    **Goal: feel the gravity.**
 3. Add the camera: wheel-zoom toward cursor, middle-drag pan, double-click
@@ -748,14 +955,28 @@ Build in this order:
    rock on its own. **Goal: geology without host code.**
 6. Add the cloud power (host entity + rain spawn). **Goal: weather.**
 7. Wire the library volcano (`stampVolcano` + per-tick `stepVolcanoFrame`, §8.2). **Goal: a fountaining, cone-building eruption.**
-8. Scatter `SEED` / `plant()` a tree; watch a forest establish. **Goal: life.**
+8. Scatter `SEED` across the forest brush and watch a forest establish (§8.6).
+   Use `plant()` only on a cell you have checked, and honour its `false`
+   return. **Goal: life — and nothing growing in the sky.**
 9. Add lightning smite (host-drawn bolt + `FIRE`/`explode` at the strike).
    **Goal: wrath.**
-10. Add surface walkers: copy
-   [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts) and feed it
-   your strike/vent state (§8.5). **Goal: an inhabited world that reacts
-   to you — creatures visible on the bare rock within seconds.**
-11. Polish: nicer colors, brush-size slider, a "clear world" button.
+10. Wire the walker *behaviour*: feed
+   [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts) your
+   strike/vent state and draw it with `drawSurfaceWalkers` — the placeholder
+   look — just to confirm the population, footing and fear all work.
+   **Goal: creatures visible on the bare rock within seconds, reacting to you.**
+11. **Replace the placeholder with the rig, and do it in the same sitting.**
+   Wire [`recipes/legged-walkers.ts`](../recipes/legged-walkers.ts) to
+   `slime-knight.ts` and swap `drawSurfaceWalkers` for `drawRiggedWalkers`
+   (§8.5, four calls). Then delete the `drawSurfaceWalkers` import.
+
+   Do not defer this and do not treat step 10 as a finished feature. Two
+   builds stopped at step 10, called the creatures done, and were rejected on
+   sight. The gap between the two steps is the entire difference between
+   "there are things on my planet" and the creatures people remember.
+   **Goal: IK legs, trailing antennae, morphing mouths, a colour per
+   individual — and `grep -rn "drawSurfaceWalkers" src/` returning nothing.**
+12. Polish: nicer colors, brush-size slider, a "clear world" button.
 
 ---
 
@@ -798,9 +1019,16 @@ once before declaring done.
    measured story is in the engine CHANGELOG's 0.2.0 section.)
 4. **A pressure source buried in another material is skipped forever.** The
    source cell must be EMPTY or its own material.
-5. **Timer throttling.** Occluded tabs throttle `setInterval` to ~1 Hz; drive
-   fixed steps from a wall-clock accumulator with a clamped catch-up (§2,
-   [`recipes/fixed-tick-clock.ts`](../recipes/fixed-tick-clock.ts)).
+5. **Timer throttling — and the driver, not just the accumulator.** Occluded
+   tabs throttle `setInterval` to ~1 Hz; drive fixed steps from a wall-clock
+   accumulator with a clamped catch-up (§2,
+   [`recipes/fixed-tick-clock.ts`](../recipes/fixed-tick-clock.ts)). **Drive
+   that accumulator from `setInterval`, never `requestAnimationFrame`.** rAF
+   does not fire at all in a hidden tab, where `setInterval` merely slows — a
+   later build got the accumulator arithmetic exactly right, hung it off rAF,
+   and froze the entire world whenever the tab was not frontmost. It also
+   makes the game unverifiable headlessly, where the page is hidden by
+   definition and every screenshot shows the boot frame.
 6. **Pointer-capture hygiene.** Stop painting/panning on window-level
    `pointerup`/`pointercancel`/`blur` and release the capture, or one broken
    drag wedges all input (§6, [`recipes/radial-camera.ts`](../recipes/radial-camera.ts)).
@@ -820,3 +1048,20 @@ once before declaring done.
     reviewer concludes they were never built — this happened. Walkers
     spawn at boot on any walkable footing, bare rock included (§8.5,
     [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts)).
+13. **Never `plant()` a tree tip in a cell you have not confirmed is
+    ground.** The engine now refuses and returns `false`, so the worst case
+    is a silent no-op — but a brush that ignores the return value plants
+    nothing across half its disc and the power feels broken. Scatter `SEED`
+    and let it fall; that is what it is for (§8.6).
+14. **Creature animation is not yours to write — it is `aicraft-engine`'s.**
+    Two builds hand-rolled an ellipse with an eye and both were rejected on
+    sight. The IK, the gait, the spring chains, the breathing and the palettes
+    are all in that package, composed by the slime rig and bridged by
+    `recipes/legged-walkers.ts`. If your source contains an IK solver, a
+    stride-phase calculation or a colour generator, you have reimplemented —
+    badly — code you already installed. `drawSurfaceWalkers` is a bring-up
+    placeholder and must not survive to the finished build (§8.5, §9.2.2).
+15. **Copy the recipes at step 0, not "later".** Every trap on this list from
+    1, 2, 5 and 6 is already solved inside a recipe file. The build that
+    ignored them reproduced four of them in 746 lines, in one file, in under
+    half an hour (§9.2.1, §10 step 0).

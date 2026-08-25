@@ -5,6 +5,8 @@ export {
   isThermal,
   isImmobile,
   needsSupport,
+  isStructuralMat,
+  canAnchor,
   hasGrowth,
   hasPressure,
   hasPressureStrength,

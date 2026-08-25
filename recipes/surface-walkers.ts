@@ -40,9 +40,31 @@ import type { PixelEngine } from '../src/index.js';
  *
  * Usage: create after the planet stamp, step once per fixed 1/60s tick
  * (see `fixed-tick-clock.ts`) feeding your power code's threat state,
- * draw under the camera transform in grid space. The look is a minimal
- * body + eye + hop — swap in a richer rig later; the behavior is the part
- * worth not reinventing.
+ * draw under the camera transform in grid space.
+ *
+ * ## The look lives elsewhere — and it is not optional
+ *
+ * This file owns **behaviour only**. The creature you actually ship is the
+ * slime rig composed on `aicraft-engine`, reached through
+ * [`legged-walkers.ts`](./legged-walkers.ts):
+ *
+ * ```ts
+ * import * as rig from './slime-knight';
+ * const rigged = createRiggedWalkers(pop, rig);
+ * stepRiggedWalkers(pop, rigged, rig);      // per tick, after stepSurfaceWalkers
+ * drawRiggedWalkers(ctx, pop, rigged, rig, tick);
+ * ```
+ *
+ * `drawSurfaceWalkers` below is a **bring-up placeholder**, not a second
+ * supported look. It exists so a host can see its population on screen before
+ * the rig is wired, and it must not survive into a finished build — it
+ * re-derives, worse, three things `aicraft-engine` already does properly
+ * (`solveLimb`, `advanceLocomotionByDisplacement`, `blendLocomotionToStance`).
+ *
+ * This file used to draw an ellipse with an eye and describe it as "minimal —
+ * swap in a richer rig later". Nobody ever did: two builds shipped creatures a
+ * reviewer summed up as "no legs, not really walkers then are they", and the
+ * reason both stopped there is that the prose let them.
  */
 
 /** Footing a walker can stand on. Bare rock counts — see the header. */
@@ -79,14 +101,82 @@ const MAX_SPAWN_ATTEMPTS = 40;
 const FEAR_TICKS = 260;
 /** Strike relevance radius in grid px. */
 const FEAR_RADIUS = 120;
-/** Below STARE they carry on; between the two they freeze and stare; above FLEE they run. */
-const FEAR_STARE = 0.2;
-const FEAR_FLEE = 0.5;
+/**
+ * Below STARE they carry on; between the two they freeze and stare; above FLEE
+ * they run. Exported because an alternative look — `legged-walkers.ts` — has to
+ * map the same thresholds onto its own gaze and mouth, and two copies of a
+ * tuning value drift.
+ */
+export const FEAR_STARE = 0.2;
+export const FEAR_FLEE = 0.5;
+
+// --- the walk cycle -------------------------------------------------------
+//
+// Grid pixels. Sized against BODY_H (12) so the drawn creature matches the
+// body the hazard probes sample: hip height plus the body above it comes to
+// ~11px from the feet, which sits just inside it. Change these together or the
+// feet stop reaching the ground.
+
+/** Thigh and shin. Their sum is the leg's reach; HIP_HEIGHT is its rest height. */
+const THIGH = 2.9;
+const SHIN = 2.9;
+/**
+ * Hip height at rest, as a fraction under full reach. Legs start slightly bent
+ * so the IK solver has room to extend on the swing — at full reach the knee
+ * has no bend direction to resolve and the leg reads as a rigid stick.
+ */
+const HIP_HEIGHT = (THIGH + SHIN) * 0.86;
+/**
+ * How far the hip joint sits *inside* the body's lower edge.
+ *
+ * Zero looks wrong in a way that is easy to ship by accident: put the hips
+ * exactly on the body's boundary and the rounded silhouette curves away from
+ * them, leaving a visible sliver of background between body and legs. The
+ * creature then reads as a head hovering over a pair of legs rather than as
+ * one animal. Tucking the joint up inside the fill closes it at every point of
+ * the stride, including the lean.
+ */
+const HIP_INSET = 1.5;
+/** How far a foot swings fore/aft of the hip. Roughly one body width. */
+const STRIDE_LENGTH = 2.6;
+/** Peak toe clearance on the swing phase. */
+const STRIDE_HEIGHT = 1.6;
+/** Centre-to-centre foot distance in the idle stance. */
+const FOOT_SPREAD = 3.4;
+/** Hip separation. Narrower than the stance, so legs splay outward slightly. */
+const HIP_SPREAD = 2.2;
+const LEG_WIDTH = 1.5;
+const FOOT_WIDTH = 1.2;
+const FOOT_LENGTH = 1.4;
+/** Body rise/fall over the stride, and the lean it carries into a run. */
+const BODY_BOUNCE = 0.7;
+const LEAN = 0.45;
+const BODY_RX = 4.4;
+const BODY_RY = 3.6;
+/**
+ * Ticks a walker takes to settle from a stride into a two-foot stance, and to
+ * pick a stride back up. Ramping rather than switching is what stops a walker
+ * freezing with one foot in the air the instant it stops.
+ */
+const STANCE_BLEND_TICKS = 8;
+const OUTLINE = '#141a12';
 
 export interface Walker {
   readonly seed: number;
   /** Fill colour, fixed at creation so individuals are recognizable. */
   readonly color: string;
+  /**
+   * Limb shades, near and far, derived from {@link color} at creation.
+   *
+   * Fixed dark greens were tried first and the legs vanished: at this scale a
+   * limb is one or two pixels wide, and a colour picked to read against one
+   * background reads as empty space against another. Tying the limbs to the
+   * body's own hue keeps an individual coherent and keeps the legs visible on
+   * any terrain, which matters more than it sounds — invisible legs are
+   * indistinguishable from no legs, which is the bug this look exists to fix.
+   */
+  readonly limbNear: string;
+  readonly limbFar: string;
   angle: number;
   radius: number;
   vRadial: number;
@@ -98,6 +188,12 @@ export interface Walker {
   fear: number;
   /** Hop phase; advances with actual movement so idle bodies are still. */
   bobPhase: number;
+  /**
+   * How much of the striding pose is applied, 0..1. Ramps toward 1 while the
+   * walker is covering ground and toward 0 when it stops, over
+   * {@link STANCE_BLEND_TICKS} — see `drawSurfaceWalkers`.
+   */
+  locomotion: number;
   alive: boolean;
   respawnTimer: number;
 }
@@ -173,9 +269,15 @@ export function createSurfaceWalkers(
   for (let i = 0; i < count; i++) {
     const seed = (rng() * 0xffffffff) >>> 0;
     const hue = 96 + (seed % 1000) / 1000 * 80; // green → teal → mint
+    const h = hue.toFixed(0);
+    const light = 46 + (seed % 97) / 97 * 12;
     list.push({
       seed,
-      color: `hsl(${hue.toFixed(0)}, 62%, ${(46 + (seed % 97) / 97 * 12).toFixed(0)}%)`,
+      color: `hsl(${h}, 62%, ${light.toFixed(0)}%)`,
+      // Two steps down in lightness, up in saturation: reads as the same
+      // creature in shadow rather than as a different material.
+      limbNear: `hsl(${h}, 48%, ${(light - 17).toFixed(0)}%)`,
+      limbFar: `hsl(${h}, 44%, ${(light - 27).toFixed(0)}%)`,
       angle: 0,
       radius: opts.centerY,
       vRadial: 0,
@@ -185,6 +287,7 @@ export function createSurfaceWalkers(
       wanderTimer: WANDER_MIN + rng() * (WANDER_MAX - WANDER_MIN),
       fear: 0,
       bobPhase: rng() * Math.PI,
+      locomotion: 0,
       alive: false,
       // Staggered boot spawn: the whole population within a few seconds.
       respawnTimer: i * SPAWN_STAGGER_TICKS,
@@ -423,15 +526,61 @@ export function stepSurfaceWalkers(
     }
 
     w.bobPhase += Math.abs(gridDx) * 0.9;
+    // Ramp the drawn stride with whether the walker is actually covering
+    // ground, not with its `walking` intent: a walker pressed against a wall
+    // still intends to walk, and should not be striding on the spot.
+    const target = Math.abs(gridDx) > 0.001 ? 1 : 0;
+    w.locomotion += (target - w.locomotion) / STANCE_BLEND_TICKS;
+    w.locomotion = Math.max(0, Math.min(1, w.locomotion));
     if (w.angle < 0) w.angle += Math.PI * 2;
     if (w.angle >= Math.PI * 2) w.angle -= Math.PI * 2;
   }
 }
 
 /**
- * Draw the population in grid space — call under the camera transform
- * (after the planet blit, before UI). Minimal look: squash-and-stretch hop
- * body, gazing eye that looks at the sky when afraid, blink.
+ * **Bring-up placeholder. Do not ship this.** Use `drawRiggedWalkers` from
+ * [`legged-walkers.ts`](./legged-walkers.ts) instead — see the file header.
+ *
+ * Draw the population in grid space — call under the camera transform (after
+ * the planet blit, before UI).
+ *
+ * ## Why this exists at all, and why it is not the answer
+ *
+ * `aicraft-pixel-engine` ships with zero runtime dependencies, and this recipe
+ * has to be usable the moment it is copied in — before the host has installed
+ * `aicraft-engine` or copied the rig. So there is a look here. It is a
+ * stopgap for that gap and nothing more.
+ *
+ * Everything below re-derives, worse, code that `aicraft-engine` already
+ * ships: `solveKnee` is a poorer `solveLimb`, the `bobPhase` stride is a
+ * poorer `advanceLocomotionByDisplacement`, the `locomotion` ramp is a poorer
+ * `blendLocomotionToStance`. It has no antenna physics, no breathing, no mouth,
+ * no generated palette, and no tuning behind its proportions. A build that
+ * ships it has hand-rolled its creatures, which is the failure the whole
+ * §8.5 section of the brief exists to prevent.
+ *
+ * The first version of this function drew an ellipse with an eye on it, and
+ * two independent builds shipped creatures a reviewer described as "no legs,
+ * not really walkers then are they" — one by copying this file, one by
+ * reinventing it from the same prose. Legs alone were not the fix; the fix is
+ * the rig. What follows is at least honest about being a placeholder.
+ *
+ * Three properties keep it from reading as a sliding decal, and they are the
+ * same three the library implements properly:
+ *
+ *  1. **The stride is driven by distance, not by time.** `bobPhase` advances
+ *     with `|gridDx|` in {@link stepSurfaceWalkers}, so feet cover exactly the
+ *     ground the body covers. A time-driven phase skates — the classic
+ *     foot-sliding tell — and skating looks worse than not animating at all.
+ *  2. **Idle blends to a stance.** Cutting locomotion dead the instant a
+ *     walker stops leaves one foot frozen in mid-air. The pose lerps toward a
+ *     neutral two-foot stance instead, over {@link STANCE_BLEND_TICKS}.
+ *  3. **The knee bends forward.** The IK solver has two solutions and picking
+ *     the wrong one per-frame makes the joint pop inside out; the bend is
+ *     pinned to the facing direction.
+ *
+ * The rest — squash on the hop, a gazing eye that looks at the threatening sky
+ * when afraid, a blink — is the same as it was.
  */
 export function drawSurfaceWalkers(
   ctx: CanvasRenderingContext2D,
@@ -442,41 +591,196 @@ export function drawSurfaceWalkers(
     if (!w.alive) continue;
     const fx = pop.centerX + w.radius * Math.cos(w.angle);
     const fy = pop.centerY + w.radius * Math.sin(w.angle);
-    const hop = Math.abs(Math.sin(w.bobPhase)) * 2;
-    const stretch = 1 + 0.14 * Math.sin(w.bobPhase * 2);
-    const blink = ((tick + (w.seed % 1024)) % 260) < 9;
-    // Local frame: +x is the facing tangent, -y points at the sky.
+
+    // Local frame: +x is the facing tangent, -y points at the sky, y = 0 is
+    // the ground contact line the feet plant on.
     ctx.save();
     ctx.translate(fx, fy);
     ctx.rotate(w.angle + Math.PI / 2);
-    ctx.translate(0, -hop);
-    ctx.fillStyle = w.color;
-    ctx.strokeStyle = 'rgba(18, 28, 14, 0.85)';
-    ctx.lineWidth = 0.75;
-    ctx.beginPath();
-    ctx.ellipse(0, 0, 4.6 * stretch, 5.4 / stretch, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    // Eye: forward when calm, up at the threatening sky when afraid.
-    if (!blink) {
-      const px = w.fear > FEAR_STARE ? 0.3 : 1.1;
-      const py = w.fear > FEAR_STARE ? -0.9 : -0.2;
-      ctx.fillStyle = '#f4f7ee';
-      ctx.beginPath();
-      ctx.ellipse(1.2 * w.facing, -1.4, 1.7, 1.8, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#1c2418';
-      ctx.beginPath();
-      ctx.ellipse(1.2 * w.facing + px, -1.4 + py, 0.7, 0.8, 0, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      ctx.strokeStyle = '#1c2418';
-      ctx.lineWidth = 0.6;
-      ctx.beginPath();
-      ctx.moveTo(0.1 * w.facing, -1.4);
-      ctx.lineTo(2.3 * w.facing, -1.4);
-      ctx.stroke();
-    }
+
+    const pose = walkerPose(w);
+    drawShadow(ctx, pose);
+    drawLegs(ctx, w, pose);
+    drawBody(ctx, w, pose, tick);
+
     ctx.restore();
   }
+}
+
+/** Resolved per-frame pose: where the feet are and how the body rides. */
+interface WalkerPose {
+  /** Foot targets in the local frame, `[x, y]` with y <= 0. */
+  readonly feet: readonly [readonly [number, number], readonly [number, number]];
+  /** Hip line height (negative = above ground). */
+  readonly hipY: number;
+  /** Body centre height. */
+  readonly bodyY: number;
+  /** Horizontal lean, positive = leaning into the facing direction. */
+  readonly lean: number;
+  /** Vertical squash, 1 = neutral. */
+  readonly squash: number;
+}
+
+/**
+ * Resolve the gait for one walker.
+ *
+ * `locomotion` is how much of the striding pose to apply, ramped rather than
+ * switched: a walker that stops mid-stride settles into a stance over
+ * {@link STANCE_BLEND_TICKS} instead of freezing with a foot in the air. It is
+ * advanced in {@link stepSurfaceWalkers} alongside `bobPhase`, so this stays a
+ * pure read of walker state and the draw pass writes nothing.
+ */
+function walkerPose(w: Walker): WalkerPose {
+  const locomotion = w.locomotion;
+  const phase = w.bobPhase;
+  const stride = w.fear > FEAR_FLEE ? STRIDE_LENGTH * 1.35 : STRIDE_LENGTH;
+  const lift = w.fear > FEAR_FLEE ? STRIDE_HEIGHT * 1.5 : STRIDE_HEIGHT;
+
+  const feet: [number, number][] = [];
+  for (let i = 0; i < 2; i++) {
+    const p = phase + (i === 0 ? 0 : Math.PI);
+    // Stance target: feet planted either side of the midline, toes forward.
+    const stanceX = (i === 0 ? -1 : 1) * (FOOT_SPREAD / 2);
+    const strideX = w.facing * stride * Math.cos(p);
+    const strideY = -Math.max(0, Math.sin(p)) * lift;
+    feet.push([
+      stanceX * (1 - locomotion) + strideX * locomotion,
+      strideY * locomotion,
+    ]);
+  }
+
+  // The body rides the gait: it rises when both legs are near mid-stance and
+  // dips at footfall, at twice the stride frequency.
+  const bounce = -Math.abs(Math.sin(phase)) * BODY_BOUNCE * locomotion;
+  const squash = 1 + 0.10 * Math.sin(phase * 2) * locomotion;
+  const hipY = -HIP_HEIGHT + bounce;
+  return {
+    feet: feet as unknown as WalkerPose['feet'],
+    hipY,
+    // Body rides the hips, overlapping them by HIP_INSET so the join closes.
+    bodyY: hipY - BODY_RY + HIP_INSET,
+    lean: w.facing * LEAN * locomotion * (w.fear > FEAR_FLEE ? 2 : 1),
+    squash,
+  };
+}
+
+/**
+ * Two-bone IK: given a hip and a foot, find the knee.
+ *
+ * The two-solution ambiguity is resolved by `bend`, which is the facing
+ * direction — a knee that picks its solution from the geometry alone flips
+ * inside out as the foot crosses under the hip, once per stride, and reads as
+ * a snapped leg. Out-of-reach targets are clamped rather than left unsolved,
+ * so the leg straightens instead of detaching.
+ */
+function solveKnee(
+  hipX: number, hipY: number,
+  footX: number, footY: number,
+  thigh: number, shin: number,
+  bend: number,
+): [number, number] {
+  let dx = footX - hipX;
+  let dy = footY - hipY;
+  let d = Math.hypot(dx, dy);
+  const min = Math.abs(thigh - shin) + 0.001;
+  const max = thigh + shin - 0.001;
+  if (d < min) { const s = min / (d || 1); dx *= s; dy *= s; d = min; }
+  if (d > max) { const s = max / d; dx *= s; dy *= s; d = max; }
+  const a = (thigh * thigh - shin * shin + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, thigh * thigh - a * a));
+  const ux = dx / d, uy = dy / d;
+  return [hipX + ux * a - uy * h * bend, hipY + uy * a + ux * h * bend];
+}
+
+function drawShadow(ctx: CanvasRenderingContext2D, pose: WalkerPose): void {
+  ctx.fillStyle = 'rgba(8, 12, 20, 0.28)';
+  ctx.beginPath();
+  ctx.ellipse(0, 0.4, 4.4, 1.2, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawLegs(ctx: CanvasRenderingContext2D, w: Walker, pose: WalkerPose): void {
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  // Far leg first, so the near one overlaps it and the pair reads as depth
+  // rather than as one leg with a glitch.
+  const order: (0 | 1)[] = (w.facing > 0) === (pose.feet[0][0] < pose.feet[1][0])
+    ? [0, 1]
+    : [1, 0];
+  for (const i of order) {
+    const [footX, footY] = pose.feet[i];
+    const near = i === order[1];
+    const hipX = (i === 0 ? -1 : 1) * HIP_SPREAD / 2 + pose.lean * 0.5;
+    const [kneeX, kneeY] = solveKnee(
+      hipX, pose.hipY, footX, footY, THIGH, SHIN, w.facing,
+    );
+
+    const limb = new Path2D();
+    limb.moveTo(hipX, pose.hipY);
+    limb.lineTo(kneeX, kneeY);
+    limb.lineTo(footX, footY);
+    const foot = new Path2D();
+    foot.moveTo(footX - w.facing * 0.5, footY);
+    foot.lineTo(footX + w.facing * FOOT_LENGTH, footY);
+
+    // Outline pass then fill pass, the pixel-art way: a dark stroke one step
+    // wider under the colour keeps a two-pixel limb legible against terrain of
+    // any brightness.
+    ctx.strokeStyle = OUTLINE;
+    ctx.lineWidth = LEG_WIDTH + 0.9;
+    ctx.stroke(limb);
+    ctx.lineWidth = FOOT_WIDTH + 0.9;
+    ctx.stroke(foot);
+
+    ctx.strokeStyle = near ? w.limbNear : w.limbFar;
+    ctx.lineWidth = LEG_WIDTH;
+    ctx.stroke(limb);
+    ctx.lineWidth = FOOT_WIDTH;
+    ctx.stroke(foot);
+  }
+}
+
+function drawBody(
+  ctx: CanvasRenderingContext2D,
+  w: Walker,
+  pose: WalkerPose,
+  tick: number,
+): void {
+  const rx = BODY_RX / pose.squash;
+  const ry = BODY_RY * pose.squash;
+  ctx.save();
+  ctx.translate(pose.lean, pose.bodyY);
+
+  ctx.fillStyle = w.color;
+  ctx.strokeStyle = OUTLINE;
+  ctx.lineWidth = 0.75;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  const blink = ((tick + (w.seed % 1024)) % 260) < 9;
+  const eyeX = 1.1 * w.facing;
+  const eyeY = -0.9;
+  if (!blink) {
+    // Pupil forward when calm, up at the threatening sky when afraid.
+    const px = w.fear > FEAR_STARE ? 0.3 : 1.0 * w.facing;
+    const py = w.fear > FEAR_STARE ? -0.9 : -0.2;
+    ctx.fillStyle = '#f4f7ee';
+    ctx.beginPath();
+    ctx.ellipse(eyeX, eyeY, 1.5, 1.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = OUTLINE;
+    ctx.beginPath();
+    ctx.ellipse(eyeX + px, eyeY + py, 0.62, 0.72, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.strokeStyle = OUTLINE;
+    ctx.lineWidth = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(eyeX - 1.1, eyeY);
+    ctx.lineTo(eyeX + 1.1, eyeY);
+    ctx.stroke();
+  }
+  ctx.restore();
 }

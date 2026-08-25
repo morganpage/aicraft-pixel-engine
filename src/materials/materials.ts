@@ -205,6 +205,37 @@ export interface TipRule {
   seeds?: { into: MaterialType; chance: number };
   /** Only advance while the tip's own temperature is within `[min, max]`. */
   tempRange?: [number, number];
+  /**
+   * Refuse to establish this tip unless the cell it is planted in has ground
+   * under it, gravity-relative.
+   *
+   * ## The failure it prevents
+   *
+   * A tip material is `isStatic`, so nothing makes it fall, and nothing in the
+   * growth pass asked what was underneath it. `plant(x, y, TREE_TIP)` at an
+   * arbitrary cell therefore grew a complete tree wherever it was called —
+   * including in open sky. A god-game brush that scattered tips across the
+   * cursor disc put a full trunk and canopy in orbit beside the planet, and the
+   * result persisted because {@link MaterialDef.needsSupport} could not tell a
+   * trunk held up by the ground from one holding *itself* up (see
+   * {@link PixelEngine.isAnchored}).
+   *
+   * ## Why the check is at establishment, not per advance
+   *
+   * A tip leaves trunk behind it and climbs, so after its first step the cell
+   * under it is its own stem — the question "is there ground below me" stops
+   * being meaningful. Worse, a limb running level or down has open sky beneath
+   * it by design, and a per-advance test would prune exactly the branches that
+   * make a tree read as a tree. Rootedness is a property of where the plant
+   * *started*, so it is settled once, when the tip is established, and
+   * inherited by every branch that forks off it.
+   *
+   * Growth started from a falling {@link AggregateRule} seed (the SEED → tip
+   * path) is rooted by construction — the seed germinates only on contact with
+   * soil — so this flag changes nothing for hosts that scatter seeds. It is
+   * the direct `plant()` call that needed a guard.
+   */
+  rooted?: boolean;
 }
 
 /**
@@ -491,6 +522,25 @@ export interface MaterialDef {
   needsSupport?: boolean;
 
   /**
+   * Whether this material may serve as the **ground** a
+   * {@link needsSupport} structure ultimately rests on. Defaults to `true` for
+   * any solid that is not itself `needsSupport`; set `false` to opt out.
+   *
+   * Only foliage and growing tips opt out, and the reason is that they are
+   * held up by the very thing they would be vouching for. A tree's canopy is
+   * static — it has to be, or a crown is physically impossible (see LEAF) —
+   * so a trunk cell wrapped in leaves would read as standing on ground and a
+   * burnt-through trunk would hang from its own foliage. That is the same
+   * "held up by what I am holding up" circularity the anchored support test
+   * exists to break, one material along.
+   *
+   * GRASS deliberately keeps the default: its spread rule sets `needsFooting`,
+   * so a grass cell only ever exists where there is already soil beneath it,
+   * and a sapling rooted in a lawn is rooted in the ground under the lawn.
+   */
+  bearsLoad?: boolean;
+
+  /**
    * Generative rule — under what conditions this material creates new cells.
    * Absent = inert, which is every material that predates this field.
    *
@@ -646,7 +696,7 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.SEED]: {
     id: MaterialType.SEED, name: 'Seed', color: [180, 140, 60, 255],
     density: 7, isLiquid: false, isGas: false, flammability: 50, friction: 0.6,
-    conductivity: 0.2, emissivity: 0.10,
+    bearsLoad: false, conductivity: 0.2, emissivity: 0.10,
     growth: {
       kind: 'aggregate',
       // TEPHRA counts as soil: volcanic ash is fertile ground, once it has
@@ -669,11 +719,14 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.TREE_TIP]: {
     id: MaterialType.TREE_TIP, name: 'Bud', color: [140, 230, 90, 255],
     density: 20, isLiquid: false, isGas: false, flammability: 40, friction: 0.7,
-    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    isStatic: true, bearsLoad: false, conductivity: 0.2, emissivity: 0.10,
     growth: {
       kind: 'tip',
       becomes: MaterialType.WOOD,
       terminal: MaterialType.LEAF,
+      // A tree needs ground under it. Without this a `plant()` call anywhere
+      // grew one, sky included — see TipRule.rooted for the measured story.
+      rooted: true,
       branchTurns: [-1, 1],
       branchChance: 0.18,
       // Limbs are a bit under half the remaining trunk, two generations deep.
@@ -709,7 +762,7 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.LEAF]: {
     id: MaterialType.LEAF, name: 'Leaf', color: [60, 150, 60, 255],
     density: 15, isLiquid: false, isGas: false, flammability: 60, friction: 0.6,
-    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    isStatic: true, bearsLoad: false, conductivity: 0.2, emissivity: 0.10,
   },
 
   // A frond, not a tree: regular pinnae at 90° (`branchEvery` rather than
@@ -717,11 +770,12 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.FERN_TIP]: {
     id: MaterialType.FERN_TIP, name: 'Frond', color: [120, 210, 110, 255],
     density: 20, isLiquid: false, isGas: false, flammability: 50, friction: 0.6,
-    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    isStatic: true, bearsLoad: false, conductivity: 0.2, emissivity: 0.10,
     growth: {
       kind: 'tip',
       becomes: MaterialType.FROND,
       terminal: MaterialType.FROND,
+      rooted: true,
       branchTurns: [-2, 2],
       branchEvery: 2,
       branchTaper: 0.35,
@@ -751,7 +805,7 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.CORAL]: {
     id: MaterialType.CORAL, name: 'Coral', color: [230, 120, 140, 255],
     density: 60, isLiquid: false, isGas: false, flammability: 0, friction: 0.8,
-    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    isStatic: true, bearsLoad: false, conductivity: 0.2, emissivity: 0.10,
   },
 
   // The fern's blade. Physically identical to LEAF now that foliage is static —
@@ -763,7 +817,7 @@ export const Materials: Record<MaterialType, MaterialDef> = {
   [MaterialType.FROND]: {
     id: MaterialType.FROND, name: 'Frond', color: [80, 175, 85, 255],
     density: 18, isLiquid: false, isGas: false, flammability: 55, friction: 0.6,
-    isStatic: true, conductivity: 0.2, emissivity: 0.10,
+    isStatic: true, bearsLoad: false, conductivity: 0.2, emissivity: 0.10,
   },
 };
 
@@ -831,6 +885,55 @@ export const isImmobile: readonly boolean[] = materialDefs.map(
  */
 export const needsSupport: readonly boolean[] = materialDefs.map(
   (d) => d.needsSupport === true
+);
+
+/**
+ * Whether each material is a load-bearing structural solid, indexed by id.
+ *
+ * The set is WALL / ROCK / ICE / WOOD, and it answers a narrower question than
+ * {@link isImmobile}: not "can this cell move" but "can load travel *through*
+ * this cell". Sand cannot — a pile transmits weight down, not sideways along a
+ * span — which is why a tree standing in sand is anchored by the sand beneath
+ * its base but a tree cell buried in sand mid-trunk does not brace a limb.
+ *
+ * Precomputed for {@link PixelEngine.isAnchored}, which reads it once per cell
+ * per flood step; the previous hardcoded id comparison chain lived inside
+ * {@link PixelEngine.isStructural} and had to be kept in sync by hand.
+ */
+export const isStructuralMat: readonly boolean[] = materialDefs.map(
+  (d) =>
+    d.id === MaterialType.WOOD ||
+    d.id === MaterialType.WALL ||
+    d.id === MaterialType.ROCK ||
+    d.id === MaterialType.ICE
+);
+
+/**
+ * Whether each material can serve as the **ground** a {@link
+ * MaterialDef.needsSupport} structure ultimately rests on. Indexed by id.
+ *
+ * A solid that neither needs support itself nor opts out via
+ * {@link MaterialDef.bearsLoad}: rock, wall, ice, sand, tephra, grass.
+ *
+ * Deliberately *not* the same as {@link isStructuralMat} — sand is not a span
+ * but it is perfectly good ground, and a tree planted in soil has nothing
+ * structural anywhere near its base. Getting this wrong is visible in both
+ * directions, and all three of these were reached by watching something break:
+ *
+ *  - Require structure, and every tree standing in sand collapses on sprout.
+ *  - Accept WOOD, and a trunk anchors itself — the mutual-support bug the
+ *    anchored test exists to fix.
+ *  - Accept LEAF, and the same circularity comes back one material along: a
+ *    trunk cell wrapped in its own canopy reads as standing on ground, so a
+ *    burnt-through trunk hangs from its foliage instead of falling.
+ */
+export const canAnchor: readonly boolean[] = materialDefs.map(
+  (d) =>
+    d.id !== MaterialType.EMPTY &&
+    d.isGas !== true &&
+    d.isLiquid !== true &&
+    d.needsSupport !== true &&
+    d.bearsLoad !== false
 );
 
 /**
