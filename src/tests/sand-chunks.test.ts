@@ -24,6 +24,7 @@ describe('render-dirty tracking', () => {
 
   it('marks only the chunk touched by setMaterial after the initial consume', () => {
     const e = makeEngine();
+    e.update(); // tick once so the boot all-dirty can be consumed
     e.consumeRenderDirtyChunks(); // clear initial full-dirty
 
     e.setMaterial(5, 5, MaterialType.SAND);
@@ -38,6 +39,7 @@ describe('render-dirty tracking', () => {
 
   it('resets after consume (second consume with no changes reports nothing)', () => {
     const e = makeEngine();
+    e.update(); // tick once so the boot all-dirty can be consumed
     e.consumeRenderDirtyChunks();
     e.setMaterial(0, 0, MaterialType.SAND);
     e.consumeRenderDirtyChunks();
@@ -45,6 +47,33 @@ describe('render-dirty tracking', () => {
     let sum = 0;
     for (let i = 0; i < dirty.length; i++) sum += dirty[i];
     expect(sum).toBe(0);
+  });
+
+  it('boot all-dirty survives any number of consumes before the first update', () => {
+    // The black-canvas race: a bundler dep-optimization full-reload or HMR can
+    // consume the dirty set before the renderer's first paint. Pre-tick, the
+    // all-dirty report must repeat so the world still gets its initial paint.
+    const e = makeEngine();
+    for (let i = 0; i < 3; i++) {
+      const dirty = e.consumeRenderDirtyChunks();
+      let sum = 0;
+      for (let j = 0; j < dirty.length; j++) sum += dirty[j];
+      expect(sum).toBe(dirty.length);
+    }
+  });
+
+  it('hands over to delta reporting at the first consume after an update', () => {
+    const e = makeEngine();
+    e.consumeRenderDirtyChunks(); // pre-tick: retained
+    e.update();
+    const full = e.consumeRenderDirtyChunks(); // first post-tick: full, consumed
+    let sum = 0;
+    for (let j = 0; j < full.length; j++) sum += full[j];
+    expect(sum).toBe(full.length);
+    const quiet = e.consumeRenderDirtyChunks();
+    let sum2 = 0;
+    for (let j = 0; j < quiet.length; j++) sum2 += quiet[j];
+    expect(sum2).toBe(0);
   });
 });
 

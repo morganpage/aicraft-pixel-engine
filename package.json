@@ -1,6 +1,6 @@
 {
   "name": "aicraft-pixel-engine",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Pixel-based falling-sand cellular-automaton physics engine for AI Craft games. Zero runtime dependencies.",
   "license": "MIT",

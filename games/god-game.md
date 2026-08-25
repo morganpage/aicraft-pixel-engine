@@ -323,13 +323,18 @@ correctly with zoom without extra work.
 
 ## 7. Repainting dirty chunks (do this — and read the `putImageData` warning)
 
+Copy [`recipes/dirty-chunk-renderer.ts`](../recipes/dirty-chunk-renderer.ts) —
+it is everything below, hardened (palette + grain, the `colorGrid`
+incandescence override, and a deterministic boot paint). The rest of this
+section explains what it does so you can adapt it rather than reinvent it.
+
 `engine.consumeRenderDirtyChunks()` returns a `Uint8Array` with one byte per
 32×32 chunk; a non-zero byte means that chunk's pixels changed this frame and
 need repainting. The **first call after construction (or `clear()`) reports
-every chunk dirty** — the engine hands you your initial full paint for free,
-so the loop below is all you need; there is no separate boot-paint path. The
-structure is an offscreen canvas at grid resolution that you write into and
-then blit through the camera:
+every chunk dirty** — treat that as a bonus repaint, not as your boot paint
+(the boot-race warning below explains why). The structure is an offscreen
+canvas at grid resolution that you write into and then blit through the
+camera:
 
 ```ts
 const CHUNK = engine.CHUNK_SIZE;          // 32
@@ -387,6 +392,16 @@ for (let i = 0; i < dirty.length; i++) {
 > makes the source offset correct by accident) and **every other chunk shows
 > nothing or garbage.** If your planet is stamped but invisible and only a
 > fragment appears in the top-left corner, this is it.
+
+> **⚠️ Boot-race trap — paint every chunk once at renderer init.** The
+> engine's first-report-all-dirty is consumable state, and anything that
+> consumes it before your first `render()` — a Vite dep-optimization
+> full-reload re-evaluating your modules, HMR state — burns the world's
+> initial paint: the page loads, the sim runs, and the canvas stays blank
+> while the grid data is perfectly correct. This was the worst bug of a
+> real build. Paint all chunks deterministically when you bind the renderer
+> (the recipe does exactly this) and let the engine's all-dirty report
+> double-paint — one redundant full repaint, once, is harmless.
 
 ---
 
@@ -653,8 +668,23 @@ host-side; none touch the engine beyond reads.
  package's animation primitives, so using it means one extra dependency:
  `npm install --save-exact aicraft-engine` (its `solveLimb`,
  `advanceSpringChain` and palette helpers — see the rig's README). Compose
- the rig; do not reinvent it. A minimal slime (body + eye + hop) satisfies
- the acceptance criteria; the rig is polish.
+ the rig; do not reinvent it. A minimal slime (body + eye + hop — as baked
+ into the walkers recipe below) satisfies the acceptance criteria; the rig
+ is polish.
+
+ **Spawn contract — walkers are present from boot.** Spawn ≈16 creatures
+ at world creation with staggered timers so the population is established
+ within the first few seconds, on **any walkable footing — bare rock
+ counts**. Do NOT gate the population on grass, forest, or any census
+ threshold: a fresh dead-rock world is already inhabited, and "watching a
+ dead rock become a living world" is about the terrain, not about
+ withholding the creatures. The population may grow as the world greens,
+ but its floor is never zero, and respawn after death uses the same
+ any-walkable-footing rule. The reference behavior ships as
+ [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts) — footing,
+ swimming, hazards, fear (freeze-stare → flee), and a minimal body + eye +
+ hop look, with the spawn contract pinned by tests. Copy it and feed it
+ your strike and vent state.
 
 ---
 
@@ -670,6 +700,9 @@ A single page where, within a few minutes of loading, a player can:
 - [ ] Open a volcano and watch lava fountain, flow, fragment into a tephra cone, and cool into new land.
 - [ ] Scatter seeds and watch forests grow (and grass creep outward from water).
 - [ ] Smite with lightning and watch the bolt flash, the impact ignite, and fire spread through flammables.
+- [ ] See creatures walking the surface within seconds of loading — on the
+  bare-rock world, before any gardening — and watch them freeze, stare, and
+  flee when you smite near them (§8.5).
 - There is **no UI beyond the toolbar**. No score, no levels, no menus. The
   simulation reacting to the player *is* the game.
 
@@ -718,7 +751,11 @@ Build in this order:
 8. Scatter `SEED` / `plant()` a tree; watch a forest establish. **Goal: life.**
 9. Add lightning smite (host-drawn bolt + `FIRE`/`explode` at the strike).
    **Goal: wrath.**
-10. Polish: nicer colors, brush-size slider, a "clear world" button.
+10. Add surface walkers: copy
+   [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts) and feed it
+   your strike/vent state (§8.5). **Goal: an inhabited world that reacts
+   to you — creatures visible on the bare rock within seconds.**
+11. Polish: nicer colors, brush-size slider, a "clear world" button.
 
 ---
 
@@ -726,8 +763,10 @@ Build in this order:
 
 - **Day/night** — modulate `ambientTemperature` on a slow cycle; oceans freeze
   at night and thaw at dawn, natively. Add a canvas tint overlay for mood.
-- **Population** — simple sprites that walk on the surface and need water +
-  food. Read the grid to find walkable ground.
+- **Population needs** — walkers that require water + food (drink from
+  oceans, graze grass, starve): the §8.5 walkers upgraded from residents to
+  a survival loop. The base walkers themselves are core (§8.5, step 10),
+  not stretch.
 - **Challenges** — "create an ocean of ≥N water cells", "grow a forest of ≥N
   trees", with a counter.
 - **Biomes** — tint rock by depth, sand by moisture, etc., in your renderer.
@@ -744,8 +783,15 @@ once before declaring done.
 1. **`putImageData` dirty offsets are source offsets.** The correct chunk
    repaint is `putImageData(img, 0, 0, x0, y0, CHUNK, CHUNK)` — anything else
    renders every chunk but (0,0) invisible (§7).
-2. **The first `consumeRenderDirtyChunks()` reports everything dirty.** No
-   boot-paint special case is needed — or allowed to double-paint.
+2. **Boot paint: paint every chunk once at renderer init — don't rely on
+   the first `consumeRenderDirtyChunks()` report.** The engine's
+   first-report-all-dirty is consumable state, and anything that consumes
+   it before your first `render()` (a Vite dep-optimization full-reload
+   re-evaluating modules, HMR state) leaves a correct grid rendering as a
+   permanently blank canvas — the worst bug of a real build. Copying
+   `recipes/dirty-chunk-renderer.ts` gets you the deterministic init paint;
+   the engine's all-dirty report then double-paints once, which is
+   harmless.
 3. **Bulk-stamped lava carries no heat.** If you ever stamp lava by hand,
    `setHeat(1.0)` every stamped cell after `endBulk()`, or the body freezes
    without ever flowing. (The library volcano handles this internally; the
@@ -769,3 +815,8 @@ once before declaring done.
 11. **Grass needs a colonist and adjacency to water** — sprinkle a little
     GRASS with the forest brush, or the meadow never starts; the moisture
     scan reaches an adjacent cell, not one further along (§8).
+12. **Never gate the creature population on the census.** A grass/forest
+    census gate means a fresh world shows zero creatures for minutes and a
+    reviewer concludes they were never built — this happened. Walkers
+    spawn at boot on any walkable footing, bare rock included (§8.5,
+    [`recipes/surface-walkers.ts`](../recipes/surface-walkers.ts)).

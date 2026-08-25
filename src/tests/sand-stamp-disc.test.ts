@@ -61,6 +61,7 @@ describe('stampDisc', () => {
   it('marks the touched chunks render-dirty', () => {
     // 128×128 → 4 chunks per row, so a disc at the centre spans four chunks.
     const e = engine(128, 128);
+    e.update(); // tick once so the boot all-dirty can be consumed
     e.consumeRenderDirtyChunks(); // drop the constructor's all-dirty frame
     e.stampDisc(64, 64, 20, MaterialType.SAND);
     const dirty = e.consumeRenderDirtyChunks();

@@ -1241,10 +1241,20 @@ export class PixelEngine {
    * set is cleared. On the first call after construction (or {@link clear}),
    * every chunk is reported dirty so the renderer can do an initial full
    * paint.
+   *
+   * That all-dirty report is not consumed until the engine has ticked at
+   * least once: while `frameCount === 0`, repeated calls keep reporting
+   * every chunk dirty. Renderers are typically bound before the first
+   * `update()`, and anything consuming the dirty set in that window — a
+   * bundler's dependency-optimization full-reload re-evaluating game
+   * modules, HMR state — would otherwise burn the world's initial full
+   * paint and leave a correct grid rendering as a blank canvas (seen in
+   * the wild during a god-game build). The cost is at most one redundant
+   * full-chunk repaint before the first tick.
    */
   consumeRenderDirtyChunks(): Uint8Array {
     if (this._renderDirtyAll) {
-      this._renderDirtyAll = false;
+      if (this.frameCount > 0) this._renderDirtyAll = false;
       const result = new Uint8Array(this.chunkWidth * this.chunkHeight);
       result.fill(1);
       this.renderDirtyChunks.fill(0);

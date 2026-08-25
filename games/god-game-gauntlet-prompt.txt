@@ -10,3 +10,8 @@ That separate sub-agent should be a really harsh critic, and if it doesn't look 
 
 Don't stop until each sub-agent is utterly wowed with the quality when compared with actual god games like Reus, Godfinger, and WorldBox.
 It should literally compare them side by side blind and say which one looks better.
+
+Operational notes, learned from previous runs of this exact prompt:
+- After any sub-agent is cancelled, check the working tree before re-launching it (git status + tsc --noEmit + a smoke screenshot): cancelled agents usually finished writing complete code before cancellation, and re-launching wastes the whole round.
+- When preparing blind side-by-side comparisons, perturb one pixel of each screenshot (or otherwise make bytes unique) before uploading: image CDNs dedupe by content hash and identical files return identical URLs, which lets a critic notice which shots are yours after ranking.
+- Verify visually with pixel probes (count pixels of an expected colour in a region), not by asking a vision model to describe the screenshot — models misread axes and hallucinate features. See recipes/headless-shot.mjs in the engine repo.

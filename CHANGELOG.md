@@ -4,9 +4,44 @@ All notable changes to **aicraft-pixel-engine** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.1] — 2026-08-25
 
 ### Added
+- **`recipes/surface-walkers.ts`** — polar-coordinate surface creatures as a
+  copy-in module: footing via WALKABLE/LIQUID/DEADLY material sets, swim-bob,
+  hazards with respawn, event-driven fear (freeze-stare → flee; strike
+  memories plus live vents), and a minimal body + eye + hop look.
+
+  Two builds of the god-game brief diverged on spawn policy. One populated
+  the world at boot on any walkable footing — bare rock counts. The other
+  gated its population on the grass census ("no grass → no walkers") and hid
+  every creature behind minutes of gardening; a reviewer of a fresh world
+  concluded the creatures had never been built. The brief described *how*
+  walkers move but never *when they appear*, so each build invented a policy.
+  The recipe pins the contract in tested code: ≈16 slots created at boot with
+  staggered timers, spawning on any walkable footing, never gated on grass,
+  forest, or any census threshold. Walkers are strictly visual (zero grid
+  writes) and roll a dedicated `mulberry32` stream — not `engine.random()`,
+  which would shift the simulation's draw sequence. The brief's §8.5 now
+  states the spawn contract, §9 has an acceptance checkbox, §10 has a build
+  step, and §12 trap 12 forbids the census gate.
+
+- **`recipes/headless-shot.mjs`** — copy-in headless-screenshot harness:
+  reads the canvas in-page via `getImageData` (the CPU path), composites the
+  ground-truth bitmap over the page screenshot with pngjs, launches with
+  `--disable-accelerated-2d-canvas`, detects garbage sessions (near-black
+  canvas centre) by exiting 42 for wrapper retries, and verifies with pixel
+  probes (`--probe x,y,w,h,r,g,b,tol --probe-min N`).
+
+  Trustworthy visual evidence from a headless browser cost a real build its
+  longest detour: `page.screenshot()` and `canvas.toDataURL()` both ride the
+  GPU-compositing path and intermittently return a black canvas while the
+  bitmap is pixel-perfect (proven by counting cells through `getImageData`),
+  and the GPU-disable flags did not help. A vision model describing
+  screenshots then misread axes and hallucinated features that pixel counts
+  disproved. The recipe encodes both lessons: trust the CPU readback, and
+  count pixels instead of asking a model.
+
 - **The volcano silhouette contract** — `measureVolcanoShape` /
   `assertVolcanoShape` (`src/tests/helpers/volcano-fixtures.ts`), with
   `src/tests/volcano-shape.test.ts` guarding the library subsystem and a new
@@ -51,6 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   end by a factor of nearly three are one table.
 
 ### Fixed
+- **Black-canvas boot race — `consumeRenderDirtyChunks()` no longer burns
+  the all-dirty report before the first `update()`.** The initial
+  full-paint report was a one-shot consumable, so anything consuming it
+  before the renderer's first `render()` — a Vite dep-optimization
+  full-reload re-evaluating game modules, HMR state — left a correct grid
+  rendering as a permanently blank canvas. Seen in the wild as the worst
+  bug of a god-game build. The report now repeats on every consume while
+  `frameCount === 0` and hands over to delta reporting at the first consume
+  after a tick; the cost is at most one redundant full-chunk repaint before
+  the world's first update. The brief's §7 and trap 2 were rewritten to
+  match: paint every chunk once at renderer init and let the engine's
+  report double-paint.
+
 - **The god-game volcano built a chimney instead of a cone** at three of five
   vent angles. Two causes, both now measured rather than guessed:
 
