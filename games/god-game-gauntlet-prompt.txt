@@ -1,21 +1,43 @@
-I want you to build a one-screen circular-planet god game at the level of games like Reus and Godfinger following the directions in the file:
+I want you to build a one-screen circular-planet god game at the level of games like Reus and Godfinger, following the directions in the file:
 
 https://github.com/morganpage/aicraft-pixel-engine/blob/main/games/god-game.md
 
-It should be utterly perfect, visually beautiful, with every single thing done at AAA quality—from the planet rendering to the eruption feel to anything you could think of.
+Done is defined by the brief's §9 acceptance criteria — not by a critic's enthusiasm. The sequencing is fixed and non-negotiable: **complete and correct first, then one bounded polish pass.** Three runs of this prompt have proven that inverting this (chasing visual perfection before the game exists) produces either a gorgeous rock disc with no game on it, or an over-built UI shell with the core acceptance items failing.
 
-Fan out sub-agents and have sub-agents tackle each build-order stage individually so that the game is utterly perfect.
-You should /loop on each item and have a separate sub-agent check it visually to ensure it looks triple A.
-That separate sub-agent should be a really harsh critic, and if it doesn't look triple A, it should keep going.
+## Build order and gates
 
-Don't stop until each sub-agent is utterly wowed with the quality when compared with actual god games like Reus, Godfinger, and WorldBox.
-It should literally compare them side by side blind and say which one looks better.
+- Fan out sub-agents, one per brief §10 build-order stage (steps 0–12).
+- A stage is DONE when its mechanical checks pass: the §9.2.1 greps (recipes present and imported), the §9.2.2 forbidden-pattern greps, the relevant §12 traps, `tsc --noEmit` clean, and a headless pixel-probe screenshot showing the stage's feature actually working. Nothing else gates a stage.
+- Run the §9.2.1 creature greps at EVERY stage boundary, not once at the end: `grep -rn "drawRiggedWalkers" src/` must hit game code (not just the copied recipe file — one run carried all seven recipes and never wired a single one), `drawSurfaceWalkers` must not appear, and `aicraft-engine` must be imported by game code. One run shipped 757 lines of hand-rolled creature animation while its critic was busy judging toolbar styling; mechanical greps at every boundary are the only reliable gate for this.
+- Steps 1–11 may render raw material colors exactly as the brief's recipes produce them. Do not spend rounds on art direction before the full §9 checklist passes — a correct loop with ugly pixels beats a pretty loop that doesn't simulate (§9.2.2).
 
-Operational notes, learned from previous runs of this exact prompt:
+## Critic protocol (after §9 passes, not before)
+
+- Polish is ONE final pass after the full §9 checklist passes: at most 2 critic rounds, then ship regardless. "Wowed" is not a terminal condition a critic can define, and an uncapped harsh-critic loop does not converge — one run spent three critique rounds making a bare rock disc beat WorldBox screenshots and never built the volcano, forest, smite, or creatures at all.
+- Each polish round has one deliverable: the critic compares the CURRENT screenshot against the PREVIOUS round's screenshot, names the single biggest remaining defect, and the builder fixes that one thing. If the fix makes the screenshot worse, revert it. Never compare mid-build screenshots against Reus/WorldBox marketing shots — those are finished commercial games with artist art and full HUDs, an unwinnable bar that fuels endless elaboration.
+- Before critiquing anything, the critic reads brief §9.1 and §11 and is bound by them. Anything on the §11 stretch list (day/night, milestone toasts, challenges, biomes, save/load) or beyond §9.1's "no UI beyond the toolbar" is OUT OF SCOPE: log the suggestion in the critique file and move on. A critic demanding a fancier dock, custom fonts, or celebration toasts is wrong, and obeying such critics is how previous runs over-built.
+- The critic writes its critique file BEFORE replying. An empty sub-agent reply means "resume it", not "rerun it".
+- After the polish pass, run ONE blind side-by-side against real Reus/WorldBox gameplay screenshots — informational only, feeding the postmortem; it never reopens the build. Curate like-for-like references first (gameplay-HUD frames at similar world scale for all three), and perturb one pixel of each panel before uploading so content-hash dedup can't break the blinding.
+
+## Complexity budget (checked mechanically, like §9.2)
+
+The best run of this prompt shipped a complete, beautiful game with a 35-line index.html, a 161-line CSS file, and emoji toolbar buttons. The over-built runs had 559 lines of inline CSS, a 934-line stylesheet, DOM nebulae, and a web-font dependency — and looked worse:
+
+- `index.html` ≤ 60 lines (this cap makes large inline stylesheets impossible). One CSS file, ≤ 250 lines.
+- No npm dependencies beyond `aicraft-engine`, `aicraft-pixel-engine`, and dev tooling (typescript/vite; playwright-core/pngjs as devDependencies for the harness is fine, never shipped in the page). No web fonts, no `@fontsource`, no CDN assets. Emoji are the sanctioned icon set.
+- No DOM scenery: no nebula/star/grain/glowstar/vignette divs, no `backdrop-filter` glass panels. Space is painted on a canvas or left black. The toolbar and a one-line footer census are the entire chrome.
+- If a file exceeds its budget, you are building chrome the brief does not ask for — delete the chrome, do not restructure the file.
+
+## Operational notes, learned from previous runs of this exact prompt
+
 - After any sub-agent is cancelled, check the working tree before re-launching it (git status + tsc --noEmit + a smoke screenshot): cancelled agents usually finished writing complete code before cancellation, and re-launching wastes the whole round.
-- When preparing blind side-by-side comparisons, perturb one pixel of each screenshot (or otherwise make bytes unique) before uploading: image CDNs dedupe by content hash and identical files return identical URLs, which lets a critic notice which shots are yours after ranking.
+- Before starting, kill any Vite dev server left running by a previous gauntlet run (check the port): a stale server returns 200 and you will test the wrong game.
+- Validate the brief's example pixel probes against one real render at step 0 and freeze the passing values into a conventions doc; a probe that has never passed is worse than no probe.
 - Verify visually with pixel probes (count pixels of an expected colour in a region), not by asking a vision model to describe the screenshot — models misread axes and hallucinate features. See recipes/headless-shot.mjs in the engine repo.
-- Before declaring any stage done, confirm the brief's recipe files were actually COPIED into src/recipes/ and imported — not re-sketched inline. A stage that reimplements a recipe from scratch is a failed stage, however good the code looks: the last run produced 746 lines in a single main.ts with no src/recipes/ at all, and independently reproduced four of the exact bugs those files document. Check with `ls src/recipes/` and `grep -rn "from './recipes/" src/` (brief §9.2.1).
-- The build runs in a browser tab that may be hidden — drive the simulation from setInterval, never requestAnimationFrame, or every headless screenshot you take will be the boot frame and you will debug a game that was never running (brief §12.5).
-- The creatures must be the slime rig running on aicraft-engine — this is the brief's §8.5 and it is not negotiable. Check it mechanically, not by eye: `grep -rn "drawRiggedWalkers" src/` must hit and `grep -rn "drawSurfaceWalkers" src/` must not. If a sub-agent has written its own IK solver, gait phase, spring chain or palette generator, it has reimplemented — badly — a 2,500-line library the build already depends on. Two runs shipped hand-rolled blobs and both were rejected on sight.
-- Two specific things a critic must be pointed at directly, because both shipped past a full sub-agent QA round last time: the creatures (above — and note foot-skating is invisible in a still screenshot and obvious in motion, so check the stride is driven by distance covered, not by wall time), and nothing may grow in mid-air (scatter seeds over open sky and confirm nothing takes root).
+- Before declaring any stage done, confirm the brief's recipe files were actually COPIED into src/recipes/ and imported — not re-sketched inline. A stage that reimplements a recipe from scratch is a failed stage, however good the code looks. Check with `ls src/recipes/` and `grep -rn "from './recipes/" src/` (§9.2.1).
+- The build runs in a browser tab that may be hidden — drive the simulation from setInterval, never requestAnimationFrame, or every headless screenshot will be the boot frame (§12.5).
+- The creatures must be the slime rig running on aicraft-engine (§8.5, non-negotiable). If a sub-agent has written its own IK solver, gait phase, spring chain or palette generator, it has reimplemented — badly — a 2,500-line library the build already depends on. Check behaviour, not just rendering: the stride must be driven by distance covered (foot-skating is invisible in stills), walkers must spawn at boot on bare rock (never gate population on the census — §12 trap 12), and nothing may grow in mid-air (scatter seeds over open sky and confirm nothing takes root).
+
+## Ship condition
+
+The run ends when: every §10 step is built, the full §9 checklist passes, the §9.2 greps are clean, and the polish pass (≤ 2 rounds) is complete. Write a short postmortem — including the final blind-comparison result and any out-of-scope suggestions the critic logged — and stop.
