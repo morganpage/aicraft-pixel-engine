@@ -25,7 +25,11 @@ The best run of this prompt shipped a complete, beautiful game with a 35-line in
 
 - `index.html` ≤ 60 lines (this cap makes large inline stylesheets impossible). One CSS file, ≤ 250 lines.
 - No npm dependencies beyond `aicraft-engine`, `aicraft-pixel-engine`, and dev tooling (typescript/vite; playwright-core/pngjs as devDependencies for the harness is fine, never shipped in the page). No web fonts, no `@fontsource`, no CDN assets. Emoji are the sanctioned icon set.
-- No DOM scenery: no nebula/star/grain/glowstar/vignette divs, no `backdrop-filter` glass panels. Space is painted on a canvas or left black. The toolbar and a one-line footer census are the entire chrome.
+- No DOM scenery: no nebula/star/grain/glowstar/vignette divs, no `backdrop-filter` glass panels. The toolbar and a one-line footer census are the entire chrome.
+- No decorative geometry around the planet: no stroked rings, orbit lines or atmosphere circles at any radius, on any layer. The planet's silhouette is the pixel disc alone; a real atmosphere, if attempted, must be masked to sky cells only.
+- Space is not left flat: paint a starfield on a background canvas behind the transparent grid (the exemplar's approach — a few hundred tinted dots at varied size/alpha). "Left black" reads dead and fails the polish round.
+- Frame the canvas like the exemplar run: one wrapper with a 1px border, ~10px radius and a soft drop shadow. An unframed canvas floating on the page reads unfinished.
+- Clouds and effect overlays are soft filled shapes in the pixel idiom — no contrasting 1px vector outlines around pixel content (outlined vector circles read as clip-art).
 - If a file exceeds its budget, you are building chrome the brief does not ask for — delete the chrome, do not restructure the file.
 
 ## Operational notes, learned from previous runs of this exact prompt
