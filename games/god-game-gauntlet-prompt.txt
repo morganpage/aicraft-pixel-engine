@@ -29,6 +29,7 @@ The best run of this prompt shipped a complete, beautiful game with a 35-line in
 - No decorative geometry around the planet: no stroked rings, orbit lines or atmosphere circles at any radius, on any layer. The planet's silhouette is the pixel disc alone; a real atmosphere, if attempted, must be masked to sky cells only.
 - Space is not left flat: paint a starfield on a background canvas behind the transparent grid (the exemplar's approach — a few hundred tinted dots at varied size/alpha). "Left black" reads dead and fails the polish round.
 - Frame the canvas like the exemplar run: one wrapper with a 1px border, ~10px radius and a soft drop shadow. An unframed canvas floating on the page reads unfinished.
+- Do not force `image-rendering: pixelated`/`crisp-edges` on the canvas: the canvas is CSS-sized to the stage at a fractional scale (~1.1×), and nearest-neighbour there quantizes the rig's sub-pixel edges into stair-steps and shimmers terrain cells. The exemplar ships the browser default (`auto`) — match it.
 - Clouds and effect overlays are soft filled shapes in the pixel idiom — no contrasting 1px vector outlines around pixel content (outlined vector circles read as clip-art).
 - If a file exceeds its budget, you are building chrome the brief does not ask for — delete the chrome, do not restructure the file.
 
